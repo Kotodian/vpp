@@ -238,6 +238,7 @@ set(VPPINFRA_HEADERS
   vector_sse42.h
   warnings.h
   xxhash.h
+  siphash.h
   linux/sysfs.h
 )
 

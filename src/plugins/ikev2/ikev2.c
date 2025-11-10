@@ -2349,6 +2349,9 @@ ikev2_create_tunnel_interface (vlib_main_t *vm, ikev2_sa_t *sa,
 	    case IKEV2_TRANSFORM_INTEG_TYPE_AUTH_HMAC_SHA1_96:
 	      integ_type = IPSEC_INTEG_ALG_SHA1_96;
 	      break;
+	    case IKEV2_TRANSFORM_INTEG_TYPE_AUTH_HMAC_SM3_256_128:
+	      integ_type = IPSEC_INTEG_ALG_SM3;
+	      break;
 	    default:
 	      ikev2_set_state (sa, IKEV2_STATE_NO_PROPOSAL_CHOSEN);
 	      return 1;
