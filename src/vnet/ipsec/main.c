@@ -2,6 +2,7 @@
  * Copyright(c) 2025 Cisco Systems, Inc.
  */
 
+#include "vnet/ipsec/ipsec_sa.h"
 #include <vlib/vlib.h>
 #include <vnet/ipsec/ipsec.h>
 
@@ -205,6 +206,14 @@ ipsec_main_t ipsec_main = {
       .bld_enc_op_tmpl[VNET_CRYPTO_HANDLER_TYPE_SIMPLE] = ipsec_default_build_op_tmpl,
       .bld_enc_op_tmpl[VNET_CRYPTO_HANDLER_TYPE_CHAINED] = ipsec_default_build_op_tmpl
     },
+
+    [IPSEC_CRYPTO_ALG_SM4_CBC] = {
+      .enc_op_id = VNET_CRYPTO_OP_SM4_CBC_ENC,
+      .dec_op_id = VNET_CRYPTO_OP_SM4_CBC_DEC,
+      .alg = VNET_CRYPTO_ALG_SM4_CBC,
+      .iv_size = 16,
+      .block_align = 16,
+    },
   },
   .integ_algs = {
     [IPSEC_INTEG_ALG_NONE] = {
@@ -260,6 +269,12 @@ ipsec_main_t ipsec_main = {
       .icv_size = 32,
       .bld_integ_op_tmpl[VNET_CRYPTO_HANDLER_TYPE_SIMPLE] = ipsec_default_build_op_tmpl,
       .bld_integ_op_tmpl[VNET_CRYPTO_HANDLER_TYPE_CHAINED] = ipsec_default_build_op_tmpl
+    },
+
+    [IPSEC_INTEG_ALG_SM3] = {
+      .op_id = VNET_CRYPTO_OP_SM3_HMAC,
+      .alg = VNET_CRYPTO_ALG_HMAC_SM3,
+      .icv_size = 12,
     },
   },
 };
