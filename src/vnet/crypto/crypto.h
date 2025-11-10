@@ -18,7 +18,7 @@
 
 #include <vlib/vlib.h>
 
-#define VNET_CRYPTO_FRAME_SIZE 64
+#define VNET_CRYPTO_FRAME_SIZE	    64
 #define VNET_CRYPTO_FRAME_POOL_SIZE 1024
 
 /* CRYPTO_ID, PRETTY_NAME, ARGS*/
@@ -30,8 +30,9 @@
   _ (AES_256_CBC, "aes-256-cbc", .key_length = 32)                            \
   _ (AES_128_CTR, "aes-128-ctr", .key_length = 16)                            \
   _ (AES_192_CTR, "aes-192-ctr", .key_length = 24)                            \
-  _ (AES_256_CTR, "aes-256-ctr", .key_length = 32)
-
+  _ (AES_256_CTR, "aes-256-ctr", .key_length = 32)                            \
+  _ (SM4_CBC, "sm4-cbc", .key_length = 16)                                    \
+  _ (SM4_CTR, "sm4-ctr", .key_length = 16)
 /* CRYPTO_ID, PRETTY_NAME,  ARGS */
 #define foreach_crypto_aead_alg                                               \
   _ (AES_128_GCM, "aes-128-gcm", .is_aead = 1, .key_length = 16)              \
@@ -48,7 +49,8 @@
   _ (SHA224, "sha-224")                                                       \
   _ (SHA256, "sha-256")                                                       \
   _ (SHA384, "sha-384")                                                       \
-  _ (SHA512, "sha-512")
+  _ (SHA512, "sha-512")                                                       \
+  _ (SM3, "sm3")
 
 #define foreach_crypto_op_type                                                \
   _ (ENCRYPT, "encrypt")                                                      \
@@ -64,14 +66,14 @@ typedef enum
     VNET_CRYPTO_OP_N_TYPES,
 } vnet_crypto_op_type_t;
 
-#define foreach_crypto_op_status \
-  _(IDLE, "idle") \
-  _(PENDING, "pending") \
-  _(WORK_IN_PROGRESS, "work-in-progress") \
-  _(COMPLETED, "completed") \
-  _(FAIL_NO_HANDLER, "no-handler") \
-  _(FAIL_BAD_HMAC, "bad-hmac") \
-  _(FAIL_ENGINE_ERR, "engine-error")
+#define foreach_crypto_op_status                                              \
+  _ (IDLE, "idle")                                                            \
+  _ (PENDING, "pending")                                                      \
+  _ (WORK_IN_PROGRESS, "work-in-progress")                                    \
+  _ (COMPLETED, "completed")                                                  \
+  _ (FAIL_NO_HANDLER, "no-handler")                                           \
+  _ (FAIL_BAD_HMAC, "bad-hmac")                                               \
+  _ (FAIL_ENGINE_ERR, "engine-error")
 
 /** async crypto **/
 
@@ -130,8 +132,9 @@ typedef enum
   _ (AES_256_CTR, SHA384, "aes-256-ctr-hmac-sha-384", 32, 24)                 \
   _ (AES_128_CTR, SHA512, "aes-128-ctr-hmac-sha-512", 16, 32)                 \
   _ (AES_192_CTR, SHA512, "aes-192-ctr-hmac-sha-512", 24, 32)                 \
-  _ (AES_256_CTR, SHA512, "aes-256-ctr-hmac-sha-512", 32, 32)
-
+  _ (AES_256_CTR, SHA512, "aes-256-ctr-hmac-sha-512", 32, 32)                 \
+  _ (SM4_CBC, SM3, "sm4-cbc-hmac-sm3", 16, 32)                                \
+  _ (SM4_CTR, SM3, "sm4-ctr-hmac-sm3", 16, 32)
 typedef enum
 {
   VNET_CRYPTO_KEY_OP_ADD,
@@ -156,12 +159,10 @@ typedef enum
 #define _(n, s) VNET_CRYPTO_ALG_HASH_##n, VNET_CRYPTO_ALG_HMAC_##n,
     foreach_crypto_hash_alg
 #undef _
-#define _(n, s, k, t, a) \
-  VNET_CRYPTO_ALG_##n##_TAG##t##_AAD##a,
+#define _(n, s, k, t, a) VNET_CRYPTO_ALG_##n##_TAG##t##_AAD##a,
       foreach_crypto_aead_async_alg
 #undef _
-#define _(c, h, s, k ,d) \
-  VNET_CRYPTO_ALG_##c##_##h##_TAG##d,
+#define _(c, h, s, k, d) VNET_CRYPTO_ALG_##c##_##h##_TAG##d,
 	foreach_crypto_link_async_alg
 #undef _
 	  VNET_CRYPTO_N_ALGS,
@@ -231,7 +232,7 @@ typedef struct
   CLIB_CACHE_LINE_ALIGN_MARK (cacheline0);
   uword user_data;
   vnet_crypto_op_id_t op;
-  vnet_crypto_op_status_t status:8;
+  vnet_crypto_op_status_t status : 8;
   u8 flags;
 #define VNET_CRYPTO_OP_FLAG_HMAC_CHECK	    (1 << 0)
 #define VNET_CRYPTO_OP_FLAG_CHAINED_BUFFERS (1 << 1)
@@ -374,12 +375,11 @@ typedef void (vnet_crypto_key_fn_t) (vnet_crypto_key_op_t kop,
 typedef int (vnet_crypto_frame_enq_fn_t) (vlib_main_t *vm,
 					  vnet_crypto_async_frame_t *frame);
 typedef vnet_crypto_async_frame_t *(
-  vnet_crypto_frame_dequeue_t) (vlib_main_t *vm, u32 *nb_elts_processed,
+  vnet_crypto_frame_dequeue_t) (vlib_main_t * vm, u32 *nb_elts_processed,
 				clib_thread_index_t *enqueue_thread_idx);
 
-u32
-vnet_crypto_register_engine (vlib_main_t * vm, char *name, int prio,
-			     char *desc);
+u32 vnet_crypto_register_engine (vlib_main_t *vm, char *name, int prio,
+				 char *desc);
 
 void vnet_crypto_register_ops_handler (vlib_main_t *vm, u32 engine_index,
 				       vnet_crypto_op_id_t opt,
@@ -399,7 +399,7 @@ void vnet_crypto_register_key_handler (vlib_main_t *vm, u32 engine_index,
 				       vnet_crypto_key_fn_t *keyh);
 
 /** async crypto register functions */
-u32 vnet_crypto_register_post_node (vlib_main_t * vm, char *post_node_name);
+u32 vnet_crypto_register_post_node (vlib_main_t *vm, char *post_node_name);
 
 void vnet_crypto_register_enqueue_handler (vlib_main_t *vm, u32 engine_index,
 					   vnet_crypto_op_id_t opt,
@@ -466,10 +466,10 @@ typedef struct
 
 extern vnet_crypto_main_t crypto_main;
 
-u32 vnet_crypto_process_chained_ops (vlib_main_t * vm, vnet_crypto_op_t ops[],
-				     vnet_crypto_op_chunk_t * chunks,
+u32 vnet_crypto_process_chained_ops (vlib_main_t *vm, vnet_crypto_op_t ops[],
+				     vnet_crypto_op_chunk_t *chunks,
 				     u32 n_ops);
-u32 vnet_crypto_process_ops (vlib_main_t * vm, vnet_crypto_op_t ops[],
+u32 vnet_crypto_process_ops (vlib_main_t *vm, vnet_crypto_op_t ops[],
 			     u32 n_ops);
 
 void vnet_crypto_set_async_dispatch (u8 mode, u8 adaptive);
@@ -486,16 +486,16 @@ typedef struct
 int vnet_crypto_set_handlers (vnet_crypto_set_handlers_args_t *);
 int vnet_crypto_is_set_handler (vnet_crypto_alg_t alg);
 
-u32 vnet_crypto_key_add (vlib_main_t * vm, vnet_crypto_alg_t alg,
-			 u8 * data, u16 length);
-void vnet_crypto_key_del (vlib_main_t * vm, vnet_crypto_key_index_t index);
+u32 vnet_crypto_key_add (vlib_main_t *vm, vnet_crypto_alg_t alg, u8 *data,
+			 u16 length);
+void vnet_crypto_key_del (vlib_main_t *vm, vnet_crypto_key_index_t index);
 void vnet_crypto_key_update (vlib_main_t *vm, vnet_crypto_key_index_t index);
 
 /**
  * Use 2 created keys to generate new key for linked algs (cipher + integ)
  * The returned key index is to be used for linked alg only.
  **/
-u32 vnet_crypto_key_add_linked (vlib_main_t * vm,
+u32 vnet_crypto_key_add_linked (vlib_main_t *vm,
 				vnet_crypto_key_index_t index_crypto,
 				vnet_crypto_key_index_t index_integ);
 
@@ -512,7 +512,7 @@ format_function_t format_vnet_crypto_op_status;
 unformat_function_t unformat_vnet_crypto_alg;
 
 static_always_inline void
-vnet_crypto_op_init (vnet_crypto_op_t * op, vnet_crypto_op_id_t type)
+vnet_crypto_op_init (vnet_crypto_op_t *op, vnet_crypto_op_id_t type)
 {
   if (CLIB_DEBUG > 0)
     clib_memset (op, 0xfe, sizeof (*op));
@@ -562,8 +562,8 @@ vnet_crypto_async_get_frame (vlib_main_t *vm, vnet_crypto_op_id_t opt)
 }
 
 static_always_inline void
-vnet_crypto_async_free_frame (vlib_main_t * vm,
-			      vnet_crypto_async_frame_t * frame)
+vnet_crypto_async_free_frame (vlib_main_t *vm,
+			      vnet_crypto_async_frame_t *frame)
 {
   vnet_crypto_main_t *cm = &crypto_main;
   vnet_crypto_thread_t *ct = cm->threads + vm->thread_index;
@@ -571,8 +571,8 @@ vnet_crypto_async_free_frame (vlib_main_t * vm,
 }
 
 static_always_inline int
-vnet_crypto_async_submit_open_frame (vlib_main_t * vm,
-				     vnet_crypto_async_frame_t * frame)
+vnet_crypto_async_submit_open_frame (vlib_main_t *vm,
+				     vnet_crypto_async_frame_t *frame)
 {
   vnet_crypto_main_t *cm = &crypto_main;
   vlib_thread_main_t *tm = vlib_get_thread_main ();
@@ -641,12 +641,12 @@ vnet_crypto_async_add_to_frame (vlib_main_t *vm, vnet_crypto_async_frame_t *f,
 }
 
 static_always_inline void
-vnet_crypto_async_reset_frame (vnet_crypto_async_frame_t * f)
+vnet_crypto_async_reset_frame (vnet_crypto_async_frame_t *f)
 {
   vnet_crypto_op_id_t opt;
   ASSERT (f != 0);
-  ASSERT ((f->state == VNET_CRYPTO_FRAME_STATE_NOT_PROCESSED
-	   || f->state == VNET_CRYPTO_FRAME_STATE_ELT_ERROR));
+  ASSERT ((f->state == VNET_CRYPTO_FRAME_STATE_NOT_PROCESSED ||
+	   f->state == VNET_CRYPTO_FRAME_STATE_ELT_ERROR));
   opt = f->op;
   if (CLIB_DEBUG > 0)
     clib_memset (f, 0xfe, sizeof (*f));

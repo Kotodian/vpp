@@ -42,7 +42,9 @@
   _ (12, CHACHA20_POLY1305, "chacha20-poly1305")                              \
   _ (13, AES_NULL_GMAC_128, "aes-null-gmac-128")                              \
   _ (14, AES_NULL_GMAC_192, "aes-null-gmac-192")                              \
-  _ (15, AES_NULL_GMAC_256, "aes-null-gmac-256")
+  _ (15, AES_NULL_GMAC_256, "aes-null-gmac-256")                              \
+  _ (16, SM4_CBC, "sm4-cbc")                                                  \
+  _ (17, SM4_CTR, "sm4-ctr")
 
 typedef enum
 {
@@ -52,14 +54,15 @@ typedef enum
     IPSEC_CRYPTO_N_ALG,
 } __clib_packed ipsec_crypto_alg_t;
 
-#define foreach_ipsec_integ_alg                                            \
-  _ (0, NONE, "none")                                                      \
-  _ (1, MD5_96, "md5-96")           /* RFC2403 */                          \
-  _ (2, SHA1_96, "sha1-96")         /* RFC2404 */                          \
-  _ (3, SHA_256_96, "sha-256-96")   /* draft-ietf-ipsec-ciph-sha-256-00 */ \
-  _ (4, SHA_256_128, "sha-256-128") /* RFC4868 */                          \
-  _ (5, SHA_384_192, "sha-384-192") /* RFC4868 */                          \
-  _ (6, SHA_512_256, "sha-512-256")	/* RFC4868 */
+#define foreach_ipsec_integ_alg                                               \
+  _ (0, NONE, "none")                                                         \
+  _ (1, MD5_96, "md5-96")	    /* RFC2403 */                             \
+  _ (2, SHA1_96, "sha1-96")	    /* RFC2404 */                             \
+  _ (3, SHA_256_96, "sha-256-96")   /* draft-ietf-ipsec-ciph-sha-256-00 */    \
+  _ (4, SHA_256_128, "sha-256-128") /* RFC4868 */                             \
+  _ (5, SHA_384_192, "sha-384-192") /* RFC4868 */                             \
+  _ (6, SHA_512_256, "sha-512-256") /* RFC4868 */                             \
+  _ (7, SM3, "sm3")
 
 typedef enum
 {
@@ -752,16 +755,15 @@ ipsec_sa_anti_replay_advance (ipsec_sa_inb_rt_t *irt,
   return n_lost;
 }
 
-
 /*
  * Makes choice for thread_id should be assigned.
  *  if input ~0, gets random worker_id based on unix_time_now_nsec
-*/
+ */
 always_inline u16
 ipsec_sa_assign_thread (u16 thread_id)
 {
-  return ((thread_id) ? thread_id
-	  : (unix_time_now_nsec () % vlib_num_workers ()) + 1);
+  return ((thread_id) ? thread_id :
+			(unix_time_now_nsec () % vlib_num_workers ()) + 1);
 }
 
 #endif /* __IPSEC_SPD_SA_H__ */
