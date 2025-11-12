@@ -105,6 +105,36 @@ format_http_conn_state (u8 *s, va_list *args)
   return format (s, "%s", t);
 }
 
+const char *http_conn_flags_str[] = {
+#define _(sym, str) str,
+  foreach_http_conn_flags
+#undef _
+};
+
+u8 *
+format_http_conn_flags (u8 *s, va_list *args)
+{
+  http_conn_t *hc = va_arg (*args, http_conn_t *);
+  int i, last = -1;
+
+  for (i = 0; i < HTTP_CONN_N_F_BITS; i++)
+    {
+      if (hc->flags & (1 << i))
+	last = i;
+    }
+
+  for (i = 0; i < last; i++)
+    {
+      if (hc->flags & (1 << i))
+	s = format (s, "%s | ", http_conn_flags_str[i]);
+    }
+  if (last >= 0)
+    s = format (s, "%s", http_conn_flags_str[i]);
+
+  return s;
+  return s;
+}
+
 u8 *
 format_http_time_now (u8 *s, va_list *args)
 {
@@ -606,13 +636,13 @@ http_ts_accept_stream (session_t *stream_session)
   ASSERT (stream_session->thread_index ==
 	  session_thread_from_handle (stream_session->listener_handle));
 
+  stream_index = http_conn_alloc_w_thread (stream_session->thread_index);
   conn_session = session_get_from_handle (stream_session->listener_handle);
   hc = http_conn_get_w_thread (
     ((http_conn_handle_t) conn_session->opaque).conn_index,
     conn_session->thread_index);
   ASSERT (hc->version == HTTP_VERSION_3);
 
-  stream_index = http_conn_alloc_w_thread (stream_session->thread_index);
   stream = http_conn_get_w_thread (stream_index, stream_session->thread_index);
   clib_memcpy_fast (stream, hc, sizeof (*hc));
   stream->hc_hc_index = stream_index;
