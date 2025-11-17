@@ -262,7 +262,7 @@ func (vpp *VppInstance) Stop() {
 	}
 }
 
-func (vpp *VppInstance) Vppctl(command string, arguments ...any) string {
+func (vpp *VppInstance) Vppctl(command any, arguments ...any) string {
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Printf("\n*******************************************************************************\n"+
@@ -271,7 +271,13 @@ func (vpp *VppInstance) Vppctl(command string, arguments ...any) string {
 		}
 	}()
 
-	vppCliCommand := fmt.Sprintf(command, arguments...)
+	var vppCliCommand string
+	if len(arguments) > 0 {
+		vppCliCommand = fmt.Sprintf(fmt.Sprint(command), arguments...)
+	} else {
+		vppCliCommand = fmt.Sprint(command)
+	}
+
 	containerExecCommand := fmt.Sprintf("docker exec --detach=false %[1]s vppctl -s %[2]s %[3]s",
 		vpp.Container.Name, vpp.getCliSocket(), vppCliCommand)
 	vpp.getSuite().Log(containerExecCommand)
@@ -535,13 +541,14 @@ func (vpp *VppInstance) CreateTap(tap *NetInterface, IPv6 bool, tapId uint32) er
 			ipAddressPeer = tap.Peer.Ip4Address
 		}
 
-		vppCliConfig := fmt.Sprintf("create tap id %d host-if-name %s %s num-rx-queues %d %s\n"+
+		vppCliConfig := fmt.Sprintf("create tap id %d host-if-name %s %s num-rx-queues %d num-tx-queues %d %s\n"+
 			"set int ip addr tap%d %s\n"+
 			"set int state tap%d up\n",
 			tapId,
 			tap.name,
 			ipAddress,
 			numRxQueues,
+			numRxQueues+1,
 			flagsCli,
 			tapId,
 			ipAddressPeer,
@@ -561,6 +568,7 @@ func (vpp *VppInstance) CreateTap(tap *NetInterface, IPv6 bool, tapId uint32) er
 		HostIP6PrefixSet: true,
 		HostIP6Prefix:    tap.Ip6AddressWithPrefix(),
 		NumRxQueues:      numRxQueues,
+		NumTxQueues:      numRxQueues + 1,
 		TapFlags:         tapv2.TapFlags(tapFlags),
 	}
 

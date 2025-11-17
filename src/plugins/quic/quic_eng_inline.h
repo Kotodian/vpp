@@ -2,8 +2,8 @@
  * Copyright(c) 2025 Cisco Systems, Inc.
  */
 
-#ifndef __included_quic_inlines_h__
-#define __included_quic_inlines_h__
+#ifndef __included_quic_eng_inline_h__
+#define __included_quic_eng_inline_h__
 
 #include <quic/quic.h>
 
@@ -22,26 +22,6 @@ quic_eng_engine_init (quic_main_t *qm)
       return;
     }
   quic_engine_vfts[qm->engine_type].engine_init (qm);
-}
-
-static_always_inline int
-quic_eng_app_cert_key_pair_delete (app_cert_key_pair_t *ckpair)
-{
-  quic_main_t *qm = &quic_main;
-
-  if (PREDICT_FALSE (qm->engine_type == QUIC_ENGINE_NONE))
-    {
-      QUIC_DBG (1, "No QUIC engine is available\n");
-      return -1;
-    }
-  if (PREDICT_FALSE (
-	!quic_engine_vfts[qm->engine_type].app_cert_key_pair_delete))
-    {
-      QUIC_DBG (1, "app_cert_key_pair_delete() not available for %s engine\n",
-		quic_engine_type_str (qm->engine_type));
-      return -1;
-    }
-  return (quic_engine_vfts[qm->engine_type].app_cert_key_pair_delete (ckpair));
 }
 
 static_always_inline int
@@ -350,4 +330,4 @@ quic_eng_proto_on_close (u32 ctx_index, u32 thread_index)
   quic_engine_vfts[qm->engine_type].proto_on_close (ctx_index, thread_index);
 }
 
-#endif /* __included_quic_inliqm->nes_h__ */
+#endif /* __included_quic_eng_inline_h__ */

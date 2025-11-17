@@ -3,7 +3,7 @@
  */
 
 #include <quic/quic.h>
-#include <quic/quic_inlines.h>
+#include <quic/quic_eng_inline.h>
 #include <quic/quic_timer.h>
 #include <vnet/session/application.h>
 
@@ -161,6 +161,16 @@ format_quic_listener (u8 *s, va_list *args)
   s = format (s, "%-" SESSION_CLI_ID_LEN "U", format_quic_ctx_listener, ctx);
   if (verbose)
     s = format (s, "%-" SESSION_CLI_STATE_LEN "U", format_quic_ctx_state, ctx);
+  return s;
+}
+
+u8 *
+format_crypto_context (u8 *s, va_list *args)
+{
+  crypto_context_t *crctx = va_arg (*args, crypto_context_t *);
+  s = format (s, "[0x%x][sub%d,ckpair%x]", crctx->ctx_index,
+	      crctx->n_subscribers, crctx->ckpair_index);
+  s = format (s, "[engine:%U]", format_crypto_engine, crctx->crypto_engine);
   return s;
 }
 

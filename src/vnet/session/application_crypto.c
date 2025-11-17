@@ -18,11 +18,14 @@ static app_cert_key_pair_t *
 app_cert_key_pair_alloc ()
 {
   app_cert_key_pair_t *ckpair;
+  app_certkey_int_ctx_t **ckip;
   pool_get (app_crypto_main.cert_key_pair_store, ckpair);
   clib_memset (ckpair, 0, sizeof (*ckpair));
   ckpair->cert_key_index = ckpair - app_crypto_main.cert_key_pair_store;
   /* Avoid need for locks when used by workers */
   vec_validate (ckpair->cki, vlib_num_workers ());
+  vec_foreach (ckip, ckpair->cki)
+    vec_validate (*ckip, app_crypto_main.last_crypto_engine);
   return ckpair;
 }
 
@@ -118,28 +121,22 @@ vnet_app_add_cert_key_pair (vnet_app_add_cert_key_pair_args_t *a)
   return 0;
 }
 
-int
-vnet_app_add_cert_key_interest (u32 index, u32 app_index)
-{
-  app_cert_key_pair_t *ckpair;
-  if (!(ckpair = app_cert_key_pair_get_if_valid (index)))
-    return -1;
-  if (vec_search (ckpair->app_interests, app_index) != ~0)
-    vec_add1 (ckpair->app_interests, app_index);
-  return 0;
-}
-
 static void
 app_certkey_free_int_ctx (app_cert_key_pair_t *ck)
 {
+  app_certkey_int_ctx_t **ckip;
   app_certkey_int_ctx_t *cki;
 
-  vec_foreach (cki, ck->cki)
+  vec_foreach (ckip, ck->cki)
     {
-      if (cki->cleanup_cb)
-	(cki->cleanup_cb) (cki);
-      cki->cert = 0;
-      cki->key = 0;
+      vec_foreach (cki, *ckip)
+	{
+	  if (cki->cleanup_cb)
+	    (cki->cleanup_cb) (cki);
+	  cki->cert = 0;
+	  cki->key = 0;
+	}
+      vec_free (*ckip);
     }
   vec_free (ck->cki);
 }
@@ -148,20 +145,11 @@ int
 vnet_app_del_cert_key_pair (u32 index)
 {
   app_cert_key_pair_t *ckpair;
-  application_t *app;
-  u32 *app_index;
 
   if (!(ckpair = app_cert_key_pair_get_if_valid (index)))
     return SESSION_E_INVALID;
 
   app_certkey_free_int_ctx (ckpair);
-
-  vec_foreach (app_index, ckpair->app_interests)
-    {
-      if ((app = application_get_if_valid (*app_index)) &&
-	  app->cb_fns.app_cert_key_pair_delete_callback)
-	app->cb_fns.app_cert_key_pair_delete_callback (ckpair);
-    }
 
   vec_free (ckpair->cert);
   vec_free (ckpair->key);

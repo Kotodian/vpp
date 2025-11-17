@@ -16,7 +16,7 @@ func init() {
 		Http2ClientGetTest, Http2ClientPostTest, Http2ClientPostPtrTest, Http2ClientGetRepeatTest, Http2ClientMultiplexingTest,
 		Http2ClientH2cTest, Http2ClientMemLeakTest)
 	RegisterH2MWTests(Http2MultiplexingMWTest, Http2ClientMultiplexingMWTest)
-	RegisterVethTests(Http2CliTlsTest, Http2ClientContinuationTest)
+	RegisterVethTests(Http2CliTlsTest, Http2ClientContinuationTest, Http2ClientPostFormTest, Http2ClientPostFormPtrTest)
 }
 
 func Http2TcpGetTest(s *Http2Suite) {
@@ -69,7 +69,7 @@ func Http2TcpPostTest(s *Http2Suite) {
 func Http2MultiplexingTest(s *Http2Suite) {
 	vpp := s.Containers.Vpp.VppInstance
 	serverAddress := s.VppAddr() + ":" + s.Ports.Port1
-	vpp.Vppctl("http tps uri tcp://" + serverAddress + " no-zc")
+	vpp.Vppctl("http tps uri http://" + serverAddress + " no-zc")
 
 	args := fmt.Sprintf("--log-file=%s -T10 -n21 -c1 -m100 http://%s/test_file_20M", s.H2loadLogFileName(s.Containers.H2load), serverAddress)
 	s.Containers.H2load.ExtraRunningArgs = args
@@ -89,7 +89,7 @@ func Http2MultiplexingMWTest(s *Http2Suite) {
 	s.SetupTest()
 	vpp := s.Containers.Vpp.VppInstance
 	serverAddress := s.VppAddr() + ":" + s.Ports.Port1
-	vpp.Vppctl("http tps uri tcp://" + serverAddress + " no-zc")
+	vpp.Vppctl("http tps uri http://" + serverAddress + " no-zc")
 
 	args := fmt.Sprintf("-T10 -n100 -c4 -r1 -m10 http://%s/test_file_20M", serverAddress)
 	s.Containers.H2load.ExtraRunningArgs = args
@@ -118,7 +118,7 @@ func Http2TlsTest(s *Http2Suite) {
 func Http2ContinuationTxTest(s *Http2Suite) {
 	vpp := s.Containers.Vpp.VppInstance
 	serverAddress := s.VppAddr() + ":" + s.Ports.Port1
-	vpp.Vppctl("http tps uri tcp://" + serverAddress + " no-zc")
+	vpp.Vppctl("http tps uri http://" + serverAddress + " no-zc")
 	args := fmt.Sprintf("-w %%{size_header} --max-time 10 --noproxy '*' --http2-prior-knowledge http://%s/test_file_64?test_header=32k", serverAddress)
 	writeOut, log := s.RunCurlContainer(s.Containers.Curl, args)
 	sizeHeader, err := strconv.Atoi(strings.ReplaceAll(writeOut, "\x00", ""))
@@ -205,6 +205,27 @@ func Http2CliTlsTest(s *VethsSuite) {
 	s.AssertContains(o, "2 responses sent")
 	s.AssertContains(o, "2 application streams opened")
 	s.AssertContains(o, "2 application streams closed")
+}
+
+func http2ClientPostFormTest(s *VethsSuite, usePtr bool) {
+	uri := "http://" + s.Interfaces.Server.Ip4AddressString() + ":" + s.Ports.Port1
+	o := s.Containers.ServerVpp.VppInstance.Vppctl("http static server uri " + uri + " url-handlers debug")
+	s.Log(o)
+	cmd := "http client post http2 verbose uri " + uri + "/interface_stats.json data host-" + s.Interfaces.Server.Name()
+	if usePtr {
+		cmd += " use-ptr"
+	}
+	o = s.Containers.ClientVpp.VppInstance.Vppctl(cmd)
+	s.Log(o)
+	s.AssertContains(o, "HTTP/2 200 OK")
+}
+
+func Http2ClientPostFormTest(s *VethsSuite) {
+	http2ClientPostFormTest(s, false)
+}
+
+func Http2ClientPostFormPtrTest(s *VethsSuite) {
+	http2ClientPostFormTest(s, true)
 }
 
 func Http2ClientGetTest(s *Http2Suite) {
@@ -353,7 +374,7 @@ func Http2ClientMultiplexingMWTest(s *Http2Suite) {
 func Http2ClientContinuationTest(s *VethsSuite) {
 	serverAddress := s.Interfaces.Server.Ip4AddressString() + ":" + s.Ports.Port1
 
-	s.Containers.ServerVpp.VppInstance.Vppctl("http tps uri tls://" + serverAddress + " no-zc")
+	s.Containers.ServerVpp.VppInstance.Vppctl("http tps uri https://" + serverAddress + " no-zc")
 
 	uri := fmt.Sprintf("https://%s/test_file_64?test_header=32k", serverAddress)
 	o := s.Containers.ClientVpp.VppInstance.Vppctl("http client fifo-size 64k verbose save-to response.txt uri " + uri)

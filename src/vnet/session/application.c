@@ -847,7 +847,7 @@ application_alloc_and_init (app_init_args_t *a)
   if (opts[APP_OPTIONS_FLAGS] & APP_OPTIONS_FLAGS_EVT_MQ_USE_EVENTFD)
     props->use_mq_eventfd = 1;
   if (opts[APP_OPTIONS_TLS_ENGINE])
-    app->tls_engine = opts[APP_OPTIONS_TLS_ENGINE];
+    app->crypto_ctx.tls_engine = opts[APP_OPTIONS_TLS_ENGINE];
   if (opts[APP_OPTIONS_MAX_FIFO_SIZE])
     props->max_fifo_size = opts[APP_OPTIONS_MAX_FIFO_SIZE];
   if (opts[APP_OPTIONS_HIGH_WATERMARK])
@@ -1818,16 +1818,6 @@ application_format_connects (application_t * app, int verbose)
     app_wrk = app_worker_get (wrk_map->wrk_index);
     app_worker_format_connects (app_wrk, verbose);
   }
-}
-
-u8 *
-format_crypto_context (u8 * s, va_list * args)
-{
-  crypto_context_t *crctx = va_arg (*args, crypto_context_t *);
-  s = format (s, "[0x%x][sub%d,ckpair%x]", crctx->ctx_index,
-	      crctx->n_subscribers, crctx->ckpair_index);
-  s = format (s, "[engine:%U]", format_crypto_engine, crctx->crypto_engine);
-  return s;
 }
 
 u8 *

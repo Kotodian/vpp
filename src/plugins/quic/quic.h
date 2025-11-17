@@ -229,6 +229,15 @@ typedef struct quic_rx_packet_ctx_
     u8 padding[1024 * 128]; /* FIXME: remove hardcoded size */
 } quic_rx_packet_ctx_t;
 
+typedef struct crypto_ctx_
+{
+  u32 ctx_index;     /**< index in crypto context pool */
+  u32 n_subscribers; /**< refcount of sessions using said context */
+  u32 ckpair_index;  /**< certificate & key */
+  u8 crypto_engine;
+  void *data; /**< protocol specific data */
+} crypto_context_t;
+
 typedef struct quic_worker_ctx_
 {
   CLIB_CACHE_LINE_ALIGN_MARK (cacheline0);
@@ -373,7 +382,6 @@ typedef enum quic_session_connected_
 typedef struct quic_engine_vft_
 {
   void (*engine_init) (quic_main_t *qm);
-  int (*app_cert_key_pair_delete) (app_cert_key_pair_t *ckpair);
   int (*crypto_context_acquire) (quic_ctx_t *ctx);
   void (*crypto_context_release) (u32 crypto_context_index, u8 thread_index);
   int (*connect) (quic_ctx_t *ctx, u32 ctx_index,
