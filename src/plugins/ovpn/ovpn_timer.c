@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "ovpn/ovpn_reliable.h"
+#include <ovpn/ovpn_reliable.h>
 #include <ovpn/ovpn.h>
 #include <ovpn/private.h>
 #include <ovpn/ovpn_timer.h>
@@ -69,14 +69,14 @@ ovpn_expired_reliable_queues_callback (u32 *expired_timers)
 
   for (i = 0; i < vec_len (expired_timers); i++)
     {
-      ovpn_reliable_queue_event_t *event =
-	clib_mem_alloc (sizeof (ovpn_reliable_queue_event_t));
+      ovpn_reliable_send_queue_event_t *event =
+	clib_mem_alloc (sizeof (ovpn_reliable_send_queue_event_t));
 
       ovpn_reliable_get_pkt_id_and_queue_index (expired_timers[i], &pkt_id,
 						&pool_index);
       vlib_process_signal_event_mt (
-	vm, omp->timer_node_index, OVPN_CTRL_EVENT_TYPE_RELIABLE_QUEUE_EXPIRED,
-	(uword) event);
+	vm, omp->timer_node_index,
+	OVPN_CTRL_EVENT_TYPE_RELIABLE_SEND_QUEUE_EXPIRED, (uword) event);
     }
 }
 
