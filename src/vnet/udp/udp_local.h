@@ -37,7 +37,8 @@
   _ (4790, VXLAN_GPE)                                                         \
   _ (6633, vpath_3)                                                           \
   _ (6081, geneve)                                                            \
-  _ (53053, dns_reply)
+  _ (53053, dns_reply)                                                        \
+  _ (1194, ovpn)
 
 #define foreach_udp6_dst_port                                                 \
   _ (53, dns6)                                                                \
@@ -54,27 +55,27 @@
   _ (6633, vpath6_3)                                                          \
   _ (6081, geneve6)                                                           \
   _ (8138, BIER)                                                              \
-  _ (53053, dns_reply6)
+  _ (53053, dns_reply6)                                                       \
+  _ (1194, ovpn6)
 
 typedef enum
 {
-#define _(n,f) UDP_DST_PORT_##f = n,
+#define _(n, f) UDP_DST_PORT_##f = n,
   foreach_udp4_dst_port foreach_udp6_dst_port
 #undef _
 } udp_dst_port_t;
 
 typedef enum
 {
-#define _(n,f) UDP6_DST_PORT_##f = n,
+#define _(n, f) UDP6_DST_PORT_##f = n,
   foreach_udp6_dst_port
 #undef _
 } udp6_dst_port_t;
 
-void udp_register_dst_port (vlib_main_t * vm,
-			    udp_dst_port_t dst_port,
+void udp_register_dst_port (vlib_main_t *vm, udp_dst_port_t dst_port,
 			    u32 node_index, u8 is_ip4);
-void udp_unregister_dst_port (vlib_main_t * vm,
-			      udp_dst_port_t dst_port, u8 is_ip4);
+void udp_unregister_dst_port (vlib_main_t *vm, udp_dst_port_t dst_port,
+			      u8 is_ip4);
 u8 udp_is_valid_dst_port (udp_dst_port_t dst_port, u8 is_ip4);
 
 #endif /* SRC_VNET_UDP_UDP_LOCAL_H_ */
