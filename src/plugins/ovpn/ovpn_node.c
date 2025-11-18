@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "vppinfra/pool.h"
 #include <ovpn/ovpn_channel.h>
 #include <ovpn/ovpn_reliable.h>
 #include <picotls.h>
@@ -184,7 +185,8 @@ ovpn_free_channel (vlib_main_t *vm, ovpn_channel_t *ch)
 	&omp->queues_timer_wheel,
 	ovpn_reliable_get_timer_handle (queue, *pkt_id));
     }
-  if (ch->key_source_index != ~0)
+  if (ch->key_source_index != ~0 &&
+      !pool_is_free_index (omp->key_sources, ch->key_source_index))
     {
       ovpn_key_source_t *ks =
 	pool_elt_at_index (omp->key_sources, ch->key_source_index);
@@ -215,6 +217,12 @@ ovpn_free_session (vlib_main_t *vm, ovpn_session_t *sess)
       ch = pool_elt_at_index (omp->channels, sess->channel_index);
       ovpn_free_channel (vm, ch);
       sess->channel_index = ~0;
+    }
+  if (!pool_is_free_index (omp->key2s, sess->key2_index))
+    {
+      ovpn_key2_t *key2 = pool_elt_at_index (omp->key2s, sess->key2_index);
+      ovpn_secure_zero_memory (key2->keys, sizeof (key2->keys));
+      pool_put (omp->key2s, key2);
     }
   BV (clib_bihash_add_del) (&omp->session_hash, &kv, 0);
   ovpn_session_free (sess);
