@@ -184,11 +184,20 @@ ovpn_free_channel (vlib_main_t *vm, ovpn_channel_t *ch)
 	&omp->queues_timer_wheel,
 	ovpn_reliable_get_timer_handle (queue, *pkt_id));
     }
+  if (ch->key_source_index != ~0)
+    {
+      ovpn_key_source_t *ks =
+	pool_elt_at_index (omp->key_sources, ch->key_source_index);
+      ovpn_secure_zero_memory (ks->pre_master_secret, 48);
+      ovpn_secure_zero_memory (ks->client_prf_seed_master_secret, 32);
+      ovpn_secure_zero_memory (ks->client_prf_seed_key_expansion, 32);
+      ovpn_secure_zero_memory (ks->server_prf_seed_master_secret, 32);
+      ovpn_secure_zero_memory (ks->server_prf_seed_key_expansion, 32);
+      pool_put (omp->key_sources, ks);
+    }
   ovpn_reliable_queue_free (queue);
   ovpn_channel_free (ch);
   pool_put_index (omp->channels, ch->index);
-  pool_put (omp->channels, ch);
-  ovpn_channel_free (ch);
   pool_put (omp->channels, ch);
 }
 
