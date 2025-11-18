@@ -484,15 +484,33 @@ ovpn_ack_recv_pkt (vlib_main_t *vm, ovpn_channel_t *ch,
   ovpn_reliable_ack_recv_pkt (vm, queue, pkt->pkt_id);
 }
 
-always_inline void
-ovpn_handle_hard_reset_client_v2 (vlib_main_t *vm, uword *event_data)
+always_inline ovpn_error_t
+ovpn_send_ctrl_server_reset_v2 (vlib_main_t *vm, ip46_address_t *remote_addr,
+				u16 remote_port, u8 is_ip4, ovpn_channel_t *ch,
+				ovpn_reliable_queue_t *queue,
+				u64 remote_session_id)
 {
   u32 bi0 = ~0;
   vlib_buffer_t *b0;
+  ovpn_ctrl_msg_server_hard_reset_v2_t ctrl_msg;
+  ctrl_msg.remote_session_id = clib_host_to_net_u64 (remote_session_id);
+  ovpn_create_ctrl_frame (vm, ch,
+			  OVPN_OPCODE_TYPE_P_CONTROL_HARD_RESET_SERVER_V2,
+			  &queue->replay_packet_id, &queue->next_send_pkt_id,
+			  (u8 *) &ctrl_msg, sizeof (ctrl_msg), &bi0);
+  b0 = vlib_get_buffer (vm, bi0);
+  ovpn_prepend_rewrite (b0, remote_addr, remote_port, is_ip4);
+  ovpn_ip46_enqueue_packet (vm, is_ip4, bi0);
+  ovpn_reliable_enqueue_packet (vm, is_ip4, b0, queue);
+  return OVPN_ERROR_NONE;
+}
+
+always_inline void
+ovpn_handle_hard_reset_client_v2 (vlib_main_t *vm, uword *event_data)
+{
   ovpn_main_t *omp = &ovpn_main;
   ovpn_ctrl_event_hard_reset_client_v2_t *event =
     (ovpn_ctrl_event_hard_reset_client_v2_t *) event_data[0];
-  ovpn_ctrl_msg_server_hard_reset_v2_t ctrl_msg;
   u32 session_index = ~0;
   u32 channel_index = ~0;
   u32 reliable_queue_index = ~0;
@@ -533,17 +551,9 @@ ovpn_handle_hard_reset_client_v2 (vlib_main_t *vm, uword *event_data)
   ch->reliable_queue_index = reliable_queue_index;
 
   /* send hard reset server v2 */
-  ctrl_msg.remote_session_id = clib_host_to_net_u64 (event->remote_session_id);
-  ovpn_create_ctrl_frame (vm, ch,
-			  OVPN_OPCODE_TYPE_P_CONTROL_HARD_RESET_SERVER_V2,
-			  &queue->replay_packet_id, &queue->next_send_pkt_id,
-			  (u8 *) &ctrl_msg, sizeof (ctrl_msg), &bi0);
-  b0 = vlib_get_buffer (vm, bi0);
-  ovpn_prepend_rewrite (b0, &event->remote_addr, event->client_port,
-			event->is_ip4);
-  ovpn_ip46_enqueue_packet (vm, event->is_ip4, bi0);
-  ovpn_reliable_enqueue_packet (vm, event->is_ip4, b0, queue);
-
+  ovpn_send_ctrl_server_reset_v2 (vm, &event->remote_addr, event->client_port,
+				  event->is_ip4, ch, queue,
+				  event->remote_session_id);
 done:
   clib_mem_free (event);
 }
