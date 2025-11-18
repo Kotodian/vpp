@@ -721,9 +721,9 @@ ovpn_handle_post_handshake_pkt (vlib_main_t *vm, ovpn_channel_t *ch,
 }
 
 always_inline ovpn_error_t
-ovpn_handle_ssl_handshake (vlib_main_t *vm, ip46_address_t *remote_addr,
-			   u32 pkt_id, u16 remote_port, u8 is_ip4,
-			   u64 remote_session_id, u8 *data, u32 data_len)
+ovpn_handle_handshake (vlib_main_t *vm, ip46_address_t *remote_addr,
+		       u32 pkt_id, u16 remote_port, u8 is_ip4,
+		       u64 remote_session_id, u8 *data, u32 data_len)
 {
   ovpn_main_t *omp = &ovpn_main;
   u32 sess_index = ~0;
@@ -1186,8 +1186,7 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		    {
 		      ip40 =
 			(ip4_header_t *) ((u8 *) udp0 - sizeof (ip4_header_t));
-		      // handle ssl handshake
-		      ovpn_handle_ssl_handshake (
+		      ovpn_handle_handshake (
 			vm, (ip46_address_t *) &ip40->src_address,
 			clib_net_to_host_u32 (pkt_id),
 			clib_net_to_host_u16 (udp0->src_port), 1,
@@ -1199,7 +1198,7 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		      ip60 =
 			(ip6_header_t *) ((u8 *) udp0 - sizeof (ip6_header_t));
 		      // handle ssl handshake
-		      ovpn_handle_ssl_handshake (
+		      ovpn_handle_handshake (
 			vm, (ip46_address_t *) &ip60->src_address,
 			clib_net_to_host_u32 (pkt_id),
 			clib_net_to_host_u16 (udp0->src_port), 0,
