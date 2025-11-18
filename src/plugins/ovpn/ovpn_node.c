@@ -53,6 +53,7 @@ vlib_node_registration_t ovpn_node;
   _ (MALFORMED, "Malformed data")                                             \
   _ (UNKNOWN_OPCODE, "Unknown opcode")                                        \
   _ (SSL_HANDSHAKE_FAILED, "SSL handshake failed")                            \
+  _ (INVALID_KEY_METHOD, "Invalid key method")                                \
   _ (FAILED_TO_ALLOCATE_BUFFER, "Failed to allocate buffer")
 
 typedef enum
@@ -666,10 +667,122 @@ ovpn_send_tls_output (vlib_main_t *vm, ovpn_channel_t *ch,
     }
 }
 
-always_inline void
+always_inline ovpn_error_t
 ovpn_handle_key_negotiation (vlib_main_t *vm, ovpn_channel_t *ch, u8 *payload,
-			     u32 payload_len)
+			     u32 payload_len, u32 *key2_index)
 {
+  ovpn_main_t *omp = &ovpn_main;
+  ovpn_error_t error = OVPN_ERROR_NONE;
+  ovpn_key_source_t *ks = NULL;
+  ovpn_key2_t *key2 = NULL;
+  u16 options_string_length = 0;
+  u16 username_length = 0;
+  // u8 *username = NULL;
+  u16 password_length = 0;
+  // u8 *password = NULL;
+
+  /* Literal 0 4 bytes */
+  if (payload_len < 4)
+    {
+      return OVPN_ERROR_MALFORMED;
+    }
+  payload += 4;
+  payload_len -= 4;
+
+  /* key_method type 1 byte */
+  if (payload_len < 1)
+    {
+      return OVPN_ERROR_MALFORMED;
+    }
+  u8 key_method = *payload;
+  if (key_method != 2)
+    {
+      return OVPN_ERROR_INVALID_KEY_METHOD;
+    }
+  payload += 1;
+  payload_len -= 1;
+
+  /* key_source, 48 bytes + 32 bytes + 32 bytes */
+  if (payload_len < OVPN_KEY_SOURCE_LENGTH)
+    {
+      return OVPN_ERROR_MALFORMED;
+    }
+
+  pool_get (omp->key_sources, ks);
+  ks->index = ks - omp->key_sources;
+  clib_memcpy_fast (ks->pre_master_secret, payload, 48);
+  payload += 48;
+  payload_len -= 48;
+
+  clib_memcpy_fast (ks->client_prf_seed_master_secret, payload, 32);
+  payload += 32;
+  payload_len -= 32;
+
+  clib_memcpy_fast (&ks->client_prf_seed_key_expansion, payload, 32);
+  payload += 32;
+  payload_len -= 32;
+
+  /* options_string_length,  */
+  clib_memcpy_fast (&options_string_length, payload, payload_len);
+  options_string_length = clib_net_to_host_u16 (options_string_length);
+  payload += options_string_length;
+  payload_len -= options_string_length;
+  /* null terminator */
+  options_string_length -= 1;
+
+  if (payload_len > 0)
+    {
+      clib_memcpy_fast (&username_length, payload, payload_len);
+      username_length = clib_net_to_host_u16 (username_length);
+      if (username_length > payload_len)
+	{
+	  error = OVPN_ERROR_MALFORMED;
+	  goto error;
+	}
+      // username = payload;
+      payload += username_length;
+      payload_len -= username_length;
+      /* null terminator */
+      username_length -= 1;
+
+      if (payload_len > 0)
+	{
+	  clib_memcpy_fast (&password_length, payload, payload_len);
+	  password_length = clib_net_to_host_u16 (password_length);
+	  if (password_length > payload_len)
+	    {
+	      error = OVPN_ERROR_MALFORMED;
+	      goto error;
+	    }
+	  // password = payload;
+	  payload += password_length;
+	  payload_len -= password_length;
+	  /* null terminator */
+	  password_length -= 1;
+	}
+    }
+
+  pool_get (omp->key2s, key2);
+  if (!ovpn_channel_derive_key_material_server (ch, ks, key2))
+    {
+      error = OVPN_ERROR_SSL_HANDSHAKE_FAILED;
+      goto error;
+    }
+  *key2_index = key2 - omp->key2s;
+
+error:
+  if (error != OVPN_ERROR_NONE)
+    {
+      if (ks != NULL)
+	{
+	  pool_put (omp->key_sources, ks);
+	}
+      if (key2 != NULL)
+	{
+	  pool_put (omp->key2s, key2);
+	}
+    }
+  return error;
 }
 
 static inline ovpn_error_t
@@ -679,6 +792,7 @@ ovpn_handle_post_handshake_pkt (vlib_main_t *vm, ovpn_channel_t *ch,
 				ip46_address_t *remote_addr, u16 remote_port,
 				u8 is_ip4, ovpn_session_t *sess)
 {
+  ovpn_error_t error = OVPN_ERROR_NONE;
   ptls_buffer_t plaintext_buf;
   ptls_buffer_init (&plaintext_buf, NULL, 0);
   size_t input_off = 0;
@@ -692,16 +806,20 @@ ovpn_handle_post_handshake_pkt (vlib_main_t *vm, ovpn_channel_t *ch,
 
       if (rv != 0)
 	{
-	  ptls_buffer_dispose (&plaintext_buf);
-	  return OVPN_ERROR_SSL_HANDSHAKE_FAILED;
+	  error = OVPN_ERROR_SSL_HANDSHAKE_FAILED;
+	  goto error;
 	}
     }
 
   if (plaintext_buf.off > 0)
     {
-      ovpn_handle_key_negotiation (vm, ch, plaintext_buf.base,
-				   plaintext_buf.off);
-
+      error = ovpn_handle_key_negotiation (
+	vm, ch, plaintext_buf.base, plaintext_buf.off, &sess->key2_index);
+      if (error != OVPN_ERROR_NONE)
+	{
+	  goto error;
+	}
+      /* TODO: send key negotiation response */
       ptls_buffer_t encrypted_buf;
       ptls_buffer_init (&encrypted_buf, NULL, 0);
       ptls_send (ch->tls, &encrypted_buf, NULL, 0);
@@ -720,8 +838,9 @@ ovpn_handle_post_handshake_pkt (vlib_main_t *vm, ovpn_channel_t *ch,
 			      is_ip4);
     }
 
+error:
   ptls_buffer_dispose (&plaintext_buf);
-  return OVPN_ERROR_NONE;
+  return error;
 }
 
 always_inline ovpn_error_t
@@ -782,7 +901,7 @@ ovpn_handle_handshake (vlib_main_t *vm, ip46_address_t *remote_addr,
 	  continue;
 	}
 
-      /* 已完成握手，处理明文 */
+      /* 已完成握手，协商密钥 */
       if (ch->state == OVPN_CHANNEL_STATE_SSL_HANDSHAKE_FINISHED)
 	{
 	  if (error == OVPN_ERROR_NONE)

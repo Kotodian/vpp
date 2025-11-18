@@ -24,8 +24,10 @@
 #include <stddef.h>
 #include <vnet/ip/ip46_address.h>
 #include <openssl/ssl.h>
+#include <openssl/md5.h>
 
 #define OVN_CHANNEL_EXPIRED_TIMEOUT (1 * 60) /* 1 minute */
+#define OVPN_KEY_SOURCE_LENGTH	    48 + 32 + 32
 
 /*
  * Recv P_CONTROL_HARD_RESET_CLIENT_V2: Init: Initial State
@@ -48,6 +50,23 @@ typedef enum ovpn_channel_state
     OVPN_CHANNEL_STATE_N_STATE,
 } ovpn_channel_state_t;
 
+#define MAX_CIPHER_KEY_LENGTH 32
+#define MAX_HMAC_KEY_LENGTH   20
+
+typedef struct ovpn_key
+{
+  uint8_t cipher[MAX_CIPHER_KEY_LENGTH];
+  uint8_t hmac[MAX_HMAC_KEY_LENGTH];
+} ovpn_key_t;
+
+typedef struct ovpn_key2
+{
+  int n;
+#define OVPN_KEY_DIR_TO_CLIENT 0
+#define OVPN_KEY_DIR_TO_SERVER 1
+  ovpn_key_t keys[2]; // keys[0] = server->client, keys[1] = client->server
+} ovpn_key2_t;
+
 typedef struct ovpn_channel
 {
   u32 index;
@@ -61,12 +80,25 @@ typedef struct ovpn_channel
   ptls_t *tls;
   u32 reliable_queue_index;
   f64 expired_time;
+  u32 key_source_index;
 } ovpn_channel_t;
+
+typedef struct ovpn_key_source
+{
+  u32 index;
+  u8 pre_master_secret[48];
+  u8 client_prf_seed_master_secret[32];
+  u8 client_prf_seed_key_expansion[32];
+  u8 server_prf_seed_master_secret[32];
+  u8 server_prf_seed_key_expansion[32];
+} ovpn_key_source_t;
 
 void ovpn_channel_init (vlib_main_t *vm, ovpn_channel_t *ch,
 			ptls_context_t *ssl_ctx, u64 remote_session_id,
 			ip46_address_t *remote_addr, u8 is_ip4, u32 ch_index);
-void ovpn_channel_derive_key_material (ovpn_channel_t *ch, u8 key[32]);
+bool ovpn_channel_derive_key_material_server (ovpn_channel_t *ch,
+					      ovpn_key_source_t *ks,
+					      ovpn_key2_t *key2);
 void ovpn_channel_free (ovpn_channel_t *ch);
 
 #endif /* __included_ovpn_channel_h__ */

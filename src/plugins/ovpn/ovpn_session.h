@@ -63,6 +63,7 @@ typedef struct ovpn_session_t
   u32 sw_if_index;
   ip46_address_t remote_addr;
   u8 is_ip4;
+  u32 key2_index;
 } ovpn_session_t;
 
 void ovpn_session_init (vlib_main_t *vm, ovpn_session_t *session, u32 index,

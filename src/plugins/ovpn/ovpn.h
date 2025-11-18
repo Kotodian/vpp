@@ -40,6 +40,10 @@ typedef struct
   /* local address */
   ovpn_if_t *ovpn_if;
 
+  /* options */
+  u8 *options;
+  u32 options_length;
+
   /* local SSL context */
   ptls_context_t *ptls_ctx;
 
@@ -60,9 +64,15 @@ typedef struct
   ovpn_channel_t *channels;
   tw_timer_wheel_2t_1w_2048sl_t channels_timer_wheel;
 
+  /* key source */
+  ovpn_key_source_t *key_sources;
+
   /* reliable queue */
   ovpn_reliable_queue_t *reliable_queues;
   tw_timer_wheel_2t_1w_2048sl_t queues_timer_wheel;
+
+  /* key2 */
+  ovpn_key2_t *key2s;
 
   /* convenience */
   vlib_main_t *vlib_main;

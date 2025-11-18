@@ -62,6 +62,13 @@ typedef struct ovpn_reliable_send_queue_event
   u32 pkt_id;
 } ovpn_reliable_send_queue_event_t;
 
+void
+ovpn_secure_zero_memory (void *v, size_t n)
+{
+  static void *(*const volatile memset_v) (void *, int, size_t) = &memset;
+  memset_v (v, 0, n);
+}
+
 #endif /* __included_ovpn_private_h__ */
 
 /*

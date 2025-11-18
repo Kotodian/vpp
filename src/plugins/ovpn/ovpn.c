@@ -104,6 +104,11 @@ ovpn_init (vlib_main_t *vm)
 
   omp->in4_index = vlib_frame_queue_main_init (ovpn4_input_node.index, 0);
   omp->in6_index = vlib_frame_queue_main_init (ovpn6_input_node.index, 0);
+  /*
+* TODO: Initialize SSL context
+* 从配置文件中加载SSL证书和密钥以及
+* OpenVPN配置
+*/
 
   /* Initialize session */
   BV (clib_bihash_init) (&omp->session_hash, "ovpn session hash table",
@@ -119,7 +124,6 @@ ovpn_init (vlib_main_t *vm)
   tw_timer_wheel_init_2t_1w_2048sl (
     &omp->queues_timer_wheel, ovpn_expired_reliable_queues_callback, 1.0, ~0);
 
-  /* TODO: Initialize SSL context */
 
   /* Process Node */
   omp->ctrl_node_index = ovpn_ctrl_process_node.index;
