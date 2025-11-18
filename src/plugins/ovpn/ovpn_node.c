@@ -406,6 +406,17 @@ ovpn_create_ctrl_frame (vlib_main_t *vm, ovpn_channel_t *ch, u8 opcode,
 }
 
 always_inline void
+ovpn_send_reliable_pkt (vlib_main_t *vm, ovpn_reliable_queue_t *queue,
+			u8 is_ip4, u32 bi0, ip46_address_t *remote_addr,
+			u16 remote_port)
+{
+  vlib_buffer_t *b0 = vlib_get_buffer (vm, bi0);
+  ovpn_prepend_rewrite (b0, remote_addr, remote_port, is_ip4);
+  ovpn_ip46_enqueue_packet (vm, is_ip4, bi0);
+  ovpn_reliable_enqueue_packet (vm, is_ip4, b0, queue);
+}
+
+always_inline void
 ovpn_create_ctrl_ack_v1 (vlib_main_t *vm, u32 *bi0, ovpn_channel_t *ch,
 			 u32 *replay_pkt_id)
 {
@@ -468,19 +479,17 @@ ovpn_create_ctrl_ack_v1 (vlib_main_t *vm, u32 *bi0, ovpn_channel_t *ch,
 }
 
 always_inline void
-ovpn_ack_recv_pkt (vlib_main_t *vm, ovpn_channel_t *ch,
-		   ovpn_reliable_queue_t *queue, ovpn_reliable_pkt_t *pkt,
-		   ip46_address_t *remote_addr, u16 remote_port, u8 is_ip4)
+ovpn_send_ack_recv_pkt (vlib_main_t *vm, ovpn_channel_t *ch,
+			ovpn_reliable_queue_t *queue, ovpn_reliable_pkt_t *pkt,
+			ip46_address_t *remote_addr, u16 remote_port,
+			u8 is_ip4)
 {
   ovpn_main_t *omp = &ovpn_main;
   u32 bi0 = ~0;
-  vlib_buffer_t *b0;
   ch = pool_elt_at_index (omp->channels, queue->channel_index);
   vec_add1 (ch->client_acks, pkt->pkt_id);
   ovpn_create_ctrl_ack_v1 (vm, &bi0, ch, &queue->replay_packet_id);
-  b0 = vlib_get_buffer (vm, bi0);
-  ovpn_prepend_rewrite (b0, remote_addr, remote_port, is_ip4);
-  ovpn_ip46_enqueue_packet (vm, is_ip4, bi0);
+  ovpn_send_reliable_pkt (vm, queue, is_ip4, bi0, remote_addr, remote_port);
   ovpn_reliable_ack_recv_pkt (vm, queue, pkt->pkt_id);
 }
 
@@ -491,17 +500,13 @@ ovpn_send_ctrl_server_reset_v2 (vlib_main_t *vm, ip46_address_t *remote_addr,
 				u64 remote_session_id)
 {
   u32 bi0 = ~0;
-  vlib_buffer_t *b0;
   ovpn_ctrl_msg_server_hard_reset_v2_t ctrl_msg;
   ctrl_msg.remote_session_id = clib_host_to_net_u64 (remote_session_id);
   ovpn_create_ctrl_frame (vm, ch,
 			  OVPN_OPCODE_TYPE_P_CONTROL_HARD_RESET_SERVER_V2,
 			  &queue->replay_packet_id, &queue->next_send_pkt_id,
 			  (u8 *) &ctrl_msg, sizeof (ctrl_msg), &bi0);
-  b0 = vlib_get_buffer (vm, bi0);
-  ovpn_prepend_rewrite (b0, remote_addr, remote_port, is_ip4);
-  ovpn_ip46_enqueue_packet (vm, is_ip4, bi0);
-  ovpn_reliable_enqueue_packet (vm, is_ip4, b0, queue);
+  ovpn_send_reliable_pkt (vm, queue, is_ip4, bi0, remote_addr, remote_port);
   return OVPN_ERROR_NONE;
 }
 
@@ -626,14 +631,10 @@ ovpn_send_ctrl_v1_response (vlib_main_t *vm, ip46_address_t *remote_addr,
 			    u32 payload_len)
 {
   u32 bi0 = ~0;
-  vlib_buffer_t *b0;
   ovpn_create_ctrl_frame (vm, ch, OVPN_OPCODE_TYPE_P_CONTROL_V1,
 			  &queue->replay_packet_id, &queue->next_send_pkt_id,
 			  payload, payload_len, &bi0);
-  b0 = vlib_get_buffer (vm, bi0);
-  ovpn_prepend_rewrite (b0, remote_addr, remote_port, is_ip4);
-  ovpn_ip46_enqueue_packet (vm, is_ip4, bi0);
-  ovpn_reliable_enqueue_packet (vm, is_ip4, b0, queue);
+  ovpn_send_reliable_pkt (vm, queue, is_ip4, bi0, remote_addr, remote_port);
   return OVPN_ERROR_NONE;
 }
 
@@ -650,7 +651,8 @@ ovpn_handle_tls_output (vlib_main_t *vm, ovpn_channel_t *ch,
 			u8 is_ip4, ptls_buffer_t *wbuf)
 {
   /* 先发 ACK */
-  ovpn_ack_recv_pkt (vm, ch, queue, pkt, remote_addr, remote_port, is_ip4);
+  ovpn_send_ack_recv_pkt (vm, ch, queue, pkt, remote_addr, remote_port,
+			  is_ip4);
 
   /* 再发 TLS response (如果有) */
   if (wbuf->off > 0)
@@ -713,7 +715,8 @@ ovpn_handle_post_handshake_pkt (vlib_main_t *vm, ovpn_channel_t *ch,
     }
   else
     {
-      ovpn_ack_recv_pkt (vm, ch, queue, pkt, remote_addr, remote_port, is_ip4);
+      ovpn_send_ack_recv_pkt (vm, ch, queue, pkt, remote_addr, remote_port,
+			      is_ip4);
     }
 
   ptls_buffer_dispose (&plaintext_buf);
@@ -760,7 +763,8 @@ ovpn_handle_handshake (vlib_main_t *vm, ip46_address_t *remote_addr,
   if (rv == 2)
     {
       /* ack only */
-      ovpn_ack_recv_pkt (vm, ch, queue, pkt, remote_addr, remote_port, is_ip4);
+      ovpn_send_ack_recv_pkt (vm, ch, queue, pkt, remote_addr, remote_port,
+			      is_ip4);
       return OVPN_ERROR_NONE;
     }
 
@@ -771,8 +775,8 @@ ovpn_handle_handshake (vlib_main_t *vm, ip46_address_t *remote_addr,
     {
       if (PREDICT_FALSE (pkt->recv.acked))
 	{
-	  ovpn_ack_recv_pkt (vm, ch, queue, pkt, remote_addr, remote_port,
-			     is_ip4);
+	  ovpn_send_ack_recv_pkt (vm, ch, queue, pkt, remote_addr, remote_port,
+				  is_ip4);
 	  ovpn_reliable_dequeue_recv_pkt (vm, queue, &pkt);
 	  continue;
 	}
