@@ -844,8 +844,8 @@ ovpn_handle_post_handshake_pkt (vlib_main_t *vm, ovpn_channel_t *ch,
       ovpn_send_tls_output (vm, ch, queue, pkt, remote_addr, remote_port,
 			    is_ip4, &encrypted_buf);
 
-      if (ch->state == OVPN_CHANNEL_STATE_ACTIVE)
-	ovpn_activate_session (sess);
+      ovpn_activate_session (sess);
+      ovpn_set_channel_state (ch, OVPN_CHANNEL_STATE_CLOSED);
 
       ptls_buffer_dispose (&encrypted_buf);
     }

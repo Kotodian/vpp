@@ -32,14 +32,13 @@
 /*
  * Recv P_CONTROL_HARD_RESET_CLIENT_V2: Init: Initial State
  * Send P_CONTROL_HARD_RESET_SERVER_V2: SSL_HANDSHAKE Start
- * TLS Handshake Success: Active
- * Recv PushRequest And Send PushReply: Closed
+ * TLS Handshake Success: SSL_HANDSHAKE_FINISHED
+ * Finish Key Negotiation: Closed
  */
 #define foreach_ovpn_channel_state                                            \
   _ (INIT, "Init")                                                            \
   _ (SSL_HANDSHAKE, "SSL Handshake")                                          \
   _ (SSL_HANDSHAKE_FINISHED, "SSL Handshake Finished")                        \
-  _ (ACTIVE, "Active")                                                        \
   _ (CLOSED, "Closed")
 
 typedef enum ovpn_channel_state
