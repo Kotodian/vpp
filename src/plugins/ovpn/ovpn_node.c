@@ -639,16 +639,10 @@ ovpn_send_ctrl_v1_response (vlib_main_t *vm, ip46_address_t *remote_addr,
 }
 
 always_inline void
-ovpn_key_negotiation (vlib_main_t *vm, ovpn_channel_t *ch, u8 *payload,
-		      u32 payload_len)
-{
-}
-
-always_inline void
-ovpn_handle_tls_output (vlib_main_t *vm, ovpn_channel_t *ch,
-			ovpn_reliable_queue_t *queue, ovpn_reliable_pkt_t *pkt,
-			ip46_address_t *remote_addr, u16 remote_port,
-			u8 is_ip4, ptls_buffer_t *wbuf)
+ovpn_send_tls_output (vlib_main_t *vm, ovpn_channel_t *ch,
+		      ovpn_reliable_queue_t *queue, ovpn_reliable_pkt_t *pkt,
+		      ip46_address_t *remote_addr, u16 remote_port, u8 is_ip4,
+		      ptls_buffer_t *wbuf)
 {
   /* 先发 ACK */
   ovpn_send_ack_recv_pkt (vm, ch, queue, pkt, remote_addr, remote_port,
@@ -670,6 +664,12 @@ ovpn_handle_tls_output (vlib_main_t *vm, ovpn_channel_t *ch,
 	  remaining -= chunk;
 	}
     }
+}
+
+always_inline void
+ovpn_handle_key_negotiation (vlib_main_t *vm, ovpn_channel_t *ch, u8 *payload,
+			     u32 payload_len)
+{
 }
 
 static inline ovpn_error_t
@@ -699,14 +699,15 @@ ovpn_handle_post_handshake_pkt (vlib_main_t *vm, ovpn_channel_t *ch,
 
   if (plaintext_buf.off > 0)
     {
-      ovpn_key_negotiation (vm, ch, plaintext_buf.base, plaintext_buf.off);
+      ovpn_handle_key_negotiation (vm, ch, plaintext_buf.base,
+				   plaintext_buf.off);
 
       ptls_buffer_t encrypted_buf;
       ptls_buffer_init (&encrypted_buf, NULL, 0);
       ptls_send (ch->tls, &encrypted_buf, NULL, 0);
 
-      ovpn_handle_tls_output (vm, ch, queue, pkt, remote_addr, remote_port,
-			      is_ip4, &encrypted_buf);
+      ovpn_send_tls_output (vm, ch, queue, pkt, remote_addr, remote_port,
+			    is_ip4, &encrypted_buf);
 
       if (ch->state == OVPN_CHANNEL_STATE_ACTIVE)
 	ovpn_activate_session (sess);
@@ -833,8 +834,8 @@ ovpn_handle_handshake (vlib_main_t *vm, ip46_address_t *remote_addr,
 	      else
 		{
 		  /* 统一处理 ACK + TLS response */
-		  ovpn_handle_tls_output (vm, ch, queue, pkt, remote_addr,
-					  remote_port, is_ip4, &wbuf);
+		  ovpn_send_tls_output (vm, ch, queue, pkt, remote_addr,
+					remote_port, is_ip4, &wbuf);
 		}
 
 	      ptls_buffer_dispose (&wbuf);
@@ -846,8 +847,8 @@ ovpn_handle_handshake (vlib_main_t *vm, ip46_address_t *remote_addr,
 	  /* == 握手还未完成 == */
 	  else if (hs_ret == PTLS_ERROR_IN_PROGRESS)
 	    {
-	      ovpn_handle_tls_output (vm, ch, queue, pkt, remote_addr,
-				      remote_port, is_ip4, &wbuf);
+	      ovpn_send_tls_output (vm, ch, queue, pkt, remote_addr,
+				    remote_port, is_ip4, &wbuf);
 
 	      ptls_buffer_dispose (&wbuf);
 	      ovpn_reliable_dequeue_recv_pkt (vm, queue, &pkt);
