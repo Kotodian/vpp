@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+#include "picotls.h"
+#include "picotls/openssl.h"
 #include <vppinfra/random.h>
 #include <ovpn/ovpn_channel.h>
 
@@ -33,6 +35,11 @@ ovpn_channel_init (vlib_main_t *vm, ovpn_channel_t *ch,
   ch->remote_session_id = remote_session_id;
   ch->is_ip4 = is_ip4;
   clib_memcpy_fast (&ch->remote_addr, remote_addr, sizeof (ip46_address_t));
+}
+
+void
+ovpn_channel_derive_key_material (ovpn_channel_t *ch, u8 key[32])
+{
 }
 
 void

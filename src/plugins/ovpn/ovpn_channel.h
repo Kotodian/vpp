@@ -27,12 +27,17 @@
 
 #define OVN_CHANNEL_EXPIRED_TIMEOUT (1 * 60) /* 1 minute */
 
+/*
+ * Recv P_CONTROL_HARD_RESET_CLIENT_V2: Init: Initial State
+ * Send P_CONTROL_HARD_RESET_SERVER_V2: SSL_HANDSHAKE Start
+ * TLS Handshake Success: Active
+ * Recv PushRequest And Send PushReply: Closed
+ */
 #define foreach_ovpn_channel_state                                            \
   _ (INIT, "Init")                                                            \
   _ (SSL_HANDSHAKE, "SSL Handshake")                                          \
   _ (SSL_HANDSHAKE_FINISHED, "SSL Handshake Finished")                        \
   _ (ACTIVE, "Active")                                                        \
-  _ (RENE, "Renegotiate")                                                     \
   _ (CLOSED, "Closed")
 
 typedef enum ovpn_channel_state
@@ -61,6 +66,7 @@ typedef struct ovpn_channel
 void ovpn_channel_init (vlib_main_t *vm, ovpn_channel_t *ch,
 			ptls_context_t *ssl_ctx, u64 remote_session_id,
 			ip46_address_t *remote_addr, u8 is_ip4, u32 ch_index);
+void ovpn_channel_derive_key_material (ovpn_channel_t *ch, u8 key[32]);
 void ovpn_channel_free (ovpn_channel_t *ch);
 
 #endif /* __included_ovpn_channel_h__ */

@@ -18,7 +18,8 @@
 #ifndef __included_ovpn_h__
 #define __included_ovpn_h__
 
-#include "ovpn/ovpn_channel.h"
+#include <ovpn/ovpn_channel.h>
+#include <ovpn/ovpn_if.h>
 #include <vnet/vnet.h>
 #include <vnet/ip/ip.h>
 #include <vnet/ethernet/ethernet.h>
@@ -37,7 +38,7 @@ typedef struct
   u16 msg_id_base;
 
   /* local address */
-  ip46_address_t local_addr;
+  ovpn_if_t *ovpn_if;
 
   /* local SSL context */
   ptls_context_t *ptls_ctx;

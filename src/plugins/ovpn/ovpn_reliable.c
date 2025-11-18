@@ -123,7 +123,9 @@ ovpn_reliable_retransmit_pkt (vlib_main_t *vm, ovpn_reliable_queue_t *queue,
 
 /*
   -1: drop: TODO handle replay
-  0: received
+  0: queued
+  1: received
+  2: received and acked
 */
 int
 ovpn_reliable_queue_recv_pkt (vlib_main_t *vm, ovpn_reliable_queue_t *queue,
@@ -134,8 +136,14 @@ ovpn_reliable_queue_recv_pkt (vlib_main_t *vm, ovpn_reliable_queue_t *queue,
   uword *p = NULL;
   p = hash_get (queue->recv_pkts_wnd_keys, &pkt_id);
   if (p != NULL)
-    return 1;
-  if (pool_len (queue->recv_pkts_wnd) >= OVPN_RELIABLE_MAX_RECV_SIZE)
+    {
+      new_pkt = pool_elt_at_index (queue->recv_pkts_wnd, p[0]);
+      if (new_pkt->recv.acked)
+	return 2;
+      return 1;
+    }
+
+  if (pool_elts (queue->recv_pkts_wnd) >= OVPN_RELIABLE_MAX_RECV_SIZE)
     {
       for (u32 i = 0; i < OVPN_RELIABLE_MAX_RECV_SIZE / 2; i++)
 	{
@@ -179,7 +187,7 @@ ovpn_reliable_ack_recv_pkt (vlib_main_t *vm, ovpn_reliable_queue_t *queue,
 			    u32 pkt_id)
 {
   uword *p = NULL;
-  p = hash_get (queue->recv_pkts_wnd_keys, &queue->next_recv_pkt_id);
+  p = hash_get (queue->recv_pkts_wnd_keys, &pkt_id);
   if (p == NULL)
     return;
   ovpn_reliable_pkt_t *pkt = pool_elt_at_index (queue->recv_pkts_wnd, p[0]);

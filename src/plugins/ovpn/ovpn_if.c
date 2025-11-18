@@ -1,7 +1,7 @@
 /*
- * ovpn_if.h - ovpn interface header file
+ * ovpn_if.c - ovpn interface
  *
- * Copyright (c) 2025 <blackfaceuncle@gmail.com>.
+ * Copyright (c) <current-year> <your-organization>
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at:
@@ -15,21 +15,7 @@
  * limitations under the License.
  */
 
-#ifndef __included_ovpn_if_h__
-#define __included_ovpn_if_h__
 
-#include <vlib/vlib.h>
-#include <vnet/ip/ip46_address.h>
-
-typedef struct ovpn_if_t_
-{
-  u32 sw_if_index;
-
-  /* Source IP address for originated packets */
-  ip46_address_t src_ip;
-} ovpn_if_t;
-
-#endif /* __included_ovpn_if_h__ */
 
 /*
  * fd.io coding-style-patch-verification: ON

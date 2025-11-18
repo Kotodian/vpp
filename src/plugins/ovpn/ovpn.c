@@ -1,5 +1,5 @@
 /*
- * ovpn.c - skeleton vpp engine plug-in
+ * ovpn.c - ovpn plugin
  *
  * Copyright (c) <current-year> <your-organization>
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -37,6 +37,61 @@
 
 ovpn_main_t ovpn_main;
 
+static int
+ovpn_enable (vlib_main_t *vm, ip46_address_t *src_addr)
+{
+  ovpn_main_t *omp = &ovpn_main;
+  ovpn_if_t *ovpn_if;
+
+  ovpn_if = clib_mem_alloc (sizeof (ovpn_if_t));
+  clib_memset (ovpn_if, 0, sizeof (ovpn_if_t));
+  if (ovpn_if == NULL)
+    return -1;
+  ovpn_if->src_ip = *src_addr;
+  omp->ovpn_if = ovpn_if;
+  return 0;
+}
+
+static clib_error_t *
+ovpn_enable_cmd (vlib_main_t *vm, unformat_input_t *input,
+		 vlib_cli_command_t *cmd)
+{
+  ovpn_main_t *omp = &ovpn_main;
+  ip46_address_t src_addr;
+  clib_error_t *error = NULL;
+  clib_memset (&src_addr, 0, sizeof (ip46_address_t));
+
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "src %U", unformat_ip46_address, &src_addr))
+	;
+      else
+	return clib_error_return (0, "unknown input '%U'",
+				  format_unformat_error, input);
+    }
+
+  if (omp->ovpn_if != NULL)
+    goto done;
+
+  if (ip46_address_is_zero (&src_addr))
+    {
+      error = clib_error_return (0, "Source address is required");
+      goto done;
+    }
+
+  ovpn_enable (vm, &src_addr);
+
+done:
+  return error;
+}
+
+VLIB_CLI_COMMAND (ovpn_cli_enable_command, static) = {
+  .path = "ovpn enable",
+  .short_help =
+    "ovpn enable <src-ip> tunnel-ip <tunnel-prefix> table-id <table-id>",
+  .function = ovpn_enable_cmd,
+};
+
 static clib_error_t *
 ovpn_init (vlib_main_t *vm)
 {
@@ -45,7 +100,7 @@ ovpn_init (vlib_main_t *vm)
 
   omp->vlib_main = vm;
   omp->vnet_main = vnet_get_main ();
-  clib_memset (&omp->local_addr, 0, sizeof (ip46_address_t));
+  omp->ovpn_if = NULL;
 
   omp->in4_index = vlib_frame_queue_main_init (ovpn4_input_node.index, 0);
   omp->in6_index = vlib_frame_queue_main_init (ovpn6_input_node.index, 0);
@@ -69,9 +124,6 @@ ovpn_init (vlib_main_t *vm)
   /* Process Node */
   omp->ctrl_node_index = ovpn_ctrl_process_node.index;
   omp->timer_node_index = ovpn_timer_process_node.index;
-
-  udp_register_dst_port (vm, UDP_DST_PORT_ovpn, ovpn4_input_node.index, 1);
-  udp_register_dst_port (vm, UDP_DST_PORT_ovpn6, ovpn6_input_node.index, 0);
 
   return error;
 }

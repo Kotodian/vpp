@@ -27,15 +27,17 @@ add_vpp_plugin(ovpn
   SOURCES
   ovpn.c
   ovpn_node.c
-  ovpn_timer.c
   ovpn_session.c 
   ovpn_channel.c
   ovpn_reliable.c
+  ovpn_timer.c
+  ovpn_if.c
+
   ovpn.h
   ovpn_message.h
+  ovpn_session.h
   ovpn_channel.h
   ovpn_reliable.h
-  ovpn_session.h
   ovpn_timer.h
   ovpn_if.h
   private.h

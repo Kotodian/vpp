@@ -14,10 +14,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "ovpn/ovpn_channel.h"
-#include "ovpn/ovpn_reliable.h"
-#include "picotls.h"
-#include "vnet/crypto/crypto.h"
+#include <ovpn/ovpn_channel.h>
+#include <ovpn/ovpn_reliable.h>
+#include <picotls.h>
 #include <ovpn/private.h>
 #include <vlib/node_funcs.h>
 #include <vlib/threads.h>
@@ -138,7 +137,7 @@ ovpn_create_session (ip46_address_t remote_addr, u8 is_ip4, u32 *sess_index)
   kv.value = *sess_index;
   BV (clib_bihash_add_del) (&omp->session_hash, &kv, 1);
   tw_timer_start_2t_1w_2048sl (&omp->sessions_timer_wheel, *sess_index, 0,
-			       OVN_SESSION_EXPIRED_TIMEOUT);
+			       (u64) OVN_SESSION_EXPIRED_TIMEOUT);
   return OVPN_SESSION_ERROR_NONE;
 }
 
@@ -163,9 +162,11 @@ ovpn_activate_session (ovpn_session_t *sess)
 {
   ovpn_main_t *omp = &ovpn_main;
   sess->state = OVPN_SESSION_STATE_ACTIVE;
+  /* Free channel */
+  sess->channel_index = ~0;
   tw_timer_stop_2t_1w_2048sl (&omp->sessions_timer_wheel, sess->index);
   tw_timer_start_2t_1w_2048sl (&omp->sessions_timer_wheel, sess->index, 0,
-			       OVN_SESSION_EXPIRED_TIMEOUT);
+			       (u64) OVN_SESSION_EXPIRED_TIMEOUT);
 }
 
 always_inline void
@@ -224,11 +225,10 @@ ovpn_create_channel (ovpn_session_t *sess, ip46_address_t *remote_addr,
   *ch_index = index;
   sess->channel_index = index;
   tw_timer_start_2t_1w_2048sl (&omp->channels_timer_wheel, index, 0,
-			       OVN_CHANNEL_EXPIRED_TIMEOUT);
+			       (u64) OVN_CHANNEL_EXPIRED_TIMEOUT);
 }
 always_inline void
-ovpn_set_channel_state (vlib_main_t *vm, ovpn_channel_t *ch,
-			ovpn_channel_state_t state)
+ovpn_set_channel_state (ovpn_channel_t *ch, ovpn_channel_state_t state)
 {
   ovpn_main_t *omp = &ovpn_main;
   ch->state = state;
@@ -236,7 +236,7 @@ ovpn_set_channel_state (vlib_main_t *vm, ovpn_channel_t *ch,
     {
       tw_timer_stop_2t_1w_2048sl (&omp->channels_timer_wheel, ch->index);
       tw_timer_start_2t_1w_2048sl (&omp->channels_timer_wheel, ch->index, 0,
-				   OVN_CHANNEL_EXPIRED_TIMEOUT);
+				   (u64) OVN_CHANNEL_EXPIRED_TIMEOUT);
     }
 }
 
@@ -252,8 +252,8 @@ ovpn_create_reliable_queue (ovpn_channel_t *ch, u32 *reliable_queue_index)
 }
 
 always_inline void
-ovpn_prepend_rewrite (vlib_main_t *vm, vlib_buffer_t *b0,
-		      ip46_address_t *remote_addr, u16 remote_port, u8 is_ip4)
+ovpn_prepend_rewrite (vlib_buffer_t *b0, ip46_address_t *remote_addr,
+		      u16 remote_port, u8 is_ip4)
 {
   ovpn_main_t *omp = &ovpn_main;
   if (is_ip4)
@@ -263,7 +263,7 @@ ovpn_prepend_rewrite (vlib_main_t *vm, vlib_buffer_t *b0,
       vlib_buffer_advance (b0, -sizeof (*hdr4));
       hdr4 = vlib_buffer_get_current (b0);
 
-      clib_memcpy_fast (&hdr4->ip4.src_address, &omp->local_addr,
+      clib_memcpy_fast (&hdr4->ip4.src_address, &omp->ovpn_if->src_ip,
 			sizeof (ip4_address_t));
       clib_memcpy_fast (&hdr4->ip4.dst_address, remote_addr,
 			sizeof (ip4_address_t));
@@ -284,7 +284,7 @@ ovpn_prepend_rewrite (vlib_main_t *vm, vlib_buffer_t *b0,
       vlib_buffer_advance (b0, -sizeof (*hdr6));
       hdr6 = vlib_buffer_get_current (b0);
 
-      clib_memcpy_fast (&hdr6->ip6.src_address, &omp->local_addr,
+      clib_memcpy_fast (&hdr6->ip6.src_address, &omp->ovpn_if->src_ip,
 			sizeof (ip6_address_t));
       clib_memcpy_fast (&hdr6->ip6.dst_address, remote_addr,
 			sizeof (ip6_address_t));
@@ -479,7 +479,7 @@ ovpn_ack_recv_pkt (vlib_main_t *vm, ovpn_channel_t *ch,
   vec_add1 (ch->client_acks, pkt->pkt_id);
   ovpn_create_ctrl_ack_v1 (vm, &bi0, ch, &queue->replay_packet_id);
   b0 = vlib_get_buffer (vm, bi0);
-  ovpn_prepend_rewrite (vm, b0, remote_addr, remote_port, is_ip4);
+  ovpn_prepend_rewrite (b0, remote_addr, remote_port, is_ip4);
   ovpn_ip46_enqueue_packet (vm, is_ip4, bi0);
   ovpn_reliable_ack_recv_pkt (vm, queue, pkt->pkt_id);
 }
@@ -539,7 +539,7 @@ ovpn_handle_hard_reset_client_v2 (vlib_main_t *vm, uword *event_data)
 			  &queue->replay_packet_id, &queue->next_send_pkt_id,
 			  (u8 *) &ctrl_msg, sizeof (ctrl_msg), &bi0);
   b0 = vlib_get_buffer (vm, bi0);
-  ovpn_prepend_rewrite (vm, b0, &event->remote_addr, event->client_port,
+  ovpn_prepend_rewrite (b0, &event->remote_addr, event->client_port,
 			event->is_ip4);
   ovpn_ip46_enqueue_packet (vm, event->is_ip4, bi0);
   ovpn_reliable_enqueue_packet (vm, event->is_ip4, b0, queue);
@@ -610,11 +610,10 @@ done:
 }
 
 always_inline ovpn_error_t
-ovpn_send_ssl_handshake_response (vlib_main_t *vm, ip46_address_t *remote_addr,
-				  u16 remote_port, u8 is_ip4,
-				  ovpn_channel_t *ch,
-				  ovpn_reliable_queue_t *queue, u8 *payload,
-				  u32 payload_len)
+ovpn_send_ctrl_v1_response (vlib_main_t *vm, ip46_address_t *remote_addr,
+			    u16 remote_port, u8 is_ip4, ovpn_channel_t *ch,
+			    ovpn_reliable_queue_t *queue, u8 *payload,
+			    u32 payload_len)
 {
   u32 bi0 = ~0;
   vlib_buffer_t *b0;
@@ -622,9 +621,92 @@ ovpn_send_ssl_handshake_response (vlib_main_t *vm, ip46_address_t *remote_addr,
 			  &queue->replay_packet_id, &queue->next_send_pkt_id,
 			  payload, payload_len, &bi0);
   b0 = vlib_get_buffer (vm, bi0);
-  ovpn_prepend_rewrite (vm, b0, remote_addr, remote_port, is_ip4);
+  ovpn_prepend_rewrite (b0, remote_addr, remote_port, is_ip4);
   ovpn_ip46_enqueue_packet (vm, is_ip4, bi0);
   ovpn_reliable_enqueue_packet (vm, is_ip4, b0, queue);
+  return OVPN_ERROR_NONE;
+}
+
+always_inline void
+ovpn_key_negotiation (vlib_main_t *vm, ovpn_channel_t *ch, u8 *payload,
+		      u32 payload_len)
+{
+}
+
+always_inline void
+ovpn_handle_tls_output (vlib_main_t *vm, ovpn_channel_t *ch,
+			ovpn_reliable_queue_t *queue, ovpn_reliable_pkt_t *pkt,
+			ip46_address_t *remote_addr, u16 remote_port,
+			u8 is_ip4, ptls_buffer_t *wbuf)
+{
+  /* 先发 ACK */
+  ovpn_ack_recv_pkt (vm, ch, queue, pkt, remote_addr, remote_port, is_ip4);
+
+  /* 再发 TLS response (如果有) */
+  if (wbuf->off > 0)
+    {
+      size_t remaining = wbuf->off;
+      uint8_t *resp = (uint8_t *) wbuf->base;
+
+      while (remaining > 0)
+	{
+	  u32 chunk =
+	    (remaining > OVPN_FRAME_SIZE) ? OVPN_FRAME_SIZE : (u32) remaining;
+	  ovpn_send_ctrl_v1_response (vm, remote_addr, remote_port, is_ip4, ch,
+				      queue, resp, chunk);
+	  resp += chunk;
+	  remaining -= chunk;
+	}
+    }
+}
+
+static inline ovpn_error_t
+ovpn_handle_post_handshake_pkt (vlib_main_t *vm, ovpn_channel_t *ch,
+				ovpn_reliable_queue_t *queue,
+				ovpn_reliable_pkt_t *pkt,
+				ip46_address_t *remote_addr, u16 remote_port,
+				u8 is_ip4, ovpn_session_t *sess)
+{
+  ptls_buffer_t plaintext_buf;
+  ptls_buffer_init (&plaintext_buf, NULL, 0);
+  size_t input_off = 0;
+
+  while (input_off < pkt->data_len)
+    {
+      size_t consumed = pkt->data_len - input_off;
+      int rv = ptls_receive (ch->tls, &plaintext_buf, pkt->data + input_off,
+			     &consumed);
+      input_off += consumed;
+
+      if (rv != 0)
+	{
+	  ptls_buffer_dispose (&plaintext_buf);
+	  return OVPN_ERROR_SSL_HANDSHAKE_FAILED;
+	}
+    }
+
+  if (plaintext_buf.off > 0)
+    {
+      ovpn_key_negotiation (vm, ch, plaintext_buf.base, plaintext_buf.off);
+
+      ptls_buffer_t encrypted_buf;
+      ptls_buffer_init (&encrypted_buf, NULL, 0);
+      ptls_send (ch->tls, &encrypted_buf, NULL, 0);
+
+      ovpn_handle_tls_output (vm, ch, queue, pkt, remote_addr, remote_port,
+			      is_ip4, &encrypted_buf);
+
+      if (ch->state == OVPN_CHANNEL_STATE_ACTIVE)
+	ovpn_activate_session (sess);
+
+      ptls_buffer_dispose (&encrypted_buf);
+    }
+  else
+    {
+      ovpn_ack_recv_pkt (vm, ch, queue, pkt, remote_addr, remote_port, is_ip4);
+    }
+
+  ptls_buffer_dispose (&plaintext_buf);
   return OVPN_ERROR_NONE;
 }
 
@@ -644,46 +726,40 @@ ovpn_handle_ssl_handshake (vlib_main_t *vm, ip46_address_t *remote_addr,
 
   /* 找 session */
   if (ovpn_find_session (remote_addr, &sess_index) != OVPN_SESSION_ERROR_NONE)
-    {
-      error = OVPN_ERROR_SSL_HANDSHAKE_FAILED;
-      goto done;
-    }
+    return OVPN_ERROR_SSL_HANDSHAKE_FAILED;
   sess = pool_elt_at_index (omp->sessions, sess_index);
 
   /* 验证 channel */
   if (PREDICT_FALSE (pool_is_free_index (omp->channels, sess->channel_index)))
-    goto done;
+    return OVPN_ERROR_SSL_HANDSHAKE_FAILED;
   ch = pool_elt_at_index (omp->channels, sess->channel_index);
-  if (PREDICT_FALSE (ch->remote_session_id != remote_session_id))
-    goto done;
-  if (PREDICT_FALSE (sess->state != OVPN_SESSION_STATE_HANDSHAKING))
-    {
-      error = OVPN_ERROR_SSL_HANDSHAKE_FAILED;
-      goto done;
-    }
-  if (PREDICT_FALSE (ch->state != OVPN_CHANNEL_STATE_SSL_HANDSHAKE))
-    {
-      error = OVPN_ERROR_SSL_HANDSHAKE_FAILED;
-      goto done;
-    }
 
-  /* 把收到的 pkt 入队（重复包非致命，-1/其它负值视为失败） */
+  if (PREDICT_FALSE (ch->remote_session_id != remote_session_id))
+    return OVPN_ERROR_SSL_HANDSHAKE_FAILED;
+  if (PREDICT_FALSE (sess->state != OVPN_SESSION_STATE_HANDSHAKING))
+    return OVPN_ERROR_SSL_HANDSHAKE_FAILED;
+  if (PREDICT_FALSE (ch->state != OVPN_CHANNEL_STATE_SSL_HANDSHAKE &&
+		     ch->state != OVPN_CHANNEL_STATE_SSL_HANDSHAKE_FINISHED))
+    return OVPN_ERROR_SSL_HANDSHAKE_FAILED;
+
+  /* 入队 */
   queue = pool_elt_at_index (omp->reliable_queues, ch->reliable_queue_index);
   rv = ovpn_reliable_queue_recv_pkt (vm, queue, pkt_id, data, data_len);
   if (rv < 0)
+    return OVPN_ERROR_SSL_HANDSHAKE_FAILED;
+  if (rv == 2)
     {
-      /* 内存/其它严重错误 */
-      error = OVPN_ERROR_SSL_HANDSHAKE_FAILED;
-      goto done;
+      /* ack only */
+      ovpn_ack_recv_pkt (vm, ch, queue, pkt, remote_addr, remote_port, is_ip4);
+      return OVPN_ERROR_NONE;
     }
 
-  /* 开始按序 dequeue 并处理；目标是一直尝试 dequeue 直到空 */
+  /* 按序 dequeue 处理 */
   ovpn_reliable_dequeue_recv_pkt (vm, queue, &pkt);
 
   while (pkt != NULL)
     {
-      /* 如果已经被 ack 过，向对端 ack（确保对端知道）并继续下一个 pkt */
-      if (pkt->recv.acked)
+      if (PREDICT_FALSE (pkt->recv.acked))
 	{
 	  ovpn_ack_recv_pkt (vm, ch, queue, pkt, remote_addr, remote_port,
 			     is_ip4);
@@ -691,92 +767,91 @@ ovpn_handle_ssl_handshake (vlib_main_t *vm, ip46_address_t *remote_addr,
 	  continue;
 	}
 
-      /* 对当前 pkt 的 data 进行连续消费（类似 socket recvbuf 的 roff/consumed
-       * 逻辑） */
-      {
-	size_t roff = 0;
-	int hs_ret = PTLS_ERROR_IN_PROGRESS;
+      /* 已完成握手，处理明文 */
+      if (ch->state == OVPN_CHANNEL_STATE_SSL_HANDSHAKE_FINISHED)
+	{
+	  if (error == OVPN_ERROR_NONE)
+	    error = ovpn_handle_post_handshake_pkt (
+	      vm, ch, queue, pkt, remote_addr, remote_port, is_ip4, sess);
 
-	/* 当握手仍需要并且当前 pkt 还有未消费的数据时，反复调用 ptls_handshake
-	 */
-	while (hs_ret == PTLS_ERROR_IN_PROGRESS && roff < pkt->data_len)
-	  {
-	    ptls_buffer_t wbuf;
-	    ptls_buffer_init (&wbuf, NULL, 0);
+	  ovpn_reliable_dequeue_recv_pkt (vm, queue, &pkt);
+	  continue;
+	}
 
-	    size_t consumed = pkt->data_len - roff;
-	    hs_ret = ptls_handshake (ch->tls, &wbuf, pkt->data + roff,
-				     &consumed, NULL);
-	    /* consumed 表示本次调用消费了多少输入 */
-	    roff += consumed;
+      /* handshake loop */
+      size_t roff = 0;
+      int hs_ret = PTLS_ERROR_IN_PROGRESS;
 
-	    /* 如果 ptls 写了响应到 wbuf，要立刻发送（按帧分片） */
-	    if (wbuf.off > 0)
-	      {
-		size_t remaining = wbuf.off;
-		uint8_t *resp = (uint8_t *) wbuf.base;
-		while (remaining > 0)
-		  {
-		    u32 chunk = (remaining > OVPN_FRAME_SIZE) ?
-				  OVPN_FRAME_SIZE :
-				  (u32) remaining;
-		    ovpn_send_ssl_handshake_response (vm, remote_addr,
-						      remote_port, is_ip4, ch,
-						      queue, resp, chunk);
-		    resp += chunk;
-		    remaining -= chunk;
-		  }
-	      }
+      while (hs_ret == PTLS_ERROR_IN_PROGRESS && roff < pkt->data_len)
+	{
+	  ptls_buffer_t wbuf;
+	  ptls_buffer_init (&wbuf, NULL, 0);
 
-	    ptls_buffer_dispose (&wbuf);
+	  size_t consumed = pkt->data_len - roff;
+	  hs_ret =
+	    ptls_handshake (ch->tls, &wbuf, pkt->data + roff, &consumed, NULL);
+	  roff += consumed;
 
-	    /* 如果握手完成（hs_ret == 0）或出错（hs_ret < 0 且 !=
-	     * IN_PROGRESS），退出内循环处理结果 */
-	  } /* end inner handshake loop */
+	  /* == 握手完成 == */
+	  if (hs_ret == 0 && ptls_handshake_is_complete (ch->tls))
+	    {
+	      ovpn_set_channel_state (
+		ch, OVPN_CHANNEL_STATE_SSL_HANDSHAKE_FINISHED);
 
-	/* 根据握手结果处理 */
-	if (hs_ret == 0)
-	  {
+	      /* pkt 中有剩余报文 */
+	      if (roff < pkt->data_len)
+		{
+		  ovpn_reliable_pkt_t tmp = *pkt;
+		  tmp.data += roff;
+		  tmp.data_len -= roff;
 
-	    if (PREDICT_TRUE (ptls_handshake_is_complete (ch->tls)))
-	      {
-		/* 可在此处生成 key material（TODO） */
-		/* 握手成功：更新状态并激活 session */
-		ovpn_set_channel_state (
-		  vm, ch, OVPN_CHANNEL_STATE_SSL_HANDSHAKE_FINISHED);
-		ovpn_activate_session (sess);
-	      }
+		  /* 尝试handle，并发送ack */
+		  error = ovpn_handle_post_handshake_pkt (
+		    vm, ch, queue, &tmp, remote_addr, remote_port, is_ip4,
+		    sess);
+		  if (error != OVPN_ERROR_NONE)
+		    {
+		      ch->state = OVPN_CHANNEL_STATE_CLOSED;
+		      ptls_buffer_dispose (&wbuf);
+		      return error;
+		    }
+		}
+	      else
+		{
+		  /* 统一处理 ACK + TLS response */
+		  ovpn_handle_tls_output (vm, ch, queue, pkt, remote_addr,
+					  remote_port, is_ip4, &wbuf);
+		}
 
-	    /* 握手成功后我们可以选择：1) 忽略并丢弃该 pkt；2)
-	       继续处理队列中的下一个 pkt
-	       目前选择退出循环（握手完成），如果你希望继续处理队列可将 break
-	       改为 ovpn_reliable_dequeue_recv_pkt(...) 继续。 */
-	    break;
-	  }
-	else if (hs_ret == PTLS_ERROR_IN_PROGRESS)
-	  {
-	    /*
-	     * 表示：我们已经消费了这个 pkt 的全部输入（roff ==
-	     * pkt->data_len）， 但握手仍未完成，需要等待更多来自对端的数据 ——
-	     * 我们发送了上面 wbuf 中的响应（如果有） 然后 ack 这个
-	     * pkt（告诉对端已收到）并继续 dequeue 下一个输入 pkt。
-	     */
-	    ovpn_ack_recv_pkt (vm, ch, queue, pkt, remote_addr, remote_port,
-			       is_ip4);
-	    ovpn_reliable_dequeue_recv_pkt (vm, queue, &pkt);
-	    continue; /* 继续外层 while 以处理下一个 pkt（或退出如果没有） */
-	  }
-	else
-	  {
-	    /* 其它错误：握手失败，关闭 channel 并返回错误 */
-	    ch->state = OVPN_CHANNEL_STATE_CLOSED;
-	    error = OVPN_ERROR_SSL_HANDSHAKE_FAILED;
-	    goto done;
-	  }
-      } /* end pkt handling block */
-    } /* end while pkt */
+	      ptls_buffer_dispose (&wbuf);
 
-done:
+	      ovpn_reliable_dequeue_recv_pkt (vm, queue, &pkt);
+	      continue;
+	    }
+
+	  /* == 握手还未完成 == */
+	  else if (hs_ret == PTLS_ERROR_IN_PROGRESS)
+	    {
+	      ovpn_handle_tls_output (vm, ch, queue, pkt, remote_addr,
+				      remote_port, is_ip4, &wbuf);
+
+	      ptls_buffer_dispose (&wbuf);
+	      ovpn_reliable_dequeue_recv_pkt (vm, queue, &pkt);
+	      continue;
+	    }
+
+	  /* == 失败 == */
+	  else
+	    {
+	      ch->state = OVPN_CHANNEL_STATE_CLOSED;
+	      ptls_buffer_dispose (&wbuf);
+	      return OVPN_ERROR_SSL_HANDSHAKE_FAILED;
+	    }
+
+	  ptls_buffer_dispose (&wbuf);
+	}
+    }
+
   return error;
 }
 
@@ -802,11 +877,14 @@ ovpn_handle_reliable_send_queue_expired (vlib_main_t *vm, uword *event_data)
   ovpn_main_t *omp = &ovpn_main;
   u32 bi0 = ~0;
   vlib_buffer_t *b0;
+  ovpn_reliable_queue_t *queue;
+  ovpn_reliable_pkt_t *pkt = NULL;
   ovpn_reliable_send_queue_event_t *event =
     (ovpn_reliable_send_queue_event_t *) event_data[0];
-  ovpn_reliable_queue_t *queue =
-    pool_elt_at_index (omp->reliable_queues, event->queue_index);
-  ovpn_reliable_pkt_t *pkt = NULL;
+
+  if (pool_is_free_index (omp->reliable_queues, event->queue_index))
+    goto done;
+  queue = pool_elt_at_index (omp->reliable_queues, event->queue_index);
   if (ovpn_reliable_retransmit_pkt (vm, queue, event->pkt_id, &pkt) == 0)
     {
       if (vlib_buffer_alloc (vm, &bi0, 1) != 1)
@@ -937,7 +1015,7 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
 	  if (PREDICT_FALSE (udp0->dst_port !=
 			       clib_host_to_net_u16 (UDP_DST_PORT_ovpn) ||
-			     ip46_address_is_zero (&omp->local_addr)))
+			     omp->ovpn_if == NULL))
 	    {
 	      next0 = OVPN_NEXT_DROP;
 	      error0 = OVPN_ERROR_NONE;
@@ -1152,7 +1230,6 @@ ovpn_handoff_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
   vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b;
   u16 thread_indices[VLIB_FRAME_SIZE], *ti;
   u32 n_enq, n_left_from, *from;
-  ovpn_main_t *omp = &ovpn_main;
 
   from = vlib_frame_vector_args (frame);
   n_left_from = frame->n_vectors;
@@ -1176,7 +1253,7 @@ ovpn_handoff_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       ti += 1;
       b += 1;
     }
-  n_enq = vlib_buffer_enqueue_to_thread (vm, node, omp->in4_index, from,
+  n_enq = vlib_buffer_enqueue_to_thread (vm, node, fq_index, from,
 					 thread_indices, frame->n_vectors, 1);
   if (n_enq < frame->n_vectors)
     vlib_node_increment_counter (vm, node->node_index,
