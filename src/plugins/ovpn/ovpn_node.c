@@ -1175,13 +1175,13 @@ ovpn_handle_reliable_send_queue_expired (vlib_main_t *vm, uword *event_data)
   queue = pool_elt_at_index (omp->reliable_queues, event->queue_index);
   if (ovpn_reliable_retransmit_pkt (vm, queue, event->pkt_id, &pkt) == 0)
     {
+      if (pkt == NULL)
+	{
+	  goto done;
+	}
       if (vlib_buffer_alloc (vm, &bi0, 1) != 1)
 	{
 	  clib_warning ("Failed to allocate buffer");
-	  goto done;
-	}
-      if (pkt == NULL)
-	{
 	  goto done;
 	}
       b0 = vlib_get_buffer (vm, bi0);
