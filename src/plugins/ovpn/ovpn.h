@@ -31,6 +31,7 @@
 #include <ovpn/ovpn_session.h>
 #include <ovpn/ovpn_reliable.h>
 #include <vppinfra/tw_timer_2t_1w_2048sl.h>
+#include <ovpn/private.h>
 
 typedef struct
 {
@@ -59,9 +60,12 @@ typedef struct
   BVT (clib_bihash) session_hash;
   ovpn_session_t *sessions;
   tw_timer_wheel_2t_1w_2048sl_t sessions_timer_wheel;
+  /* key2 */
+  ovpn_key2_t *key2s;
 
   /* channel */
   ovpn_channel_t *channels;
+
   tw_timer_wheel_2t_1w_2048sl_t channels_timer_wheel;
 
   /* key source */
@@ -71,8 +75,8 @@ typedef struct
   ovpn_reliable_queue_t *reliable_queues;
   tw_timer_wheel_2t_1w_2048sl_t queues_timer_wheel;
 
-  /* key2 */
-  ovpn_key2_t *key2s;
+  /* per thread data */
+  ovpn_per_thread_data_t *per_thread_data;
 
   /* convenience */
   vlib_main_t *vlib_main;

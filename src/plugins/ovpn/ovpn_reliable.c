@@ -205,7 +205,7 @@ ovpn_reliable_ack_recv_pkt (vlib_main_t *vm, ovpn_reliable_queue_t *queue,
   if (p == NULL)
     return;
   ovpn_reliable_pkt_t *pkt = pool_elt_at_index (queue->recv_pkts_wnd, p[0]);
-  pkt->recv.consumed = pkt->data_len;
+  ASSERT (pkt->recv.consumed < pkt->data_len);
   pkt->recv.acked = 1;
 }
 

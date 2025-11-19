@@ -18,6 +18,7 @@
 #ifndef __included_ovpn_channel_h__
 #define __included_ovpn_channel_h__
 
+#include "vnet/crypto/crypto.h"
 #include <picotls.h>
 #include <picotls/openssl.h>
 #include <vlib/vlib.h>
@@ -64,6 +65,8 @@ typedef struct ovpn_key2
 #define OVPN_KEY_DIR_TO_CLIENT 0
 #define OVPN_KEY_DIR_TO_SERVER 1
   ovpn_key_t keys[2]; // keys[0] = server->client, keys[1] = client->server
+  vnet_crypto_key_index_t recv_key_index;
+  vnet_crypto_key_index_t send_key_index;
 } ovpn_key2_t;
 
 typedef struct ovpn_channel

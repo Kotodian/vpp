@@ -18,6 +18,9 @@
 #define __included_ovpn_private_h__
 
 #include <vnet/ip/ip.h>
+#include <vnet/crypto/crypto.h>
+
+#define OVN_DEFAULT_DATA_SIZE 2048
 
 #define foreach_ovpn_ctrl_event_type                                          \
   _ (HARD_RESET_CLIENT_V2, "Hard reset client v2")                            \
@@ -61,6 +64,15 @@ typedef struct ovpn_reliable_send_queue_event
   u32 queue_index;
   u32 pkt_id;
 } ovpn_reliable_send_queue_event_t;
+
+typedef struct ovpn_per_thread_data
+{
+  CLIB_CACHE_LINE_ALIGN_MARK (cacheline0);
+  vnet_crypto_op_t *crypto_ops;
+  vnet_crypto_op_t *chained_crypto_ops;
+  vnet_crypto_op_chunk_t *chunks;
+  u8 data[OVN_DEFAULT_DATA_SIZE];
+} ovpn_per_thread_data_t;
 
 void
 ovpn_secure_zero_memory (void *v, size_t n)

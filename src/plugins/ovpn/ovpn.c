@@ -96,11 +96,14 @@ static clib_error_t *
 ovpn_init (vlib_main_t *vm)
 {
   ovpn_main_t *omp = &ovpn_main;
+  vlib_thread_main_t *tm = vlib_get_thread_main ();
   clib_error_t *error = 0;
 
   omp->vlib_main = vm;
   omp->vnet_main = vnet_get_main ();
   omp->ovpn_if = NULL;
+  vec_validate_aligned (omp->per_thread_data, tm->n_vlib_mains,
+			CLIB_CACHE_LINE_BYTES);
 
   omp->in4_index = vlib_frame_queue_main_init (ovpn4_input_node.index, 0);
   omp->in6_index = vlib_frame_queue_main_init (ovpn6_input_node.index, 0);

@@ -25,9 +25,10 @@ ovpn_session_init (vlib_main_t *vm, ovpn_session_t *sess, u32 index,
   sess->index = index;
   sess->state = OVPN_SESSION_STATE_NEW;
   sess->channel_index = ~0;
-  sess->expired_time = vlib_time_now (vm) + OVN_SESSION_EXPIRED_TIMEOUT;
   clib_memcpy_fast (&sess->remote_addr, remote_addr, sizeof (ip46_address_t));
   sess->is_ip4 = is_ip4;
+  sess->key2_index = ~0;
+  sess->input_thread_index = ~0;
 }
 
 void

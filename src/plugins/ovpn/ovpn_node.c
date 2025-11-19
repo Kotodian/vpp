@@ -79,6 +79,7 @@ typedef enum
 {
   OVPN_NEXT_IP_LOOKUP,
   OVPN_NEXT_HANDOFF_HANDSHAKE,
+  OVPN_NEXT_HANDOFF_DATA,
   OVPN_NEXT_DROP,
   OVPN_N_NEXT,
 } ovpn_next_t;
@@ -251,10 +252,14 @@ ovpn_activate_session (ovpn_session_t *sess, ovpn_channel_t *ch)
   sess->state = OVPN_SESSION_STATE_ACTIVE;
   /* Register key to crypto engine */
   ovpn_key2_t *key2 = pool_elt_at_index (omp->key2s, sess->key2_index);
-  vnet_crypto_key_add (vm, VNET_CRYPTO_ALG_AES_256_GCM, key2->keys[0].cipher,
-		       sizeof (key2->keys[0].cipher));
-  vnet_crypto_key_add (vm, VNET_CRYPTO_ALG_AES_256_GCM, key2->keys[1].cipher,
-		       sizeof (key2->keys[1].cipher));
+  key2->recv_key_index =
+    vnet_crypto_key_add (vm, VNET_CRYPTO_ALG_CHACHA20_POLY1305,
+			 key2->keys[OVPN_KEY_DIR_TO_SERVER].cipher,
+			 sizeof (key2->keys[OVPN_KEY_DIR_TO_SERVER].cipher));
+  key2->send_key_index =
+    vnet_crypto_key_add (vm, VNET_CRYPTO_ALG_CHACHA20_POLY1305,
+			 key2->keys[OVPN_KEY_DIR_TO_CLIENT].cipher,
+			 sizeof (key2->keys[OVPN_KEY_DIR_TO_CLIENT].cipher));
   /* Free channel */
   sess->channel_index = ~0;
   tw_timer_stop_2t_1w_2048sl (&omp->sessions_timer_wheel, sess->index);
@@ -303,6 +308,7 @@ ovpn_free_session (vlib_main_t *vm, ovpn_session_t *sess)
   kv.key[0] = sess->remote_addr.as_u64[0];
   kv.key[1] = sess->remote_addr.as_u64[1];
   kv.value = sess->index;
+  BV (clib_bihash_add_del) (&omp->session_hash, &kv, 0);
   if (!pool_is_free_index (omp->channels, sess->channel_index))
     {
       ch = pool_elt_at_index (omp->channels, sess->channel_index);
@@ -313,10 +319,12 @@ ovpn_free_session (vlib_main_t *vm, ovpn_session_t *sess)
     {
       ovpn_key2_t *key2 = pool_elt_at_index (omp->key2s, sess->key2_index);
       ovpn_secure_zero_memory (key2->keys, sizeof (key2->keys));
+      vnet_crypto_key_del (vm, key2->recv_key_index);
+      vnet_crypto_key_del (vm, key2->send_key_index);
       pool_put (omp->key2s, key2);
       sess->key2_index = ~0;
     }
-  BV (clib_bihash_add_del) (&omp->session_hash, &kv, 0);
+  sess->input_thread_index = ~0;
   ovpn_session_free (sess);
   pool_put (omp->sessions, sess);
 }
@@ -1547,6 +1555,7 @@ VLIB_REGISTER_NODE (ovpn4_input_node) =
   .next_nodes = {
         [OVPN_NEXT_IP_LOOKUP] = "ovpn4-handoff-handshake",
         [OVPN_NEXT_HANDOFF_HANDSHAKE] = "ovpn4-handoff-handshake",
+        [OVPN_NEXT_HANDOFF_DATA] = "ovpn4-handoff-data",
         [OVPN_NEXT_DROP] = "error-drop",
   },
 };
@@ -1568,6 +1577,7 @@ VLIB_REGISTER_NODE (ovpn6_input_node) =
   .next_nodes = {
         [OVPN_NEXT_IP_LOOKUP] = "ip6-lookup",
         [OVPN_NEXT_HANDOFF_HANDSHAKE] = "ovpn6-handoff-handshake",
+        [OVPN_NEXT_HANDOFF_DATA] = "ovpn6-handoff-data",
         [OVPN_NEXT_DROP] = "error-drop",
   },
 };
