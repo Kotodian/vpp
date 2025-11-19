@@ -797,7 +797,7 @@ ovpn_send_tls_output (vlib_main_t *vm, ovpn_channel_t *ch,
     return;
 
   size_t remaining = wbuf->off;
-  uint8_t *resp = (uint8_t *) wbuf->base;
+  u8 *resp = (u8 *) wbuf->base;
 
   while (remaining > 0)
     {
