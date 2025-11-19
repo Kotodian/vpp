@@ -44,6 +44,8 @@ ovpn_channel_init (vlib_main_t *vm, ovpn_channel_t *ch,
   ch->remote_session_id = remote_session_id;
   ch->is_ip4 = is_ip4;
   ch->key_source_index = ~0;
+  ch->hs_data = NULL;
+  ch->hs_data_off = 0;
   clib_memcpy_fast (&ch->remote_addr, remote_addr, sizeof (ip46_address_t));
 }
 
@@ -149,6 +151,9 @@ ovpn_channel_derive_key_material_server (ovpn_channel_t *ch,
 void
 ovpn_channel_free (ovpn_channel_t *ch)
 {
+  if (ch->hs_data != NULL)
+    vec_free (ch->hs_data);
+  ch->hs_data_off = 0;
   ptls_free (ch->tls);
   vec_free (ch->client_acks);
 }

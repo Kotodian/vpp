@@ -81,6 +81,8 @@ typedef struct ovpn_channel
   ovpn_channel_state_t state;
   u32 *client_acks;
   ptls_t *tls;
+  u8 *hs_data;
+  u32 hs_data_off;
   u32 reliable_queue_index;
   f64 expired_time;
   u32 key_source_index;

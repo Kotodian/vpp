@@ -59,6 +59,14 @@ typedef CLIB_PACKED (struct ovpn_msg_hdr {
   u8 key_id : 3;
 }) ovpn_msg_hdr_t;
 
+#define OVPN_DATA_PACKET_ID_LEN 8
+#define OVPN_DATA_IV_LEN	    12
+#define OVPN_DATA_TAG_LEN	    16
+
+typedef CLIB_PACKED (struct ovpn_data_hdr {
+  u64 packet_id;
+}) ovpn_data_hdr_t;
+
 /*
   session_id: 8 bytes
   hmac: 20 bytes
