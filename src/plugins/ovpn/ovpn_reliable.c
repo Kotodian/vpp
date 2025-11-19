@@ -33,20 +33,6 @@ ovpn_reliable_queue_init (vlib_main_t *vm, ovpn_reliable_queue_t *queue,
   queue->unacked_pkts = NULL;
   queue->next_send_pkt_id = 0;
 }
-
-void
-ovpn_reliable_queue_free (ovpn_reliable_queue_t *queue)
-{
-  if (queue->recv_pkts_wnd_keys != NULL)
-    hash_free (queue->recv_pkts_wnd_keys);
-  if (queue->unacked_pkts_by_pkt_id != NULL)
-    hash_free (queue->unacked_pkts_by_pkt_id);
-  if (queue->recv_pkts_wnd != NULL)
-    pool_free (queue->recv_pkts_wnd);
-  if (queue->unacked_pkts != NULL)
-    pool_free (queue->unacked_pkts);
-}
-
 always_inline void
 ovpn_reliable_free_pkt (ovpn_reliable_queue_t *queue, ovpn_reliable_pkt_t *pkt,
 			u8 is_ack)
@@ -62,6 +48,26 @@ ovpn_reliable_free_pkt (ovpn_reliable_queue_t *queue, ovpn_reliable_pkt_t *pkt,
       hash_unset (queue->recv_pkts_wnd_keys, &pkt->pkt_id);
       pool_put (queue->recv_pkts_wnd, pkt);
     }
+}
+
+void
+ovpn_reliable_queue_free (ovpn_reliable_queue_t *queue)
+{
+  if (queue->recv_pkts_wnd != NULL)
+    {
+      ovpn_reliable_pkt_t *pkt;
+      pool_foreach (pkt, queue->recv_pkts_wnd)
+	{
+	  ovpn_reliable_free_pkt (queue, pkt, 0);
+	}
+      pool_free (queue->recv_pkts_wnd);
+    }
+  if (queue->recv_pkts_wnd_keys != NULL)
+    hash_free (queue->recv_pkts_wnd_keys);
+  if (queue->unacked_pkts_by_pkt_id != NULL)
+    hash_free (queue->unacked_pkts_by_pkt_id);
+  if (queue->unacked_pkts != NULL)
+    pool_free (queue->unacked_pkts);
 }
 
 u32

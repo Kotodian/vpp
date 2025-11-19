@@ -273,13 +273,13 @@ ovpn_free_channel (vlib_main_t *vm, ovpn_channel_t *ch)
   ovpn_main_t *omp = &ovpn_main;
   ovpn_reliable_queue_t *queue;
   queue = pool_elt_at_index (omp->reliable_queues, ch->reliable_queue_index);
-  u32 *pkt_id;
-  vec_foreach (pkt_id, ch->client_acks)
+  ovpn_reliable_pkt_t *pkt;
+  pool_foreach (pkt, queue->unacked_pkts)
     {
-      ovpn_reliable_dequeue_pkt (vm, queue, *pkt_id);
       tw_timer_stop_2t_1w_2048sl (
 	&omp->queues_timer_wheel,
-	ovpn_reliable_get_timer_handle (queue, *pkt_id));
+	ovpn_reliable_get_timer_handle (queue, pkt->pkt_id));
+      ovpn_reliable_dequeue_pkt (vm, queue, pkt->pkt_id);
     }
   if (ch->key_source_index != ~0 &&
       !pool_is_free_index (omp->key_sources, ch->key_source_index))
@@ -295,7 +295,6 @@ ovpn_free_channel (vlib_main_t *vm, ovpn_channel_t *ch)
     }
   ovpn_reliable_queue_free (queue);
   ovpn_channel_free (ch);
-  pool_put_index (omp->channels, ch->index);
   pool_put (omp->channels, ch);
 }
 
@@ -931,8 +930,8 @@ ovpn_handle_post_handshake_pkt (vlib_main_t *vm, ovpn_channel_t *ch,
       ovpn_send_tls_output (vm, ch, queue, remote_addr, remote_port, is_ip4,
 			    &encrypted_buf);
       ovpn_activate_session (sess, ch);
-
       ovpn_set_channel_state (ch, OVPN_CHANNEL_STATE_CLOSED);
+
       ptls_buffer_dispose (&encrypted_buf);
       vec_free (key_negotiation_response);
     }
@@ -954,6 +953,8 @@ ovpn_handle_handshake (vlib_main_t *vm, ip46_address_t *remote_addr,
   ovpn_reliable_queue_t *queue;
   ovpn_reliable_pkt_t *pkt = NULL;
   ovpn_error_t error = OVPN_ERROR_NONE;
+  /* 用 vec 拼接跨 pkt 的 handshake 数据 */
+  u8 *hs_vec = NULL;
 
   if (ovpn_find_session (remote_addr, &sess_index) != OVPN_SESSION_ERROR_NONE)
     return OVPN_ERROR_SSL_HANDSHAKE_FAILED;
@@ -980,9 +981,6 @@ ovpn_handle_handshake (vlib_main_t *vm, ip46_address_t *remote_addr,
       return OVPN_ERROR_NONE;
     }
   ovpn_reliable_dequeue_recv_pkt (vm, queue, &pkt);
-
-  /* 用 vec 拼接跨 pkt 的 handshake 数据 */
-  u8 *hs_vec = NULL;
 
   while (pkt != NULL)
     {

@@ -65,7 +65,7 @@ wg_secure_zero_memory (void *v, size_t n)
 }
 
 static clib_error_t *
-wg_init (vlib_main_t * vm)
+wg_init (vlib_main_t *vm)
 {
   wg_main_t *wmp = &wg_main;
 
@@ -80,7 +80,7 @@ wg_init (vlib_main_t * vm)
 
   vlib_thread_main_t *tm = vlib_get_thread_main ();
 
-  vec_validate_aligned (wmp->per_thread_data, tm->n_vlib_mains,
+  vec_validate_aligned (wmp->per_thread_data, tm->n_vlib_mains - 1,
 			CLIB_CACHE_LINE_BYTES);
 
   wg_timer_wheel_init ();
@@ -91,7 +91,6 @@ wg_init (vlib_main_t * vm)
 }
 
 VLIB_INIT_FUNCTION (wg_init);
-
 
 VNET_FEATURE_INIT (wg4_output_tun, static) = {
   .arc_name = "ip4-output",
@@ -105,8 +104,7 @@ VNET_FEATURE_INIT (wg6_output_tun, static) = {
   .runs_after = VNET_FEATURES ("gso-ip6"),
 };
 
-VLIB_PLUGIN_REGISTER () =
-{
+VLIB_PLUGIN_REGISTER () = {
   .version = VPP_BUILD_VER,
   .description = "Wireguard Protocol",
 };

@@ -102,7 +102,7 @@ ovpn_init (vlib_main_t *vm)
   omp->vlib_main = vm;
   omp->vnet_main = vnet_get_main ();
   omp->ovpn_if = NULL;
-  vec_validate_aligned (omp->per_thread_data, tm->n_vlib_mains,
+  vec_validate_aligned (omp->per_thread_data, tm->n_vlib_mains - 1,
 			CLIB_CACHE_LINE_BYTES);
 
   omp->in4_index = vlib_frame_queue_main_init (ovpn4_input_node.index, 0);
