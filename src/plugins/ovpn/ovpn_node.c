@@ -262,9 +262,8 @@ ovpn_activate_session (ovpn_session_t *sess, ovpn_channel_t *ch)
 			 sizeof (key2->keys[OVPN_KEY_DIR_TO_CLIENT].cipher));
   /* Free channel */
   sess->channel_index = ~0;
-  tw_timer_stop_2t_1w_2048sl (&omp->sessions_timer_wheel, sess->index);
-  tw_timer_start_2t_1w_2048sl (&omp->sessions_timer_wheel, sess->index, 0,
-			       (u64) OVN_SESSION_EXPIRED_TIMEOUT);
+  tw_timer_update_2t_1w_2048sl (&omp->sessions_timer_wheel, sess->index,
+				(u64) OVN_SESSION_EXPIRED_TIMEOUT);
 }
 
 always_inline void
@@ -351,9 +350,8 @@ ovpn_set_channel_state (ovpn_channel_t *ch, ovpn_channel_state_t state)
   ch->state = state;
   if (ch->state != OVPN_CHANNEL_STATE_CLOSED)
     {
-      tw_timer_stop_2t_1w_2048sl (&omp->channels_timer_wheel, ch->index);
-      tw_timer_start_2t_1w_2048sl (&omp->channels_timer_wheel, ch->index, 0,
-				   (u64) OVN_CHANNEL_EXPIRED_TIMEOUT);
+      tw_timer_update_2t_1w_2048sl (&omp->channels_timer_wheel, ch->index,
+				    (u64) OVN_CHANNEL_EXPIRED_TIMEOUT);
     }
 }
 
