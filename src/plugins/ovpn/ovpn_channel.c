@@ -99,7 +99,7 @@ ovpn_channel_derive_key_material_server (ovpn_channel_t *ch,
 					 ovpn_key_source_t *ks,
 					 ovpn_key2_t *key2)
 {
-  uint8_t master[48];
+  u8 master[48];
 
   // 1. 随机生成 server PRF seeds
   ptls_openssl_random_bytes (ks->server_prf_seed_master_secret, 32);
@@ -107,10 +107,11 @@ ovpn_channel_derive_key_material_server (ovpn_channel_t *ch,
 
   // 2. 生成 master secret
   // 拼接 seed = "OpenVPN master secret" + client_seed + server_seed
-  uint8_t master_seed[19 + 32 + 32];
-  memcpy (master_seed, "OpenVPN master secret", 19);
-  memcpy (master_seed + 19, ks->client_prf_seed_master_secret, 32);
-  memcpy (master_seed + 19 + 32, ks->server_prf_seed_master_secret, 32);
+  u8 master_seed[19 + 32 + 32];
+  clib_memcpy_fast (master_seed, "OpenVPN master secret", 19);
+  clib_memcpy_fast (master_seed + 19, ks->client_prf_seed_master_secret, 32);
+  clib_memcpy_fast (master_seed + 19 + 32, ks->server_prf_seed_master_secret,
+		    32);
 
   if (!ovpn_ssl_tls1_PRF (
 	master_seed, sizeof (master_seed), ks->pre_master_secret,
@@ -118,17 +119,17 @@ ovpn_channel_derive_key_material_server (ovpn_channel_t *ch,
     return false;
 
   // 3. 构建 key expansion seed
-  uint8_t
-    key_exp_seed[23 + 32 + 32 + 8 + 8]; // label + client_seed + server_seed +
-					// client_sid + server_sid
-  memcpy (key_exp_seed, "OpenVPN key expansion", 23);
-  memcpy (key_exp_seed + 23, ks->client_prf_seed_key_expansion, 32);
-  memcpy (key_exp_seed + 23 + 32, ks->server_prf_seed_key_expansion, 32);
+  u8 key_exp_seed[23 + 32 + 32 + 8 + 8]; // label + client_seed + server_seed +
+					 // client_sid + server_sid
+  clib_memcpy_fast (key_exp_seed, "OpenVPN key expansion", 23);
+  clib_memcpy_fast (key_exp_seed + 23, ks->client_prf_seed_key_expansion, 32);
+  clib_memcpy_fast (key_exp_seed + 23 + 32, ks->server_prf_seed_key_expansion,
+		    32);
 
-  uint64_t client_sid = ch->remote_session_id;
-  uint64_t server_sid = ch->session_id;
-  memcpy (key_exp_seed + 23 + 64, &client_sid, 8);
-  memcpy (key_exp_seed + 23 + 72, &server_sid, 8);
+  u64 client_sid = ch->remote_session_id;
+  u64 server_sid = ch->session_id;
+  clib_memcpy_fast (key_exp_seed + 23 + 64, &client_sid, 8);
+  clib_memcpy_fast (key_exp_seed + 23 + 72, &server_sid, 8);
 
   // 4. 生成 key expansion，填充到 key2->keys
   if (!ovpn_ssl_tls1_PRF (key_exp_seed, sizeof (key_exp_seed), master,
