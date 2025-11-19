@@ -1399,8 +1399,21 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		  goto done0;
 		}
 
-	      vlib_buffer_advance (b0, sizeof (ovpn_msg_hdr_t) + sizeof (u32));
+	      // advance buffer past msg_hdr + IV
+	      vlib_buffer_advance (b0, sizeof (*msg_hdr0) + OVPN_DATA_IV_LEN);
+
+	      // 减去 tag 长度
 	      b0->current_length -= OVPN_DATA_TAG_LEN;
+
+	      // 读取 packet_id
+	      // u32 packet_id = clib_net_to_host_u32 (*(u32 *)
+	      // b0->current_data);
+
+	      // advance buffer past packet_id
+	      vlib_buffer_advance (b0, sizeof (u32));
+	      b0->current_length -= sizeof (u32);
+
+	      // b0->current_data 现在指向 user payload
 	      next0 = OVPN_NEXT_IP_INPUT;
 	      goto done0;
 	    }
