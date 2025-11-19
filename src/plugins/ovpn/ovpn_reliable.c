@@ -76,6 +76,7 @@ ovpn_reliable_queue_pkt (vlib_main_t *vm, ovpn_reliable_queue_t *queue,
   pkt->pkt_id = queue->next_send_pkt_id++;
   pkt->send.is_ip4 = is_ip4;
   pkt->data_len = data_len;
+  clib_memset (pkt->send.reserved, 0, 3);
   vec_validate_init_empty (pkt->data, data_len - 1, ~0);
   clib_memcpy_fast (pkt->data, data, data_len);
   pkt->send.retries = 0;
@@ -159,7 +160,7 @@ ovpn_reliable_queue_recv_pkt (vlib_main_t *vm, ovpn_reliable_queue_t *queue,
     return -1;
   new_pkt->pkt_id = pkt_id;
   new_pkt->recv.acked = 0;
-  new_pkt->recv.rev = 0;
+  new_pkt->recv.consumed = 0;
   new_pkt->data_len = data_len;
   vec_validate_init_empty (new_pkt->data, data_len - 1, ~0);
   clib_memcpy_fast (new_pkt->data, data, data_len);
@@ -172,14 +173,27 @@ void
 ovpn_reliable_dequeue_recv_pkt (vlib_main_t *vm, ovpn_reliable_queue_t *queue,
 				ovpn_reliable_pkt_t **pkt)
 {
-  uword *p = NULL;
-  p = hash_get (queue->recv_pkts_wnd_keys, &queue->next_recv_pkt_id);
-  if (p == NULL)
-    return;
-  *pkt = pool_elt_at_index (queue->recv_pkts_wnd, p[0]);
-  if (queue->next_recv_pkt_id == ~0)
-    queue->next_recv_pkt_id = 0;
-  queue->next_recv_pkt_id++;
+  *pkt = NULL;
+
+  while (1)
+    {
+      uword *p =
+	hash_get (queue->recv_pkts_wnd_keys, &queue->next_recv_pkt_id);
+      if (p == NULL)
+	return;
+
+      ovpn_reliable_pkt_t *cur =
+	pool_elt_at_index (queue->recv_pkts_wnd, p[0]);
+
+      if (cur->recv.consumed < cur->data_len)
+	{
+	  *pkt = cur;
+	  return;
+	}
+
+      /* 当前 pkt 已消费完，推进 next_recv_pkt_id */
+      queue->next_recv_pkt_id += 1;
+    }
 }
 
 void
@@ -191,6 +205,7 @@ ovpn_reliable_ack_recv_pkt (vlib_main_t *vm, ovpn_reliable_queue_t *queue,
   if (p == NULL)
     return;
   ovpn_reliable_pkt_t *pkt = pool_elt_at_index (queue->recv_pkts_wnd, p[0]);
+  pkt->recv.consumed = pkt->data_len;
   pkt->recv.acked = 1;
 }
 

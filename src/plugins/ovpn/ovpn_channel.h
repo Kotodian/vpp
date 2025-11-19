@@ -74,6 +74,7 @@ typedef struct ovpn_channel
   u64 remote_session_id;
   u32 remote_addr;
   u8 is_ip4;
+  /* Only for debug */
   ovpn_channel_state_t state;
   u32 *client_acks;
   ptls_t *tls;

@@ -34,12 +34,13 @@ typedef struct ovpn_reliable_pkt
     {
       u8 is_ip4;
       u8 retries;
+      u8 reserved[3];
     } send;
 
     struct
     {
       u8 acked;
-      u8 rev;
+      u32 consumed;
     } recv;
   };
 
