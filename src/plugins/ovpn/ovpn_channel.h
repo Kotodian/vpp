@@ -30,6 +30,15 @@
 #define OVN_CHANNEL_EXPIRED_TIMEOUT (1 * 60) /* 1 minute */
 #define OVPN_KEY_SOURCE_LENGTH	    48 + 32 + 32
 
+struct ovpn_reliable_pkt;
+
+typedef struct
+{
+  u8 *data;
+  u32 offset;
+  struct ovpn_reliable_pkt *pkt;
+} ovpn_handshake_buffer_t;
+
 /*
  * Recv P_CONTROL_HARD_RESET_CLIENT_V2: Init: Initial State
  * Send P_CONTROL_HARD_RESET_SERVER_V2: SSL_HANDSHAKE Start
@@ -81,8 +90,7 @@ typedef struct ovpn_channel
   ovpn_channel_state_t state;
   u32 *client_acks;
   ptls_t *tls;
-  u8 *hs_data;
-  u32 hs_data_off;
+  ovpn_handshake_buffer_t hs_buf;
   u32 reliable_queue_index;
   f64 expired_time;
   u32 key_source_index;
