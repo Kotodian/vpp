@@ -757,9 +757,12 @@ ovpn_handle_ack_v1 (vlib_main_t *vm, uword *event_data)
       vec_foreach (pkt_id, event->acks)
 	{
 	  ovpn_reliable_dequeue_pkt (vm, queue, *pkt_id);
-	  tw_timer_stop_2t_1w_2048sl (
-	    &omp->queues_timer_wheel,
-	    ovpn_reliable_get_timer_handle (queue, *pkt_id));
+	  u32 handle = ovpn_reliable_get_timer_handle (queue, *pkt_id);
+	  if (!tw_timer_handle_is_free_2t_1w_2048sl (&omp->queues_timer_wheel,
+						     handle))
+	    {
+	      tw_timer_stop_2t_1w_2048sl (&omp->queues_timer_wheel, handle);
+	    }
 	}
       vec_free (event->acks);
     }
