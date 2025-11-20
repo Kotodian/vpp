@@ -18,7 +18,8 @@
 #ifndef __included_ovpn_channel_h__
 #define __included_ovpn_channel_h__
 
-#include "vnet/crypto/crypto.h"
+#include <vnet/dpo/dpo.h>
+#include <vnet/crypto/crypto.h>
 #include <picotls.h>
 #include <picotls/openssl.h>
 #include <vlib/vlib.h>
@@ -80,7 +81,7 @@ typedef struct ovpn_key2
 
 typedef struct ovpn_channel
 {
-  u32 index;
+  index_t index;
   u64 seed;
   u64 session_id;
   u64 remote_session_id;
@@ -98,7 +99,7 @@ typedef struct ovpn_channel
 
 typedef struct ovpn_key_source
 {
-  u32 index;
+  index_t index;
   u8 pre_master_secret[48];
   u8 client_prf_seed_master_secret[32];
   u8 client_prf_seed_key_expansion[32];
@@ -108,7 +109,8 @@ typedef struct ovpn_key_source
 
 void ovpn_channel_init (vlib_main_t *vm, ovpn_channel_t *ch,
 			ptls_context_t *ssl_ctx, u64 remote_session_id,
-			ip46_address_t *remote_addr, u8 is_ip4, u32 ch_index);
+			ip46_address_t *remote_addr, u8 is_ip4,
+			index_t ch_index);
 bool ovpn_channel_derive_key_material_server (ovpn_channel_t *ch,
 					      ovpn_key_source_t *ks,
 					      ovpn_key2_t *key2);

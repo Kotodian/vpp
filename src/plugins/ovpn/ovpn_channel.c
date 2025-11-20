@@ -32,7 +32,7 @@
 void
 ovpn_channel_init (vlib_main_t *vm, ovpn_channel_t *ch,
 		   ptls_context_t *ssl_ctx, u64 remote_session_id,
-		   ip46_address_t *remote_addr, u8 is_ip4, u32 ch_index)
+		   ip46_address_t *remote_addr, u8 is_ip4, index_t ch_index)
 {
   clib_memset (ch, 0, sizeof (ovpn_channel_t));
   ch->index = ch_index;

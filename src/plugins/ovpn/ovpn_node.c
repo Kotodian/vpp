@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "vnet/ip/ip_types.h"
 #include <vnet/crypto/crypto.h>
 #include <vnet/ip/ip46_address.h>
 #include <vppinfra/vec_bootstrap.h>
@@ -235,7 +236,7 @@ ovpn_create_session (ip46_address_t remote_addr, u8 is_ip4, u32 *sess_index)
 }
 
 always_inline ovpn_session_error_t
-ovpn_find_session (ip46_address_t *remote_addr, u32 *sess_index)
+ovpn_find_session (ip46_address_t *remote_addr, index_t *sess_index)
 {
   ovpn_main_t *omp = &ovpn_main;
   BVT (clib_bihash_kv) kv;
@@ -343,7 +344,7 @@ ovpn_free_session (vlib_main_t *vm, ovpn_session_t *sess)
 
 always_inline void
 ovpn_create_channel (ovpn_session_t *sess, ip46_address_t *remote_addr,
-		     u8 is_ip4, u64 remote_session_id, u32 *ch_index)
+		     u8 is_ip4, u64 remote_session_id, index_t *ch_index)
 {
   ovpn_main_t *omp = &ovpn_main;
   ovpn_channel_t *ch;
@@ -370,7 +371,7 @@ ovpn_set_channel_state (ovpn_channel_t *ch, ovpn_channel_state_t state)
 }
 
 always_inline void
-ovpn_create_reliable_queue (ovpn_channel_t *ch, u32 *reliable_queue_index)
+ovpn_create_reliable_queue (ovpn_channel_t *ch, index_t *reliable_queue_index)
 {
   ovpn_main_t *omp = &ovpn_main;
   ovpn_reliable_queue_t *queue;
@@ -392,10 +393,8 @@ ovpn_prepend_rewrite (vlib_buffer_t *b0, ip46_address_t *remote_addr,
       vlib_buffer_advance (b0, -sizeof (*hdr4));
       hdr4 = vlib_buffer_get_current (b0);
 
-      clib_memcpy_fast (&hdr4->ip4.src_address, &omp->src_ip,
-			sizeof (ip4_address_t));
-      clib_memcpy_fast (&hdr4->ip4.dst_address, remote_addr,
-			sizeof (ip4_address_t));
+      ip46_address_set_ip4 (&omp->src_ip, &hdr4->ip4.src_address);
+      ip46_address_set_ip4 (remote_addr, &hdr4->ip4.dst_address);
       hdr4->ip4.protocol = IP_PROTOCOL_UDP;
 
       hdr4->udp.src_port = clib_host_to_net_u16 (UDP_DST_PORT_ovpn);
@@ -413,12 +412,9 @@ ovpn_prepend_rewrite (vlib_buffer_t *b0, ip46_address_t *remote_addr,
       vlib_buffer_advance (b0, -sizeof (*hdr6));
       hdr6 = vlib_buffer_get_current (b0);
 
-      clib_memcpy_fast (&hdr6->ip6.src_address, &omp->src_ip,
-			sizeof (ip6_address_t));
-      clib_memcpy_fast (&hdr6->ip6.dst_address, remote_addr,
-			sizeof (ip6_address_t));
+      ip46_address_set_ip6 (&omp->src_ip, &hdr6->ip6.src_address);
+      ip46_address_set_ip6 (remote_addr, &hdr6->ip6.dst_address);
       hdr6->ip6.protocol = IP_PROTOCOL_UDP;
-      hdr6->ip6.dst_address = remote_addr->ip6;
 
       hdr6->udp.src_port = clib_host_to_net_u16 (UDP_DST_PORT_ovpn);
       hdr6->udp.dst_port = clib_host_to_net_u16 (remote_port);
@@ -1581,8 +1577,7 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
 	  ctrl_event0->client_port = clib_net_to_host_u16 (udp0->src_port);
 	  ctrl_event0->is_ip4 = is_ip4;
-	  clib_memcpy_fast (&ctrl_event0->remote_addr, &remote_addr,
-			    sizeof (ip46_address_t));
+	  ip46_address_copy (&ctrl_event0->remote_addr, &remote_addr);
 	  ctrl_event0->remote_session_id =
 	    clib_net_to_host_u64 (ctrl_msg_hdr0->session_id);
 	  clib_memcpy_fast (&ctrl_event0->hmac, ctrl_msg_hdr0->hmac, 20);
@@ -1610,8 +1605,7 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	    clib_mem_alloc (sizeof (ovpn_ctrl_event_ack_v1_t));
 	  clib_memset (ctrl_event0, 0, sizeof (ovpn_ctrl_event_ack_v1_t));
 
-	  clib_memcpy_fast (&ctrl_event0->remote_addr, &remote_addr,
-			    sizeof (ip46_address_t));
+	  ip46_address_copy (&ctrl_event0->remote_addr, &remote_addr);
 	  ctrl_event0->remote_session_id =
 	    clib_net_to_host_u64 (ctrl_msg_hdr0->session_id);
 	  clib_memcpy_fast (&ctrl_event0->hmac, ctrl_msg_hdr0->hmac, 20);

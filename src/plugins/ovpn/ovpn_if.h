@@ -19,17 +19,17 @@
 #define __included_ovpn_if_h__
 
 #include <stdbool.h>
-#include "vnet/ip/ip46_address.h"
-#include "vnet/ip/ip_types.h"
+#include <vnet/ip/ip46_address.h>
+#include <vnet/ip/ip_types.h>
 #include <vlib/vlib.h>
 
 typedef struct ovpn_if_t_
 {
-  u32 sw_if_index;
-  u32 ip_pool_index;
+  int user_instance;
 
-  /* Source IP address for originated packets */
-  ip46_address_t src_ip;
+  index_t tunnel_ip_index;
+  index_t sw_if_index;
+  index_t sess_index;
 } ovpn_if_t;
 
 typedef struct ovpn_ip_pool
@@ -38,6 +38,16 @@ typedef struct ovpn_ip_pool
   ip46_address_t next_ip;
   ip46_address_t last_ip;
 } ovpn_ip_pool_t;
+
+extern ovpn_if_t *ovpn_if_pool;
+
+always_inline ovpn_if_t *
+ovpn_if_get (index_t ovpnii)
+{
+  if (INDEX_INVALID == ovpnii)
+    return (NULL);
+  return (pool_elt_at_index (ovpn_if_pool, ovpnii));
+}
 
 always_inline void
 ovpn_ip_pool_init (ovpn_ip_pool_t *pool, ip_prefix_t prefix)

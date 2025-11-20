@@ -85,6 +85,8 @@ typedef struct
   /* convenience */
   vlib_main_t *vlib_main;
   vnet_main_t *vnet_main;
+  ip_lookup_main_t *ip4_lm;
+  ip_lookup_main_t *ip6_lm;
 } ovpn_main_t;
 
 extern ovpn_main_t ovpn_main;

@@ -99,6 +99,8 @@ static clib_error_t *
 ovpn_init (vlib_main_t *vm)
 {
   ovpn_main_t *omp = &ovpn_main;
+  omp->ip4_lm = &ip4_main.lookup_main;
+  omp->ip6_lm = &ip6_main.lookup_main;
   vlib_thread_main_t *tm = vlib_get_thread_main ();
   clib_error_t *error = 0;
 
