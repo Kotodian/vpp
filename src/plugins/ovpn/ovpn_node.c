@@ -35,6 +35,7 @@
 #include <ovpn/ovpn.h>
 #include <ovpn/ovpn_message.h>
 #include <ovpn/ovpn_if.h>
+#include <openssl/hmac.h>
 
 typedef struct
 {
@@ -48,6 +49,12 @@ typedef struct
 static u8 *
 format_ovpn_trace (u8 *s, va_list *args)
 {
+  CLIB_UNUSED (vlib_main_t * vm) = va_arg (*args, vlib_main_t *);
+  CLIB_UNUSED (vlib_node_t * node) = va_arg (*args, vlib_node_t *);
+  ovpn_trace_t *t = va_arg (*args, ovpn_trace_t *);
+
+  s = format (s, "ovpn: sw_if_index %d, next_index %d", t->sw_if_index,
+	      t->next_index);
   return s;
 }
 
@@ -62,7 +69,8 @@ vlib_node_registration_t ovpn_node;
   _ (SSL_HANDSHAKE_FAILED, "SSL handshake failed")                            \
   _ (INVALID_KEY_METHOD, "Invalid key method")                                \
   _ (FAILED_TO_ALLOCATE_BUFFER, "Failed to allocate buffer")                  \
-  _ (DECRYPT_FAILED, "Failed to decrypt data")
+  _ (DECRYPT_FAILED, "Failed to decrypt data")                                \
+  _ (HMAC_CHECK_FAILED, "HMAC check failed")
 
 typedef enum
 {
@@ -82,7 +90,8 @@ static char *ovpn_error_strings[] = {
 
 typedef enum
 {
-  OVPN_NEXT_IP_INPUT,
+  OVPN_NEXT_IP4_INPUT,
+  OVPN_NEXT_IP6_INPUT,
   OVPN_NEXT_HANDOFF_HANDSHAKE,
   OVPN_NEXT_HANDOFF_DATA,
   OVPN_NEXT_DROP,
@@ -128,6 +137,13 @@ format_ovpn_handoff_trace (u8 *s, va_list *args)
 }
 
 always_inline void
+ovpn_calculate_hmac (u8 *key, u8 *data, u32 len, u8 *out)
+{
+  unsigned int out_len;
+  HMAC (EVP_sha256 (), key, 256, data, len, out, &out_len);
+}
+
+always_inline void
 ovpn_create_ctrl_frame (vlib_main_t *vm, ovpn_channel_t *ch, u8 opcode,
 			u32 *replay_pkt_id, u32 *pkt_id, u8 *payload,
 			u32 payload_len, u32 *bi0)
@@ -139,6 +155,8 @@ ovpn_create_ctrl_frame (vlib_main_t *vm, ovpn_channel_t *ch, u8 opcode,
   u8 *buf;
   u8 hmac[20];
   u32 pkt_len = 0;
+  ovpn_main_t *omp = &ovpn_main;
+
   if (vlib_buffer_alloc (vm, bi0, 1) != 1)
     {
       clib_warning ("Failed to allocate buffer");
@@ -207,6 +225,11 @@ ovpn_create_ctrl_frame (vlib_main_t *vm, ovpn_channel_t *ch, u8 opcode,
     }
   /* update buffer length */
   b0->current_length = pkt_len;
+
+  /* Calculate HMAC */
+  if (omp->psk_set)
+    ovpn_calculate_hmac (omp->psk, buf, pkt_len, hmac);
+  clib_memcpy_fast (ctrl_msg_hdr->hmac, hmac, 20);
 }
 
 always_inline ovpn_session_error_t
@@ -222,6 +245,8 @@ ovpn_create_session (ip46_address_t remote_addr, u8 is_ip4, u32 *sess_index)
   if (!BV (clib_bihash_search_inline) (&omp->session_hash, &kv))
     return OVPN_SESSION_ERROR_SESSION_ALREADY_EXISTS;
 
+  vlib_worker_thread_barrier_sync (omp->vlib_main);
+
   pool_get_aligned (omp->sessions, sess, CLIB_CACHE_LINE_BYTES);
   *sess_index = sess - omp->sessions;
   ovpn_session_init (omp->vlib_main, sess, *sess_index, &remote_addr, is_ip4);
@@ -231,6 +256,9 @@ ovpn_create_session (ip46_address_t remote_addr, u8 is_ip4, u32 *sess_index)
   BV (clib_bihash_add_del) (&omp->session_hash, &kv, 1);
   tw_timer_start_2t_1w_2048sl (&omp->sessions_timer_wheel, *sess_index, 0,
 			       (u64) OVN_SESSION_EXPIRED_TIMEOUT);
+
+  vlib_worker_thread_barrier_release (omp->vlib_main);
+
   return OVPN_SESSION_ERROR_NONE;
 }
 
@@ -499,6 +527,11 @@ ovpn_create_ctrl_ack_v1 (vlib_main_t *vm, u32 *bi0, ovpn_channel_t *ch,
   ctrl_msg_hdr->session_id = clib_host_to_net_u64 (ch->session_id);
 
   /* TODO: generate hmac */
+  /* OpenVPN uses HMAC-SHA1 or SHA256. For now we zero it out.
+   * Real implementation should use vnet_crypto to compute HMAC
+   * using the integrity key derived during handshake.
+   */
+  ovpn_main_t *omp = &ovpn_main;
   clib_memset_u8 (hmac, 0, 20);
   clib_memcpy_fast (ctrl_msg_hdr->hmac, hmac, 20);
 
@@ -528,6 +561,11 @@ ovpn_create_ctrl_ack_v1 (vlib_main_t *vm, u32 *bi0, ovpn_channel_t *ch,
   b0->current_length = sizeof (ovpn_msg_hdr_t) + sizeof (ovpn_ctrl_msg_hdr_t) +
 		       ctrl_msg_hdr->acks_len * sizeof (u32) +
 		       sizeof (ovpn_ctrl_msg_ack_v1_t);
+
+  /* Calculate HMAC */
+  if (omp->psk_set)
+    ovpn_calculate_hmac (omp->psk, buf, b0->current_length, hmac);
+  clib_memcpy_fast (ctrl_msg_hdr->hmac, hmac, 20);
 }
 
 always_inline void
@@ -1547,7 +1585,8 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  data_bufs[data_idx] = b0;
 	  data_last[data_idx] = lb;
 	  data_bi[data_idx] = bi0;
-	  data_nexts[data_idx] = OVPN_NEXT_IP_INPUT;
+
+	  data_nexts[data_idx] = OVPN_NEXT_DROP;
 
 	  vnet_crypto_op_t **ops =
 	    (lb != b0) ? &ptd->chained_crypto_ops : &ptd->crypto_ops;
@@ -1579,15 +1618,34 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  enqueue_data = true;
 	  b0->error = node->errors[OVPN_ERROR_NONE];
 	  n_data += 1;
-    vlib_process_signal_event_mt (
-      vm, omp->timer_node_index,
-      OVPN_CTRL_EVENT_TYPE_SESSION_KEEPALIVE, (uword) sess->index);
+	  vlib_process_signal_event_mt (vm, omp->timer_node_index,
+					OVPN_CTRL_EVENT_TYPE_SESSION_KEEPALIVE,
+					(uword) sess->index);
 	  goto next_packet;
 	}
-      else if (PREDICT_FALSE (msg_hdr0->opcode ==
-			      OVPN_OPCODE_TYPE_P_CONTROL_HARD_RESET_CLIENT_V1))
+
+      /* Verify HMAC for control packets */
+      ovpn_ctrl_msg_hdr_t *ctrl_msg_hdr0 = (ovpn_ctrl_msg_hdr_t *) payload;
+      u8 received_hmac[20];
+      u8 calculated_hmac[20];
+      u8 zero_hmac[20] = { 0 };
+
+      clib_memcpy_fast (received_hmac, ctrl_msg_hdr0->hmac, 20);
+      clib_memcpy_fast (ctrl_msg_hdr0->hmac, zero_hmac, 20);
+      if (omp->psk_set)
+	ovpn_calculate_hmac (omp->psk, (u8 *) msg_hdr0, b0->current_length,
+			     calculated_hmac);
+
+      if (PREDICT_FALSE (clib_memcmp (received_hmac, calculated_hmac, 20) !=
+			 0))
 	{
-	  ovpn_ctrl_msg_hdr_t *ctrl_msg_hdr0 = (ovpn_ctrl_msg_hdr_t *) payload;
+	  error0 = OVPN_ERROR_HMAC_CHECK_FAILED;
+	  goto enqueue_other;
+	}
+
+      if (PREDICT_FALSE (msg_hdr0->opcode ==
+			 OVPN_OPCODE_TYPE_P_CONTROL_HARD_RESET_CLIENT_V1))
+	{
 	  ovpn_ctrl_msg_client_hard_reset_v2_t *data =
 	    (ovpn_ctrl_msg_client_hard_reset_v2_t *) (payload +
 						      sizeof (
@@ -1619,7 +1677,6 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	}
       else if (PREDICT_FALSE (msg_hdr0->opcode == OVPN_OPCODE_TYPE_P_ACK_V1))
 	{
-	  ovpn_ctrl_msg_hdr_t *ctrl_msg_hdr0 = (ovpn_ctrl_msg_hdr_t *) payload;
 	  u32 *acks = (u32 *) (payload + sizeof (ovpn_ctrl_msg_hdr_t));
 	  ovpn_ctrl_msg_ack_v1_t *data =
 	    (ovpn_ctrl_msg_ack_v1_t *) (payload +
@@ -1661,7 +1718,6 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      goto enqueue_other;
 	    }
 
-	  ovpn_ctrl_msg_hdr_t *ctrl_msg_hdr0 = (ovpn_ctrl_msg_hdr_t *) payload;
 	  payload += sizeof (ovpn_ctrl_msg_hdr_t) +
 		     ctrl_msg_hdr0->acks_len * sizeof (u32);
 	  ovpn_ctrl_msg_control_v1_t *ctrl_msg_control_v1 =
@@ -1720,6 +1776,7 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	    {
 	      ovpn_trace_t *t = vlib_add_trace (vm, node, b0, sizeof (*t));
 	      t->next_index = next0;
+	      t->sw_if_index = ~0;
 	    }
 
 	  n_other += 1;
@@ -1752,6 +1809,13 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
 	  vlib_buffer_advance (b[0], sizeof (u32));
 	  b[0]->current_length -= sizeof (u32);
+
+	  u8 *ip_hdr = vlib_buffer_get_current (b[0]);
+	  u8 ip_ver = ip_hdr[0] >> 4;
+	  if (ip_ver == 4)
+	    data_next[0] = OVPN_NEXT_IP4_INPUT;
+	  else if (ip_ver == 6)
+	    data_next[0] = OVPN_NEXT_IP6_INPUT;
 	}
 
       if (PREDICT_FALSE ((node->flags & VLIB_NODE_FLAG_TRACE) &&
@@ -1759,6 +1823,10 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	{
 	  ovpn_trace_t *t = vlib_add_trace (vm, node, b[0], sizeof (*t));
 	  t->next_index = data_next[0];
+	  /* We can try to find the session again or pass it down, but for now
+	   * let's just set it to ~0 or we need to store it in the buffer ctx
+	   */
+	  t->sw_if_index = ~0; // TODO: retrieve sw_if_index from session
 	}
 
       b += 1;
@@ -1952,7 +2020,8 @@ VLIB_REGISTER_NODE (ovpn4_input_node) =
 
   /* edit / add dispositions here */
   .next_nodes = {
-        [OVPN_NEXT_IP_INPUT] = "ip4-input-no-checksum",
+        [OVPN_NEXT_IP4_INPUT] = "ip4-input-no-checksum",
+        [OVPN_NEXT_IP6_INPUT] = "ip6-input-no-checksum",
         [OVPN_NEXT_HANDOFF_HANDSHAKE] = "ovpn4-handoff-handshake",
         [OVPN_NEXT_HANDOFF_DATA] = "ovpn4-handoff-data",
         [OVPN_NEXT_DROP] = "error-drop",
@@ -1974,7 +2043,8 @@ VLIB_REGISTER_NODE (ovpn6_input_node) =
 
   /* edit / add dispositions here */
   .next_nodes = {
-        [OVPN_NEXT_IP_INPUT] = "ip6-input-no-checksum",
+        [OVPN_NEXT_IP4_INPUT] = "ip4-input-no-checksum",
+        [OVPN_NEXT_IP6_INPUT] = "ip6-input-no-checksum",
         [OVPN_NEXT_HANDOFF_HANDSHAKE] = "ovpn6-handoff-handshake",
         [OVPN_NEXT_HANDOFF_DATA] = "ovpn6-handoff-data",
         [OVPN_NEXT_DROP] = "error-drop",

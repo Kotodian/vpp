@@ -39,12 +39,18 @@
 ovpn_main_t ovpn_main;
 
 static int
-ovpn_enable (vlib_main_t *vm, ip46_address_t *src_addr, ip_prefix_t *prefix)
+ovpn_enable (vlib_main_t *vm, ip46_address_t *src_addr, ip_prefix_t *prefix,
+	     u8 *psk)
 {
   ovpn_main_t *omp = &ovpn_main;
 
   omp->src_ip = *src_addr;
   ovpn_ip_pool_init (&omp->tunnel_ip_pool, *prefix);
+  if (psk)
+    {
+      clib_memcpy_fast (omp->psk, psk, 256);
+      omp->psk_set = 1;
+    }
   omp->enabled = 1;
 
   return 0;
@@ -58,6 +64,8 @@ ovpn_enable_cmd (vlib_main_t *vm, unformat_input_t *input,
   ip46_address_t src_addr;
   ip_prefix_t prefix;
   clib_error_t *error = NULL;
+  u8 *psk = 0;
+  u8 psk_set = 0;
   clib_memset (&src_addr, 0, sizeof (ip46_address_t));
 
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
@@ -66,6 +74,8 @@ ovpn_enable_cmd (vlib_main_t *vm, unformat_input_t *input,
 	;
       else if (unformat (input, "tunnel-ip %U", unformat_ip_prefix, &prefix))
 	;
+      else if (unformat (input, "tls-auth-key %U", unformat_hex_string, &psk))
+	psk_set = 1;
       else
 	return clib_error_return (0, "unknown input '%U'",
 				  format_unformat_error, input);
@@ -82,7 +92,19 @@ ovpn_enable_cmd (vlib_main_t *vm, unformat_input_t *input,
       goto done;
     }
 
-  ovpn_enable (vm, &src_addr, &prefix);
+  if (psk_set)
+    {
+      if (vec_len (psk) != 256)
+	{
+	  error = clib_error_return (0, "PSK must be 256 bytes");
+	  vec_free (psk);
+	  goto done;
+	}
+    }
+
+  ovpn_enable (vm, &src_addr, &prefix, psk);
+
+  vec_free (psk);
 
 done:
   return error;
@@ -90,8 +112,8 @@ done:
 
 VLIB_CLI_COMMAND (ovpn_cli_enable_command, static) = {
   .path = "ovpn enable",
-  .short_help =
-    "ovpn enable <src-ip> tunnel-ip <tunnel-prefix> table-id <table-id>",
+  .short_help = "ovpn enable <src-ip> tunnel-ip <tunnel-prefix> [tls-auth-key "
+		"<hex-string>]",
   .function = ovpn_enable_cmd,
 };
 
@@ -107,6 +129,7 @@ ovpn_init (vlib_main_t *vm)
   omp->vlib_main = vm;
   omp->vnet_main = vnet_get_main ();
   omp->enabled = 0;
+  omp->psk_set = 0;
   clib_memset (&omp->src_ip, 0, sizeof (ip46_address_t));
   vec_validate_aligned (omp->per_thread_data, tm->n_vlib_mains - 1,
 			CLIB_CACHE_LINE_BYTES);
@@ -120,8 +143,9 @@ ovpn_init (vlib_main_t *vm)
    */
 
   /* Initialize session */
-  BV (clib_bihash_init) (&omp->session_hash, "ovpn session hash table",
-			 OVPN_SESSION_HASH_BUCKETS, OVPN_SESSION_HASH_MEMORY);
+  BV (clib_bihash_init)
+  (&omp->session_hash, "ovpn session hash table", OVPN_SESSION_HASH_BUCKETS,
+   OVPN_SESSION_HASH_MEMORY);
   tw_timer_wheel_init_2t_1w_2048sl (&omp->sessions_timer_wheel,
 				    ovpn_expired_sessions_callback, 1.0, ~0);
 

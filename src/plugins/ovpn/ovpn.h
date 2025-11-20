@@ -44,6 +44,8 @@ typedef struct
   /* Control Plane */
   ovpn_ip_pool_t tunnel_ip_pool;
   ip46_address_t src_ip;
+  u8 psk[256];
+  u8 psk_set;
 
   /* options */
   u8 *options;
