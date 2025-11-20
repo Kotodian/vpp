@@ -223,6 +223,9 @@ ovpn_create_session (ip46_address_t remote_addr, u8 is_ip4, u32 *sess_index)
   pool_get_aligned (omp->sessions, sess, CLIB_CACHE_LINE_BYTES);
   *sess_index = sess - omp->sessions;
   ovpn_session_init (omp->vlib_main, sess, *sess_index, &remote_addr, is_ip4);
+  ovpn_ip_pool_alloc (&omp->tunnel_ip_pool, &sess->tunnel_addr);
+  sess->is_tunnel_ip4 =
+    ip_prefix_version (&omp->tunnel_ip_pool.prefix) == AF_IP4;
 
   kv.value = *sess_index;
   BV (clib_bihash_add_del) (&omp->session_hash, &kv, 1);
@@ -265,6 +268,8 @@ ovpn_activate_session (ovpn_session_t *sess, ovpn_channel_t *ch)
 			 sizeof (key2->keys[OVPN_KEY_DIR_TO_CLIENT].cipher));
 
   vlib_worker_thread_barrier_sync (vm);
+  /* Create tunnel interface */
+
   /* Free channel */
   sess->channel_index = ~0;
   sess->state = OVPN_SESSION_STATE_ACTIVE;
@@ -387,7 +392,7 @@ ovpn_prepend_rewrite (vlib_buffer_t *b0, ip46_address_t *remote_addr,
       vlib_buffer_advance (b0, -sizeof (*hdr4));
       hdr4 = vlib_buffer_get_current (b0);
 
-      clib_memcpy_fast (&hdr4->ip4.src_address, &omp->ovpn_if->src_ip,
+      clib_memcpy_fast (&hdr4->ip4.src_address, &omp->src_ip,
 			sizeof (ip4_address_t));
       clib_memcpy_fast (&hdr4->ip4.dst_address, remote_addr,
 			sizeof (ip4_address_t));
@@ -408,7 +413,7 @@ ovpn_prepend_rewrite (vlib_buffer_t *b0, ip46_address_t *remote_addr,
       vlib_buffer_advance (b0, -sizeof (*hdr6));
       hdr6 = vlib_buffer_get_current (b0);
 
-      clib_memcpy_fast (&hdr6->ip6.src_address, &omp->ovpn_if->src_ip,
+      clib_memcpy_fast (&hdr6->ip6.src_address, &omp->src_ip,
 			sizeof (ip6_address_t));
       clib_memcpy_fast (&hdr6->ip6.dst_address, remote_addr,
 			sizeof (ip6_address_t));
@@ -1408,7 +1413,7 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
       if (PREDICT_FALSE (udp0->dst_port !=
 			   clib_host_to_net_u16 (UDP_DST_PORT_ovpn) ||
-			 omp->ovpn_if == NULL))
+			 !omp->enabled))
 	goto enqueue_other;
 
       ip46_address_t remote_addr;

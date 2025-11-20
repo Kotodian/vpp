@@ -38,8 +38,12 @@ typedef struct
   /* API message ID base */
   u16 msg_id_base;
 
-  /* local address */
-  ovpn_if_t *ovpn_if;
+  /* Base */
+  u8 enabled;
+
+  /* Control Plane */
+  ovpn_ip_pool_t tunnel_ip_pool;
+  ip46_address_t src_ip;
 
   /* options */
   u8 *options;

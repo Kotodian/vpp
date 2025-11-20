@@ -34,21 +34,19 @@
 #include <vpp/app/version.h>
 #include <stdbool.h>
 #include <ovpn/ovpn_timer.h>
+#include <ovpn/ovpn_if.h>
 
 ovpn_main_t ovpn_main;
 
 static int
-ovpn_enable (vlib_main_t *vm, ip46_address_t *src_addr)
+ovpn_enable (vlib_main_t *vm, ip46_address_t *src_addr, ip_prefix_t *prefix)
 {
   ovpn_main_t *omp = &ovpn_main;
-  ovpn_if_t *ovpn_if;
 
-  ovpn_if = clib_mem_alloc (sizeof (ovpn_if_t));
-  clib_memset (ovpn_if, 0, sizeof (ovpn_if_t));
-  if (ovpn_if == NULL)
-    return -1;
-  ovpn_if->src_ip = *src_addr;
-  omp->ovpn_if = ovpn_if;
+  omp->src_ip = *src_addr;
+  ovpn_ip_pool_init (&omp->tunnel_ip_pool, *prefix);
+  omp->enabled = 1;
+
   return 0;
 }
 
@@ -58,6 +56,7 @@ ovpn_enable_cmd (vlib_main_t *vm, unformat_input_t *input,
 {
   ovpn_main_t *omp = &ovpn_main;
   ip46_address_t src_addr;
+  ip_prefix_t prefix;
   clib_error_t *error = NULL;
   clib_memset (&src_addr, 0, sizeof (ip46_address_t));
 
@@ -65,13 +64,17 @@ ovpn_enable_cmd (vlib_main_t *vm, unformat_input_t *input,
     {
       if (unformat (input, "src %U", unformat_ip46_address, &src_addr))
 	;
+      else if (unformat (input, "tunnel-ip %U", unformat_ip_prefix, &prefix))
+	;
       else
 	return clib_error_return (0, "unknown input '%U'",
 				  format_unformat_error, input);
     }
 
-  if (omp->ovpn_if != NULL)
-    goto done;
+  if (omp->enabled)
+    {
+      goto done;
+    }
 
   if (ip46_address_is_zero (&src_addr))
     {
@@ -79,7 +82,7 @@ ovpn_enable_cmd (vlib_main_t *vm, unformat_input_t *input,
       goto done;
     }
 
-  ovpn_enable (vm, &src_addr);
+  ovpn_enable (vm, &src_addr, &prefix);
 
 done:
   return error;
@@ -101,7 +104,8 @@ ovpn_init (vlib_main_t *vm)
 
   omp->vlib_main = vm;
   omp->vnet_main = vnet_get_main ();
-  omp->ovpn_if = NULL;
+  omp->enabled = 0;
+  clib_memset (&omp->src_ip, 0, sizeof (ip46_address_t));
   vec_validate_aligned (omp->per_thread_data, tm->n_vlib_mains - 1,
 			CLIB_CACHE_LINE_BYTES);
 
