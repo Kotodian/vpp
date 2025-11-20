@@ -1262,314 +1262,434 @@ ovpn_ctrl_process (vlib_main_t *vm, vlib_node_runtime_t *node,
   return 0;
 }
 
+static_always_inline void
+ovpn_input_process_ops (vlib_main_t *vm, vlib_node_runtime_t *node,
+			vnet_crypto_op_t *ops, vlib_buffer_t **b, u16 *nexts,
+			u16 drop_next)
+{
+  u32 n_ops = vec_len (ops);
+  vnet_crypto_op_t *op = ops;
+
+  if (n_ops == 0)
+    return;
+
+  u32 n_fail = n_ops - vnet_crypto_process_ops (vm, op, n_ops);
+
+  while (n_fail)
+    {
+      ASSERT (op - ops < n_ops);
+      if (op->status != VNET_CRYPTO_OP_STATUS_COMPLETED)
+	{
+	  u32 data_idx = op->user_data;
+	  b[data_idx]->error = node->errors[OVPN_ERROR_DECRYPT_FAILED];
+	  nexts[data_idx] = drop_next;
+	  n_fail--;
+	}
+      op++;
+    }
+}
+
+static_always_inline void
+ovpn_input_process_chained_ops (vlib_main_t *vm, vlib_node_runtime_t *node,
+				vnet_crypto_op_t *ops, vlib_buffer_t **b,
+				u16 *nexts, vnet_crypto_op_chunk_t *chunks,
+				u16 drop_next)
+{
+  u32 n_ops = vec_len (ops);
+  vnet_crypto_op_t *op = ops;
+
+  if (n_ops == 0)
+    return;
+
+  u32 n_fail = n_ops - vnet_crypto_process_chained_ops (vm, op, chunks, n_ops);
+
+  while (n_fail)
+    {
+      ASSERT (op - ops < n_ops);
+      if (op->status != VNET_CRYPTO_OP_STATUS_COMPLETED)
+	{
+	  u32 data_idx = op->user_data;
+	  b[data_idx]->error = node->errors[OVPN_ERROR_DECRYPT_FAILED];
+	  nexts[data_idx] = drop_next;
+	  n_fail--;
+	}
+      op++;
+    }
+}
+
+static_always_inline void
+ovpn_input_chain_crypto (vlib_main_t *vm, ovpn_per_thread_data_t *ptd,
+			 vlib_buffer_t *b, u32 start_offset, u32 data_len,
+			 u16 *n_chunks)
+{
+  vlib_buffer_t *cb = b;
+  u32 offset = start_offset;
+  u32 remaining = data_len;
+  u16 count = 0;
+
+  while (remaining)
+    {
+      while (offset >= cb->current_length)
+	{
+	  ASSERT (cb->flags & VLIB_BUFFER_NEXT_PRESENT);
+	  offset -= cb->current_length;
+	  cb = vlib_get_buffer (vm, cb->next_buffer);
+	}
+
+      vnet_crypto_op_chunk_t *ch;
+      vec_add2 (ptd->chunks, ch, 1);
+      count += 1;
+
+      u32 avail = cb->current_length - offset;
+      u32 len = clib_min (avail, remaining);
+      ch->src = ch->dst = vlib_buffer_get_current (cb) + offset;
+      ch->len = len;
+
+      remaining -= len;
+      offset = 0;
+
+      if (remaining == 0)
+	break;
+
+      ASSERT (cb->flags & VLIB_BUFFER_NEXT_PRESENT);
+      cb = vlib_get_buffer (vm, cb->next_buffer);
+    }
+
+  if (n_chunks)
+    *n_chunks = count;
+}
+
 always_inline uword
 ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		   vlib_frame_t *frame, u8 is_ip4)
 {
-  u32 n_left_from, *from, *to_next;
-  ovpn_next_t next_index;
   ovpn_main_t *omp = &ovpn_main;
   clib_thread_index_t thread_index = vlib_get_thread_index ();
   ovpn_per_thread_data_t *ptd =
     vec_elt_at_index (omp->per_thread_data, thread_index);
+  const u16 drop_next = OVPN_NEXT_DROP;
+  u32 *from = vlib_frame_vector_args (frame);
+  u32 n_left_from = frame->n_vectors;
+  vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b = bufs;
+  vlib_buffer_t *data_bufs[VLIB_FRAME_SIZE];
+  vlib_buffer_t *data_last[VLIB_FRAME_SIZE];
+  u16 data_nexts[VLIB_FRAME_SIZE];
+  u32 data_bi[VLIB_FRAME_SIZE];
+  u16 other_nexts[VLIB_FRAME_SIZE];
+  u32 other_bi[VLIB_FRAME_SIZE];
+  u16 n_data = 0, n_other = 0;
 
+  vlib_get_buffers (vm, from, bufs, n_left_from);
   vec_reset_length (ptd->crypto_ops);
   vec_reset_length (ptd->chained_crypto_ops);
   vec_reset_length (ptd->chunks);
 
-  from = vlib_frame_vector_args (frame);
-  n_left_from = frame->n_vectors;
-  next_index = node->cached_next_index;
-
   while (n_left_from > 0)
     {
-      u32 n_left_to_next;
-
-      vlib_get_next_frame (vm, node, next_index, to_next, n_left_to_next);
-
-      while (n_left_from > 0 && n_left_to_next > 0)
+      if (n_left_from > 2)
 	{
-	  u32 bi0;
-	  vlib_buffer_t *b0;
-	  u32 next0 = OVPN_NEXT_DROP;
-	  u32 error0 = OVPN_ERROR_NONE;
-	  ovpn_msg_hdr_t *msg_hdr0;
-	  ip4_header_t *ip40 = NULL;
-	  ip6_header_t *ip60 = NULL;
-	  udp_header_t *udp0;
+	  u8 *p;
+	  vlib_prefetch_buffer_header (b[2], LOAD);
+	  p = vlib_buffer_get_current (b[1]);
+	  CLIB_PREFETCH (p, CLIB_CACHE_LINE_BYTES, LOAD);
+	  CLIB_PREFETCH (vlib_buffer_get_tail (b[1]), CLIB_CACHE_LINE_BYTES,
+			 LOAD);
+	}
+
+      vlib_buffer_t *b0 = b[0];
+      u32 bi0 = from[b - bufs];
+      u32 error0 = OVPN_ERROR_NONE;
+      u16 next0 = OVPN_NEXT_DROP;
+      bool enqueue_data = false;
+      ovpn_msg_hdr_t *msg_hdr0 = vlib_buffer_get_current (b0);
+      u8 *payload = (u8 *) msg_hdr0 + sizeof (ovpn_msg_hdr_t);
+      udp_header_t *udp0 =
+	(udp_header_t *) ((u8 *) msg_hdr0 - sizeof (udp_header_t));
+
+      if (PREDICT_FALSE (udp0->dst_port !=
+			   clib_host_to_net_u16 (UDP_DST_PORT_ovpn) ||
+			 omp->ovpn_if == NULL))
+	goto enqueue_other;
+
+      ip46_address_t remote_addr;
+      if (is_ip4)
+	{
+	  ip4_header_t *ip40 =
+	    (ip4_header_t *) ((u8 *) udp0 - sizeof (ip4_header_t));
+	  ip46_address_set_ip4 (&remote_addr, &ip40->src_address);
+	}
+      else
+	{
+	  ip6_header_t *ip60 =
+	    (ip6_header_t *) ((u8 *) udp0 - sizeof (ip6_header_t));
+	  ip46_address_set_ip6 (&remote_addr, &ip60->src_address);
+	}
+
+      if (PREDICT_TRUE (msg_hdr0->opcode == OVPN_OPCODE_TYPE_P_DATA_V1))
+	{
 	  ovpn_session_t *sess = NULL;
 	  u32 sess_index = ~0;
-	  ip46_address_t remote_addr;
-	  ovpn_key2_t *key2 = NULL;
 
-	  bi0 = from[0];
-	  to_next[0] = bi0;
-	  from += 1;
-	  to_next += 1;
-	  n_left_from -= 1;
-	  n_left_to_next -= 1;
+	  if (ovpn_find_session (&remote_addr, &sess_index) !=
+	      OVPN_SESSION_ERROR_NONE)
+	    goto enqueue_other;
 
-	  b0 = vlib_get_buffer (vm, bi0);
-	  msg_hdr0 = vlib_buffer_get_current (b0);
-	  u8 *payload = (u8 *) msg_hdr0 + sizeof (ovpn_msg_hdr_t);
-	  udp0 = (udp_header_t *) ((u8 *) msg_hdr0 - sizeof (udp_header_t));
+	  sess = pool_elt_at_index (omp->sessions, sess_index);
+	  if (sess->state != OVPN_SESSION_STATE_ACTIVE)
+	    goto enqueue_other;
 
-	  if (PREDICT_FALSE (udp0->dst_port !=
-			       clib_host_to_net_u16 (UDP_DST_PORT_ovpn) ||
-			     omp->ovpn_if == NULL))
+	  if (PREDICT_FALSE (sess->input_thread_index == ~0))
 	    {
-	      next0 = OVPN_NEXT_DROP;
-	      error0 = OVPN_ERROR_NONE;
-	      goto done0;
+	      clib_atomic_cmp_and_swap (&sess->input_thread_index, ~0,
+					thread_index);
+	    }
+
+	  if (sess->input_thread_index != thread_index)
+	    {
+	      next0 = OVPN_NEXT_HANDOFF_DATA;
+	      goto enqueue_other;
+	    }
+
+	  ovpn_key2_t *key2 = pool_elt_at_index (omp->key2s, sess->key2_index);
+	  if (key2 == NULL)
+	    goto enqueue_other;
+
+	  if (PREDICT_FALSE (key2->recv_key_index == ~0))
+	    {
+	      error0 = OVPN_ERROR_DECRYPT_FAILED;
+	      goto enqueue_other;
+	    }
+
+	  vlib_buffer_t *lb = b0;
+	  u16 n_bufs = 1;
+
+	  if (b0->flags & VLIB_BUFFER_NEXT_PRESENT)
+	    {
+	      n_bufs = vlib_buffer_chain_linearize (vm, b0);
+	      if (PREDICT_FALSE (n_bufs == 0))
+		{
+		  error0 = OVPN_ERROR_FAILED_TO_ALLOCATE_BUFFER;
+		  goto enqueue_other;
+		}
+
+	      if (n_bufs > 1)
+		{
+		  vlib_buffer_t *before_last = b0;
+		  while (lb->flags & VLIB_BUFFER_NEXT_PRESENT)
+		    {
+		      before_last = lb;
+		      lb = vlib_get_buffer (vm, lb->next_buffer);
+		    }
+
+		  if (PREDICT_FALSE (lb->current_length < OVPN_DATA_TAG_LEN))
+		    {
+		      u32 len_diff = OVPN_DATA_TAG_LEN - lb->current_length;
+
+		      before_last->current_length -= len_diff;
+		      if (before_last == b0)
+			before_last->flags &= ~VLIB_BUFFER_TOTAL_LENGTH_VALID;
+
+		      vlib_buffer_advance (lb, (signed) -len_diff);
+		      clib_memcpy_fast (vlib_buffer_get_current (lb),
+					vlib_buffer_get_tail (before_last),
+					len_diff);
+		    }
+		}
+	    }
+
+	  msg_hdr0 = vlib_buffer_get_current (b0);
+	  payload = (u8 *) msg_hdr0 + sizeof (ovpn_msg_hdr_t);
+	  u32 total_len = vlib_buffer_length_in_chain (vm, b0);
+	  if (PREDICT_FALSE (total_len <= sizeof (ovpn_msg_hdr_t)))
+	    {
+	      error0 = OVPN_ERROR_MALFORMED;
+	      goto enqueue_other;
+	    }
+	  u32 payload_len_total = total_len - sizeof (ovpn_msg_hdr_t);
+	  if (payload_len_total <= (OVPN_DATA_IV_LEN + OVPN_DATA_TAG_LEN))
+	    {
+	      error0 = OVPN_ERROR_MALFORMED;
+	      goto enqueue_other;
+	    }
+
+	  u8 *iv = payload;
+	  u8 *ciphertext = payload + OVPN_DATA_IV_LEN;
+	  u32 ciphertext_len_total =
+	    payload_len_total - OVPN_DATA_IV_LEN - OVPN_DATA_TAG_LEN;
+	  u8 *tag = vlib_buffer_get_tail (lb) - OVPN_DATA_TAG_LEN;
+	  u32 ciphertext_offset =
+	    (u32) (ciphertext - (u8 *) vlib_buffer_get_current (b0));
+
+	  u32 data_idx = n_data;
+	  data_bufs[data_idx] = b0;
+	  data_last[data_idx] = lb;
+	  data_bi[data_idx] = bi0;
+	  data_nexts[data_idx] = OVPN_NEXT_IP_INPUT;
+
+	  vnet_crypto_op_t **ops =
+	    (lb != b0) ? &ptd->chained_crypto_ops : &ptd->crypto_ops;
+	  vnet_crypto_op_t *op;
+	  vec_add2_aligned (ops[0], op, 1, CLIB_CACHE_LINE_BYTES);
+	  vnet_crypto_op_init (op, VNET_CRYPTO_OP_CHACHA20_POLY1305_DEC);
+	  op->key_index = key2->recv_key_index;
+	  op->iv = iv;
+	  op->tag = tag;
+	  op->tag_len = OVPN_DATA_TAG_LEN;
+	  op->aad = (u8 *) msg_hdr0;
+	  op->aad_len = sizeof (*msg_hdr0);
+	  op->user_data = data_idx;
+
+	  if (lb != b0)
+	    {
+	      op->flags |= VNET_CRYPTO_OP_FLAG_CHAINED_BUFFERS;
+	      op->chunk_index = vec_len (ptd->chunks);
+	      ovpn_input_chain_crypto (vm, ptd, b0, ciphertext_offset,
+				       ciphertext_len_total, &op->n_chunks);
+	    }
+	  else
+	    {
+	      op->src = ciphertext;
+	      op->dst = ciphertext;
+	      op->len = ciphertext_len_total;
+	    }
+
+	  enqueue_data = true;
+	  b0->error = node->errors[OVPN_ERROR_NONE];
+	  n_data += 1;
+	  goto next_packet;
+	}
+      else if (PREDICT_FALSE (msg_hdr0->opcode ==
+			      OVPN_OPCODE_TYPE_P_CONTROL_HARD_RESET_CLIENT_V1))
+	{
+	  ovpn_ctrl_msg_hdr_t *ctrl_msg_hdr0 = (ovpn_ctrl_msg_hdr_t *) payload;
+	  ovpn_ctrl_msg_client_hard_reset_v2_t *data =
+	    (ovpn_ctrl_msg_client_hard_reset_v2_t *) (payload +
+						      sizeof (
+							ovpn_ctrl_msg_hdr_t) +
+						      ctrl_msg_hdr0->acks_len *
+							sizeof (u32));
+	  ovpn_ctrl_event_hard_reset_client_v2_t *ctrl_event0 =
+	    clib_mem_alloc (sizeof (ovpn_ctrl_event_hard_reset_client_v2_t));
+
+	  clib_memset (ctrl_event0, 0,
+		       sizeof (ovpn_ctrl_event_hard_reset_client_v2_t));
+
+	  ctrl_event0->client_port = clib_net_to_host_u16 (udp0->src_port);
+	  ctrl_event0->is_ip4 = is_ip4;
+	  clib_memcpy_fast (&ctrl_event0->remote_addr, &remote_addr,
+			    sizeof (ip46_address_t));
+	  ctrl_event0->remote_session_id =
+	    clib_net_to_host_u64 (ctrl_msg_hdr0->session_id);
+	  clib_memcpy_fast (&ctrl_event0->hmac, ctrl_msg_hdr0->hmac, 20);
+	  ctrl_event0->pkt_id = clib_net_to_host_u32 (data->pkt_id);
+
+	  vlib_process_signal_event_mt (
+	    vm, omp->ctrl_node_index,
+	    OVPN_CTRL_EVENT_TYPE_HARD_RESET_CLIENT_V2, (uword) ctrl_event0);
+	}
+      else if (PREDICT_FALSE (msg_hdr0->opcode ==
+			      OVPN_OPCODE_TYPE_P_CONTROL_SOFT_RESET_V1))
+	{
+	  /* TODO: handle soft reset */
+	}
+      else if (PREDICT_FALSE (msg_hdr0->opcode == OVPN_OPCODE_TYPE_P_ACK_V1))
+	{
+	  ovpn_ctrl_msg_hdr_t *ctrl_msg_hdr0 = (ovpn_ctrl_msg_hdr_t *) payload;
+	  u32 *acks = (u32 *) (payload + sizeof (ovpn_ctrl_msg_hdr_t));
+	  ovpn_ctrl_msg_ack_v1_t *data =
+	    (ovpn_ctrl_msg_ack_v1_t *) (payload +
+					sizeof (ovpn_ctrl_msg_hdr_t) +
+					ctrl_msg_hdr0->acks_len *
+					  sizeof (u32));
+	  ovpn_ctrl_event_ack_v1_t *ctrl_event0 =
+	    clib_mem_alloc (sizeof (ovpn_ctrl_event_ack_v1_t));
+	  clib_memset (ctrl_event0, 0, sizeof (ovpn_ctrl_event_ack_v1_t));
+
+	  clib_memcpy_fast (&ctrl_event0->remote_addr, &remote_addr,
+			    sizeof (ip46_address_t));
+	  ctrl_event0->remote_session_id =
+	    clib_net_to_host_u64 (ctrl_msg_hdr0->session_id);
+	  clib_memcpy_fast (&ctrl_event0->hmac, ctrl_msg_hdr0->hmac, 20);
+
+	  if (ctrl_msg_hdr0->acks_len > 0)
+	    {
+	      vec_validate_init_empty (ctrl_event0->acks,
+				       ctrl_msg_hdr0->acks_len - 1, ~0);
+	      for (u8 i = 0; i < ctrl_msg_hdr0->acks_len; i++)
+		{
+		  ctrl_event0->acks[i] = clib_net_to_host_u32 (acks[i]);
+		  acks++;
+		}
+	    }
+
+	  ctrl_event0->session_id = clib_net_to_host_u64 (data->session_id);
+
+	  vlib_process_signal_event_mt (vm, omp->ctrl_node_index,
+					OVPN_CTRL_EVENT_TYPE_ACK_V1,
+					(uword) ctrl_event0);
+	}
+      else if (PREDICT_FALSE (msg_hdr0->opcode ==
+			      OVPN_OPCODE_TYPE_P_CONTROL_V1))
+	{
+	  if (thread_index != 0)
+	    {
+	      next0 = OVPN_NEXT_HANDOFF_HANDSHAKE;
+	      goto enqueue_other;
+	    }
+
+	  ovpn_ctrl_msg_hdr_t *ctrl_msg_hdr0 = (ovpn_ctrl_msg_hdr_t *) payload;
+	  payload += sizeof (ovpn_ctrl_msg_hdr_t) +
+		     ctrl_msg_hdr0->acks_len * sizeof (u32);
+	  ovpn_ctrl_msg_control_v1_t *ctrl_msg_control_v1 =
+	    (ovpn_ctrl_msg_control_v1_t *) payload;
+	  u32 pkt_id = ctrl_msg_control_v1->pkt_id;
+	  payload += sizeof (ovpn_ctrl_msg_control_v1_t);
+
+	  i32 payload_len =
+	    (i32) b0->current_length - (i32) sizeof (ovpn_ctrl_msg_hdr_t) -
+	    (i32) ctrl_msg_hdr0->acks_len * (i32) sizeof (u32) +
+	    (i32) sizeof (u32);
+
+	  if (payload_len < 0)
+	    {
+	      error0 = OVPN_ERROR_MALFORMED;
+	      goto enqueue_other;
 	    }
 
 	  if (is_ip4)
 	    {
-	      ip40 = (ip4_header_t *) ((u8 *) udp0 - sizeof (ip4_header_t));
-	      ip46_address_set_ip4 (&remote_addr, &ip40->src_address);
+	      ip4_header_t *ip40 =
+		(ip4_header_t *) ((u8 *) udp0 - sizeof (ip4_header_t));
+	      ovpn_handle_handshake (
+		vm, (ip46_address_t *) &ip40->src_address,
+		clib_net_to_host_u32 (pkt_id),
+		clib_net_to_host_u16 (udp0->src_port), 1,
+		clib_net_to_host_u64 (ctrl_msg_hdr0->session_id), payload,
+		(u32) payload_len);
 	    }
 	  else
 	    {
-	      ip60 = (ip6_header_t *) ((u8 *) udp0 - sizeof (ip6_header_t));
-	      ip46_address_set_ip6 (&remote_addr, &ip60->src_address);
+	      ip6_header_t *ip60 =
+		(ip6_header_t *) ((u8 *) udp0 - sizeof (ip6_header_t));
+	      ovpn_handle_handshake (
+		vm, (ip46_address_t *) &ip60->src_address,
+		clib_net_to_host_u32 (pkt_id),
+		clib_net_to_host_u16 (udp0->src_port), 0,
+		clib_net_to_host_u64 (ctrl_msg_hdr0->session_id), payload,
+		(u32) payload_len);
 	    }
+	}
+      else
+	{
+	  error0 = OVPN_ERROR_UNKNOWN_OPCODE;
+	}
 
-	  if (PREDICT_TRUE (msg_hdr0->opcode == OVPN_OPCODE_TYPE_P_DATA_V1))
-	    {
-	      if (ovpn_find_session (&remote_addr, &sess_index) !=
-		  OVPN_SESSION_ERROR_NONE)
-		{
-		  next0 = OVPN_NEXT_DROP;
-		  error0 = OVPN_ERROR_NONE;
-		  goto done0;
-		}
-	      sess = pool_elt_at_index (omp->sessions, sess_index);
-	      if (sess->state != OVPN_SESSION_STATE_ACTIVE)
-		{
-		  next0 = OVPN_NEXT_DROP;
-		  error0 = OVPN_ERROR_NONE;
-		  goto done0;
-		}
-	      if (PREDICT_FALSE (sess->input_thread_index == ~0))
-		{
-		  clib_atomic_cmp_and_swap (&sess->input_thread_index, ~0,
-					    thread_index);
-		}
-	      if (sess->input_thread_index != thread_index)
-		{
-		  next0 = OVPN_NEXT_HANDOFF_DATA;
-		  goto done0;
-		}
-	      key2 = pool_elt_at_index (omp->key2s, sess->key2_index);
-	      if (key2 == NULL)
-		{
-		  next0 = OVPN_NEXT_DROP;
-		  error0 = OVPN_ERROR_NONE;
-		  goto done0;
-		}
-	      if (PREDICT_FALSE (key2->recv_key_index == ~0))
-		{
-		  error0 = OVPN_ERROR_DECRYPT_FAILED;
-		  goto done0;
-		}
-
-	      u32 payload_len = b0->current_length - sizeof (ovpn_msg_hdr_t);
-	      if (payload_len <= (OVPN_DATA_IV_LEN + OVPN_DATA_TAG_LEN))
-		{
-		  error0 = OVPN_ERROR_MALFORMED;
-		  goto done0;
-		}
-	      u8 *iv = payload;
-	      u8 *ciphertext = payload + OVPN_DATA_IV_LEN;
-	      u32 ciphertext_len =
-		payload_len - OVPN_DATA_IV_LEN - OVPN_DATA_TAG_LEN;
-	      u8 *tag = ciphertext + ciphertext_len;
-	      vnet_crypto_op_t op;
-	      vnet_crypto_op_init (&op, VNET_CRYPTO_OP_CHACHA20_POLY1305_DEC);
-	      op.key_index = key2->recv_key_index;
-	      op.src = ciphertext;
-	      op.dst = ciphertext;
-	      op.len = ciphertext_len;
-	      op.iv = iv;
-	      op.tag = tag;
-	      op.tag_len = OVPN_DATA_TAG_LEN;
-	      op.aad = (u8 *) msg_hdr0;
-	      op.aad_len = sizeof (*msg_hdr0);
-	      if (PREDICT_FALSE (vnet_crypto_process_ops (vm, &op, 1) != 1 ||
-				 op.status != VNET_CRYPTO_OP_STATUS_COMPLETED))
-		{
-		  error0 = OVPN_ERROR_DECRYPT_FAILED;
-		  goto done0;
-		}
-
-	      // advance buffer past msg_hdr + IV
-	      vlib_buffer_advance (b0, sizeof (*msg_hdr0) + OVPN_DATA_IV_LEN);
-
-	      // 减去 tag 长度
-	      b0->current_length -= OVPN_DATA_TAG_LEN;
-
-	      // 读取 packet_id
-	      // u32 packet_id = clib_net_to_host_u32 (*(u32 *)
-	      // b0->current_data);
-
-	      // advance buffer past packet_id
-	      vlib_buffer_advance (b0, sizeof (u32));
-	      b0->current_length -= sizeof (u32);
-
-	      // b0->current_data 现在指向 user payload
-	      next0 = OVPN_NEXT_IP_INPUT;
-	      goto done0;
-	    }
-	  else if (PREDICT_FALSE (
-		     msg_hdr0->opcode ==
-		     OVPN_OPCODE_TYPE_P_CONTROL_HARD_RESET_CLIENT_V1))
-	    {
-	      ovpn_ctrl_msg_hdr_t *ctrl_msg_hdr0 =
-		(ovpn_ctrl_msg_hdr_t *) payload;
-	      ovpn_ctrl_msg_client_hard_reset_v2_t *data =
-		(ovpn_ctrl_msg_client_hard_reset_v2_t
-		   *) (payload + sizeof (ovpn_ctrl_msg_hdr_t) +
-		       ctrl_msg_hdr0->acks_len * sizeof (u32));
-	      ovpn_ctrl_event_hard_reset_client_v2_t *ctrl_event0 =
-		clib_mem_alloc (
-		  sizeof (ovpn_ctrl_event_hard_reset_client_v2_t));
-
-	      clib_memset (ctrl_event0, 0,
-			   sizeof (ovpn_ctrl_event_hard_reset_client_v2_t));
-
-	      /* client port */
-	      ctrl_event0->client_port = clib_net_to_host_u16 (udp0->src_port);
-
-	      /* remote address */
-	      ctrl_event0->is_ip4 = is_ip4;
-	      clib_memcpy_fast (&ctrl_event0->remote_addr, &remote_addr,
-				sizeof (ip46_address_t));
-
-	      /* remote session id */
-	      ctrl_event0->remote_session_id =
-		clib_net_to_host_u64 (ctrl_msg_hdr0->session_id);
-
-	      /* hmac */
-	      clib_memcpy_fast (&ctrl_event0->hmac, ctrl_msg_hdr0->hmac, 20);
-
-	      /* acks */
-	      ctrl_event0->pkt_id = clib_net_to_host_u32 (data->pkt_id);
-
-	      vlib_process_signal_event_mt (
-		vm, omp->ctrl_node_index,
-		OVPN_CTRL_EVENT_TYPE_HARD_RESET_CLIENT_V2,
-		(uword) ctrl_event0);
-	    }
-	  else if (PREDICT_FALSE (msg_hdr0->opcode ==
-				  OVPN_OPCODE_TYPE_P_CONTROL_SOFT_RESET_V1))
-	    {
-	      // TODO: handle soft reset
-	    }
-	  else if (PREDICT_FALSE (msg_hdr0->opcode ==
-				  OVPN_OPCODE_TYPE_P_ACK_V1))
-	    {
-	      ovpn_ctrl_msg_hdr_t *ctrl_msg_hdr0 =
-		(ovpn_ctrl_msg_hdr_t *) payload;
-	      u32 *acks = (u32 *) (payload + sizeof (ovpn_ctrl_msg_hdr_t));
-	      ovpn_ctrl_msg_ack_v1_t *data =
-		(ovpn_ctrl_msg_ack_v1_t *) (payload +
-					    sizeof (ovpn_ctrl_msg_hdr_t) +
-					    ctrl_msg_hdr0->acks_len *
-					      sizeof (u32));
-	      ovpn_ctrl_event_ack_v1_t *ctrl_event0 =
-		clib_mem_alloc (sizeof (ovpn_ctrl_event_ack_v1_t));
-	      clib_memset (ctrl_event0, 0, sizeof (ovpn_ctrl_event_ack_v1_t));
-
-	      /* remote address */
-	      clib_memcpy_fast (&ctrl_event0->remote_addr, &remote_addr,
-				sizeof (ip46_address_t));
-
-	      /* remote session id(Server side) */
-	      ctrl_event0->remote_session_id =
-		clib_net_to_host_u64 (ctrl_msg_hdr0->session_id);
-
-	      /* hmac */
-	      clib_memcpy_fast (&ctrl_event0->hmac, ctrl_msg_hdr0->hmac, 20);
-
-	      if (ctrl_msg_hdr0->acks_len > 0)
-		{
-		  vec_validate_init_empty (ctrl_event0->acks,
-					   ctrl_msg_hdr0->acks_len - 1, ~0);
-		  for (u8 i = 0; i < ctrl_msg_hdr0->acks_len; i++)
-		    {
-		      ctrl_event0->acks[i] = clib_net_to_host_u32 (acks[i]);
-		      acks++;
-		    }
-		}
-	      /* session id(Client side) */
-	      ctrl_event0->session_id =
-		clib_net_to_host_u64 (data->session_id);
-
-	      vlib_process_signal_event_mt (vm, omp->ctrl_node_index,
-					    OVPN_CTRL_EVENT_TYPE_ACK_V1,
-					    (uword) ctrl_event0);
-	    }
-	  else if (PREDICT_FALSE (msg_hdr0->opcode ==
-				  OVPN_OPCODE_TYPE_P_CONTROL_V1))
-	    {
-	      if (thread_index != 0)
-		{
-		  next0 = OVPN_NEXT_HANDOFF_HANDSHAKE;
-		}
-	      else
-		{
-		  ovpn_ctrl_msg_hdr_t *ctrl_msg_hdr0 =
-		    (ovpn_ctrl_msg_hdr_t *) payload;
-		  payload += sizeof (ovpn_ctrl_msg_hdr_t) +
-			     ctrl_msg_hdr0->acks_len * sizeof (u32);
-		  ovpn_ctrl_msg_control_v1_t *ctrl_msg_control_v1 =
-		    (ovpn_ctrl_msg_control_v1_t *) payload;
-		  /* packet id*/
-		  u32 pkt_id = ctrl_msg_control_v1->pkt_id;
-		  payload += sizeof (ovpn_ctrl_msg_control_v1_t);
-
-		  u32 payload_len =
-		    b0->current_length - sizeof (ovpn_ctrl_msg_hdr_t) -
-		    ctrl_msg_hdr0->acks_len * sizeof (u32) + sizeof (u32);
-
-		  if (payload_len < 0)
-		    {
-		      b0->error = node->errors[OVPN_ERROR_MALFORMED];
-		      goto done0;
-		    }
-
-		  if (is_ip4)
-		    {
-		      ip40 =
-			(ip4_header_t *) ((u8 *) udp0 - sizeof (ip4_header_t));
-		      ovpn_handle_handshake (
-			vm, (ip46_address_t *) &ip40->src_address,
-			clib_net_to_host_u32 (pkt_id),
-			clib_net_to_host_u16 (udp0->src_port), 1,
-			clib_net_to_host_u64 (ctrl_msg_hdr0->session_id),
-			payload, payload_len);
-		    }
-		  else
-		    {
-		      ip60 =
-			(ip6_header_t *) ((u8 *) udp0 - sizeof (ip6_header_t));
-		      // handle ssl handshake
-		      ovpn_handle_handshake (
-			vm, (ip46_address_t *) &ip60->src_address,
-			clib_net_to_host_u32 (pkt_id),
-			clib_net_to_host_u16 (udp0->src_port), 0,
-			clib_net_to_host_u64 (ctrl_msg_hdr0->session_id),
-			payload, payload_len);
-		    }
-		}
-	    }
-	  else
-	    {
-	      error0 = OVPN_ERROR_UNKNOWN_OPCODE;
-	    }
-
-	done0:
+    enqueue_other:
+      if (!enqueue_data)
+	{
 	  b0->error = node->errors[error0];
+	  other_bi[n_other] = bi0;
+	  other_nexts[n_other] = next0;
 
 	  if (PREDICT_FALSE ((node->flags & VLIB_NODE_FLAG_TRACE) &&
 			     (b0->flags & VLIB_BUFFER_IS_TRACED)))
@@ -1577,14 +1697,59 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      ovpn_trace_t *t = vlib_add_trace (vm, node, b0, sizeof (*t));
 	      t->next_index = next0;
 	    }
-	  /* verify speculative enqueue, maybe switch current next frame */
-	  vlib_validate_buffer_enqueue_x1 (vm, node, next_index, to_next,
-					   n_left_to_next, bi0, next0);
+
+	  n_other += 1;
 	}
-      vlib_put_next_frame (vm, node, next_index, n_left_to_next);
+
+    next_packet:
+      b += 1;
+      n_left_from -= 1;
     }
 
-  return n_left_from;
+  ovpn_input_process_ops (vm, node, ptd->crypto_ops, data_bufs, data_nexts,
+			  drop_next);
+  ovpn_input_process_chained_ops (vm, node, ptd->chained_crypto_ops, data_bufs,
+				  data_nexts, ptd->chunks, drop_next);
+
+  b = data_bufs;
+  vlib_buffer_t **data_lb = data_last;
+  u16 *data_next = data_nexts;
+  u32 remaining = n_data;
+  while (remaining > 0)
+    {
+      if (data_next[0] != drop_next)
+	{
+	  ovpn_msg_hdr_t *msg_hdr0 =
+	    (ovpn_msg_hdr_t *) vlib_buffer_get_current (b[0]);
+
+	  vlib_buffer_advance (b[0], sizeof (*msg_hdr0) + OVPN_DATA_IV_LEN);
+	  vlib_buffer_chain_increase_length (b[0], data_lb[0],
+					     -(i32) OVPN_DATA_TAG_LEN);
+
+	  vlib_buffer_advance (b[0], sizeof (u32));
+	  b[0]->current_length -= sizeof (u32);
+	}
+
+      if (PREDICT_FALSE ((node->flags & VLIB_NODE_FLAG_TRACE) &&
+			 (b[0]->flags & VLIB_BUFFER_IS_TRACED)))
+	{
+	  ovpn_trace_t *t = vlib_add_trace (vm, node, b[0], sizeof (*t));
+	  t->next_index = data_next[0];
+	}
+
+      b += 1;
+      data_lb += 1;
+      data_next += 1;
+      remaining -= 1;
+    }
+
+  if (n_other)
+    vlib_buffer_enqueue_to_next (vm, node, other_bi, other_nexts, n_other);
+
+  if (n_data)
+    vlib_buffer_enqueue_to_next (vm, node, data_bi, data_nexts, n_data);
+
+  return frame->n_vectors;
 }
 
 always_inline uword
