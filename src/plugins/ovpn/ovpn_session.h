@@ -64,8 +64,8 @@ typedef struct ovpn_session_t
   u32 index;
   u32 key2_index;
   u32 input_thread_index;
+  u32 sw_if_index;
   u8 is_ip4;
-  u8 is_tunnel_ip4;
 } ovpn_session_t;
 
 void ovpn_session_init (vlib_main_t *vm, ovpn_session_t *session, u32 index,

@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "vnet/ip/ip_types.h"
+#include <vnet/ip/ip_types.h>
 #include <vnet/crypto/crypto.h>
 #include <vnet/ip/ip46_address.h>
 #include <vppinfra/vec_bootstrap.h>
@@ -34,6 +34,7 @@
 #include <vppinfra/error.h>
 #include <ovpn/ovpn.h>
 #include <ovpn/ovpn_message.h>
+#include <ovpn/ovpn_if.h>
 
 typedef struct
 {
@@ -225,8 +226,6 @@ ovpn_create_session (ip46_address_t remote_addr, u8 is_ip4, u32 *sess_index)
   *sess_index = sess - omp->sessions;
   ovpn_session_init (omp->vlib_main, sess, *sess_index, &remote_addr, is_ip4);
   ovpn_ip_pool_alloc (&omp->tunnel_ip_pool, &sess->tunnel_addr);
-  sess->is_tunnel_ip4 =
-    ip_prefix_version (&omp->tunnel_ip_pool.prefix) == AF_IP4;
 
   kv.value = *sess_index;
   BV (clib_bihash_add_del) (&omp->session_hash, &kv, 1);
@@ -270,6 +269,9 @@ ovpn_activate_session (ovpn_session_t *sess, ovpn_channel_t *ch)
 
   vlib_worker_thread_barrier_sync (vm);
   /* Create tunnel interface */
+  ovpn_if_create (sess->index, &sess->tunnel_addr,
+		  ovpn_ip_pool_is_ip4 (&omp->tunnel_ip_pool),
+		  &sess->sw_if_index, sess->index);
 
   /* Free channel */
   sess->channel_index = ~0;
@@ -321,6 +323,8 @@ ovpn_free_session (vlib_main_t *vm, ovpn_session_t *sess)
   kv.key[0] = sess->remote_addr.as_u64[0];
   kv.key[1] = sess->remote_addr.as_u64[1];
   kv.value = sess->index;
+  vlib_worker_thread_barrier_sync (vm);
+
   BV (clib_bihash_add_del) (&omp->session_hash, &kv, 0);
   if (!pool_is_free_index (omp->channels, sess->channel_index))
     {
@@ -338,8 +342,13 @@ ovpn_free_session (vlib_main_t *vm, ovpn_session_t *sess)
       sess->key2_index = ~0;
     }
   sess->input_thread_index = ~0;
+
+  ovpn_if_delete (sess->sw_if_index);
+
   ovpn_session_free (sess);
   pool_put (omp->sessions, sess);
+
+  vlib_worker_thread_barrier_release (vm);
 }
 
 always_inline void
@@ -661,11 +670,11 @@ ovpn_send_ctrl_server_reset_v2 (vlib_main_t *vm, ip46_address_t *remote_addr,
 }
 
 always_inline void
-ovpn_handle_hard_reset_client_v2 (vlib_main_t *vm, uword *event_data)
+ovpn_handle_hard_reset_client_v2 (vlib_main_t *vm, uword event_data)
 {
   ovpn_main_t *omp = &ovpn_main;
   ovpn_ctrl_event_hard_reset_client_v2_t *event =
-    (ovpn_ctrl_event_hard_reset_client_v2_t *) event_data[0];
+    (ovpn_ctrl_event_hard_reset_client_v2_t *) event_data;
   u32 session_index = ~0;
   u32 channel_index = ~0;
   u32 reliable_queue_index = ~0;
@@ -714,13 +723,13 @@ done:
 }
 
 always_inline void
-ovpn_handle_ack_v1 (vlib_main_t *vm, uword *event_data)
+ovpn_handle_ack_v1 (vlib_main_t *vm, uword event_data)
 {
   ovpn_main_t *omp = &ovpn_main;
   ovpn_session_t *sess;
   ovpn_channel_t *ch;
   ovpn_reliable_queue_t *queue;
-  ovpn_ctrl_event_ack_v1_t *event = (ovpn_ctrl_event_ack_v1_t *) event_data[0];
+  ovpn_ctrl_event_ack_v1_t *event = (ovpn_ctrl_event_ack_v1_t *) event_data;
   u32 session_index = ~0;
   ovpn_session_error_t error =
     ovpn_find_session (&event->remote_addr, &session_index);
@@ -1148,23 +1157,32 @@ ovpn_handle_handshake (vlib_main_t *vm, ip46_address_t *remote_addr,
 }
 
 always_inline void
-ovpn_handle_session_expired (vlib_main_t *vm, uword *event_data)
+ovpn_handle_session_expired (vlib_main_t *vm, uword event_data)
 {
   ovpn_main_t *omp = &ovpn_main;
-  ovpn_session_t *sess = pool_elt_at_index (omp->sessions, event_data[0]);
+  ovpn_session_t *sess = pool_elt_at_index (omp->sessions, event_data);
   ovpn_free_session (vm, sess);
 }
 
 always_inline void
-ovpn_handle_channel_expired (vlib_main_t *vm, uword *event_data)
+ovpn_handle_session_keepalive (vlib_main_t *vm, uword event_data)
 {
   ovpn_main_t *omp = &ovpn_main;
-  ovpn_channel_t *ch = pool_elt_at_index (omp->channels, event_data[0]);
+  ovpn_session_t *sess = pool_elt_at_index (omp->sessions, event_data);
+  tw_timer_update_2t_1w_2048sl (&omp->sessions_timer_wheel, sess->index,
+				(u64) OVN_SESSION_EXPIRED_TIMEOUT);
+}
+
+always_inline void
+ovpn_handle_channel_expired (vlib_main_t *vm, uword event_data)
+{
+  ovpn_main_t *omp = &ovpn_main;
+  ovpn_channel_t *ch = pool_elt_at_index (omp->channels, event_data);
   ovpn_free_channel (vm, ch);
 }
 
 always_inline void
-ovpn_handle_reliable_send_queue_expired (vlib_main_t *vm, uword *event_data)
+ovpn_handle_reliable_send_queue_expired (vlib_main_t *vm, uword event_data)
 {
   ovpn_main_t *omp = &ovpn_main;
   u32 bi0 = ~0;
@@ -1172,7 +1190,7 @@ ovpn_handle_reliable_send_queue_expired (vlib_main_t *vm, uword *event_data)
   ovpn_reliable_queue_t *queue;
   ovpn_reliable_pkt_t *pkt = NULL;
   ovpn_reliable_send_queue_event_t *event =
-    (ovpn_reliable_send_queue_event_t *) event_data[0];
+    (ovpn_reliable_send_queue_event_t *) event_data;
 
   if (pool_is_free_index (omp->reliable_queues, event->queue_index))
     goto done;
@@ -1236,23 +1254,27 @@ ovpn_ctrl_process (vlib_main_t *vm, vlib_node_runtime_t *node,
 	{
 	case OVPN_CTRL_EVENT_TYPE_HARD_RESET_CLIENT_V2:
 	  for (i = 0; i < vec_len (event_data); i++)
-	    ovpn_handle_hard_reset_client_v2 (vm, event_data);
+	    ovpn_handle_hard_reset_client_v2 (vm, event_data[i]);
 	  break;
 	case OVPN_CTRL_EVENT_TYPE_ACK_V1:
 	  for (i = 0; i < vec_len (event_data); i++)
-	    ovpn_handle_ack_v1 (vm, event_data);
+	    ovpn_handle_ack_v1 (vm, event_data[i]);
 	  break;
 	case OVPN_CTRL_EVENT_TYPE_SESSION_EXPIRED:
 	  for (i = 0; i < vec_len (event_data); i++)
-	    ovpn_handle_session_expired (vm, event_data);
+	    ovpn_handle_session_expired (vm, event_data[i]);
+	  break;
+	case OVPN_CTRL_EVENT_TYPE_SESSION_KEEPALIVE:
+	  for (i = 0; i < vec_len (event_data); i++)
+	    ovpn_handle_session_keepalive (vm, event_data[i]);
 	  break;
 	case OVPN_CTRL_EVENT_TYPE_CHANNEL_EXPIRED:
 	  for (i = 0; i < vec_len (event_data); i++)
-	    ovpn_handle_channel_expired (vm, event_data);
+	    ovpn_handle_channel_expired (vm, event_data[i]);
 	  break;
 	case OVPN_CTRL_EVENT_TYPE_RELIABLE_SEND_QUEUE_EXPIRED:
 	  for (i = 0; i < vec_len (event_data); i++)
-	    ovpn_handle_reliable_send_queue_expired (vm, event_data);
+	    ovpn_handle_reliable_send_queue_expired (vm, event_data[i]);
 	  break;
 	default:
 	  clib_warning ("Unexpected event type %d", event_type);
@@ -1557,6 +1579,9 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  enqueue_data = true;
 	  b0->error = node->errors[OVPN_ERROR_NONE];
 	  n_data += 1;
+    vlib_process_signal_event_mt (
+      vm, omp->timer_node_index,
+      OVPN_CTRL_EVENT_TYPE_SESSION_KEEPALIVE, (uword) sess->index);
 	  goto next_packet;
 	}
       else if (PREDICT_FALSE (msg_hdr0->opcode ==

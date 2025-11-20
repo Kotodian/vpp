@@ -41,12 +41,22 @@ typedef struct ovpn_ip_pool
 
 extern ovpn_if_t *ovpn_if_pool;
 
+int ovpn_if_create (u32 user_instance, const ip46_address_t *tunnel_ip,
+		    u8 is_ip4, index_t *sw_if_indexp, index_t sess_index);
+int ovpn_if_delete (u32 sw_if_index);
+
 always_inline ovpn_if_t *
 ovpn_if_get (index_t ovpnii)
 {
   if (INDEX_INVALID == ovpnii)
     return (NULL);
   return (pool_elt_at_index (ovpn_if_pool, ovpnii));
+}
+
+always_inline u8
+ovpn_ip_pool_is_ip4 (ovpn_ip_pool_t *pool)
+{
+  return ip_prefix_version (&pool->prefix) == AF_IP4;
 }
 
 always_inline void

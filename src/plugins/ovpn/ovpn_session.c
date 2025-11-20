@@ -29,6 +29,7 @@ ovpn_session_init (vlib_main_t *vm, ovpn_session_t *sess, u32 index,
   sess->is_ip4 = is_ip4;
   sess->key2_index = ~0;
   sess->input_thread_index = ~0;
+  sess->sw_if_index = ~0;
 }
 
 void

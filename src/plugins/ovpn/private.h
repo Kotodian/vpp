@@ -28,6 +28,7 @@
   _ (CONTROL_V1, "Control v1")                                                \
   _ (ACK_V1, "Ack v1")                                                        \
   _ (SESSION_EXPIRED, "Session expired")                                      \
+  _ (SESSION_KEEPALIVE, "Session keepalive")                                  \
   _ (CHANNEL_EXPIRED, "Channel expired")                                      \
   _ (RELIABLE_SEND_QUEUE_EXPIRED, "Reliable send queue expired")
 
