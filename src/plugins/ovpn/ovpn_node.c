@@ -2184,20 +2184,6 @@ VLIB_NODE_FN (ovpn6_handoff_handshake_node)
 /* *INDENT-ON* */
 
 /* *INDENT-OFF* */
-#ifndef CLIB_MARCH_VARIANT
-vlib_node_registration_t ovpn_timer_process_node;
-vlib_node_registration_t ovpn_ctrl_process_node;
-vlib_node_registration_t ovpn4_input_node;
-vlib_node_registration_t ovpn6_input_node;
-vlib_node_registration_t ovpn4_output_node;
-vlib_node_registration_t ovpn6_output_node;
-vlib_node_registration_t ovpn4_handoff_handshake_node;
-vlib_node_registration_t ovpn4_handoff_data_node;
-vlib_node_registration_t ovpn6_handoff_handshake_node;
-vlib_node_registration_t ovpn6_handoff_data_node;
-vlib_node_registration_t ovpn4_handoff_output_node;
-vlib_node_registration_t ovpn6_handoff_output_node;
-#endif /* CLIB_MARCH_VARIANT */
 VLIB_NODE_FN (ovpn4_input_node)
 (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
 {
@@ -2250,7 +2236,6 @@ VLIB_NODE_FN (ovpn6_output_node)
 /* *INDENT-ON* */
 
 /* *INDENT-OFF* */
-#ifndef CLIB_MARCH_VARIANT
 VLIB_REGISTER_NODE (ovpn_timer_process_node) = {
   .function = ovpn_timer_process,
   .type = VLIB_NODE_TYPE_PROCESS,
@@ -2264,7 +2249,6 @@ VLIB_REGISTER_NODE (ovpn_ctrl_process_node) = {
   .name = "ovpn-ctrl-process",
   .n_next_nodes = 0,
 };
-#endif /* CLIB_MARCH_VARIANT */
 /* *INDENT-ON* */
 
 /* *INDENT-OFF* */
