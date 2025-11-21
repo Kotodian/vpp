@@ -45,6 +45,7 @@ typedef struct
 } ovpn_trace_t;
 
 /* packet trace format function */
+#ifndef CLIB_MARCH_VARIANT
 static u8 *
 format_ovpn_input_trace (u8 *s, va_list *args)
 {
@@ -56,19 +57,7 @@ format_ovpn_input_trace (u8 *s, va_list *args)
 	      t->next_index);
   return s;
 }
-
-vlib_node_registration_t ovpn_timer_process_node;
-vlib_node_registration_t ovpn_ctrl_process_node;
-vlib_node_registration_t ovpn4_input_node;
-vlib_node_registration_t ovpn6_input_node;
-vlib_node_registration_t ovpn4_output_node;
-vlib_node_registration_t ovpn6_output_node;
-vlib_node_registration_t ovpn4_handoff_handshake_node;
-vlib_node_registration_t ovpn4_handoff_data_node;
-vlib_node_registration_t ovpn6_handoff_handshake_node;
-vlib_node_registration_t ovpn6_handoff_data_node;
-vlib_node_registration_t ovpn4_handoff_output_node;
-vlib_node_registration_t ovpn6_handoff_output_node;
+#endif /* CLIB_MARCH_VARIANT */
 
 #define foreach_ovpn_error                                                    \
   _ (NONE, "No error")                                                        \
@@ -88,11 +77,13 @@ typedef enum
     OVPN_N_ERROR,
 } ovpn_error_t;
 
+#ifndef CLIB_MARCH_VARIANT
 static char *ovpn_error_strings[] = {
 #define _(sym, string) string,
   foreach_ovpn_error
 #undef _
 };
+#endif /* CLIB_MARCH_VARIANT */
 
 typedef enum
 {
@@ -115,11 +106,13 @@ typedef enum
     OVPN_HANDOFF_N_ERROR,
 } ovpn_handoff_error_t;
 
+#ifndef CLIB_MARCH_VARIANT
 static char *ovpn_handoff_error_strings[] = {
 #define _(sym, string) string,
   foreach_ovpn_handoff_error
 #undef _
 };
+#endif /* CLIB_MARCH_VARIANT */
 
 typedef enum
 {
@@ -133,6 +126,7 @@ typedef struct ovpn_handoff_trace_t_
   u32 next_worker_index;
 } ovpn_handoff_trace_t;
 
+#ifndef CLIB_MARCH_VARIANT
 static u8 *
 format_ovpn_handoff_trace (u8 *s, va_list *args)
 {
@@ -142,11 +136,13 @@ format_ovpn_handoff_trace (u8 *s, va_list *args)
   s = format (s, "ovpn handoff: next-worker %d", t->next_worker_index);
   return s;
 }
+#endif /* CLIB_MARCH_VARIANT */
 
 typedef struct ovpn_output_trace_t_
 {
 } ovpn_output_trace_t;
 
+#ifndef CLIB_MARCH_VARIANT
 static u8 *
 format_ovpn_output_trace (u8 *s, va_list *args)
 {
@@ -154,6 +150,7 @@ format_ovpn_output_trace (u8 *s, va_list *args)
   CLIB_UNUSED (vlib_node_t * node) = va_arg (*args, vlib_node_t *);
   return s;
 }
+#endif /* CLIB_MARCH_VARIANT */
 
 typedef enum
 {
@@ -2056,6 +2053,18 @@ ovpn_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  goto next;
 	}
 
+      if (PREDICT_FALSE (sess->input_thread_index == ~0))
+	{
+	  clib_atomic_cmp_and_swap (&sess->input_thread_index, ~0,
+				    thread_index);
+	}
+
+      if (sess->input_thread_index != thread_index)
+	{
+	  next0 = OVPN_NEXT_OUTPUT_HANDOFF;
+	  goto next;
+	}
+
       ovpn_key2_t *key2 = pool_elt_at_index (omp->key2s, sess->key2_index);
       if (PREDICT_FALSE (key2->send_key_index == ~0))
 	{
@@ -2175,6 +2184,20 @@ VLIB_NODE_FN (ovpn6_handoff_handshake_node)
 /* *INDENT-ON* */
 
 /* *INDENT-OFF* */
+#ifndef CLIB_MARCH_VARIANT
+vlib_node_registration_t ovpn_timer_process_node;
+vlib_node_registration_t ovpn_ctrl_process_node;
+vlib_node_registration_t ovpn4_input_node;
+vlib_node_registration_t ovpn6_input_node;
+vlib_node_registration_t ovpn4_output_node;
+vlib_node_registration_t ovpn6_output_node;
+vlib_node_registration_t ovpn4_handoff_handshake_node;
+vlib_node_registration_t ovpn4_handoff_data_node;
+vlib_node_registration_t ovpn6_handoff_handshake_node;
+vlib_node_registration_t ovpn6_handoff_data_node;
+vlib_node_registration_t ovpn4_handoff_output_node;
+vlib_node_registration_t ovpn6_handoff_output_node;
+#endif /* CLIB_MARCH_VARIANT */
 VLIB_NODE_FN (ovpn4_input_node)
 (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
 {
@@ -2227,24 +2250,26 @@ VLIB_NODE_FN (ovpn6_output_node)
 /* *INDENT-ON* */
 
 /* *INDENT-OFF* */
+#ifndef CLIB_MARCH_VARIANT
 VLIB_REGISTER_NODE (ovpn_timer_process_node) = {
   .function = ovpn_timer_process,
   .type = VLIB_NODE_TYPE_PROCESS,
   .name = "ovpn-timer-process",
   .n_next_nodes = 0,
 };
-/* *INDENT-ON* */
 
-/* *INDENT-OFF* */
 VLIB_REGISTER_NODE (ovpn_ctrl_process_node) = {
   .function = ovpn_ctrl_process,
   .type = VLIB_NODE_TYPE_PROCESS,
   .name = "ovpn-ctrl-process",
   .n_next_nodes = 0,
 };
+#endif /* CLIB_MARCH_VARIANT */
 /* *INDENT-ON* */
 
 /* *INDENT-OFF* */
+/* *INDENT-OFF* */
+#ifndef CLIB_MARCH_VARIANT
 VLIB_REGISTER_NODE (ovpn4_handoff_handshake_node) = {
   .name = "ovpn4-handoff-handshake",
   .vector_size = sizeof (u32),
@@ -2257,9 +2282,7 @@ VLIB_REGISTER_NODE (ovpn4_handoff_handshake_node) = {
     [0] = "error-drop",
   },
 };
-/* *INDENT-ON* */
 
-/* *INDENT-OFF* */
 VLIB_REGISTER_NODE (ovpn6_handoff_handshake_node) = {
   .name = "ovpn6-handoff-handshake",
   .vector_size = sizeof (u32),
@@ -2272,6 +2295,59 @@ VLIB_REGISTER_NODE (ovpn6_handoff_handshake_node) = {
     [0] = "error-drop",
   },
 };
+
+VLIB_REGISTER_NODE (ovpn4_handoff_data_node) = {
+  .name = "ovpn4-handoff-data",
+  .vector_size = sizeof (u32),
+  .format_trace = format_ovpn_handoff_trace,
+  .type = VLIB_NODE_TYPE_INTERNAL,
+  .n_errors = ARRAY_LEN (ovpn_handoff_error_strings),
+  .error_strings = ovpn_handoff_error_strings,
+  .n_next_nodes = 1,
+  .next_nodes = {
+    [0] = "error-drop",
+  },
+};
+
+VLIB_REGISTER_NODE (ovpn6_handoff_data_node) = {
+  .name = "ovpn6-handoff-data",
+  .vector_size = sizeof (u32),
+  .format_trace = format_ovpn_handoff_trace,
+  .type = VLIB_NODE_TYPE_INTERNAL,
+  .n_errors = ARRAY_LEN (ovpn_handoff_error_strings),
+  .error_strings = ovpn_handoff_error_strings,
+  .n_next_nodes = 1,
+  .next_nodes = {
+    [0] = "error-drop",
+  },
+};
+
+VLIB_REGISTER_NODE (ovpn4_handoff_output_node) = {
+  .name = "ovpn4-handoff-output-tun",
+  .vector_size = sizeof (u32),
+  .format_trace = format_ovpn_handoff_trace,
+  .type = VLIB_NODE_TYPE_INTERNAL,
+  .n_errors = ARRAY_LEN (ovpn_handoff_error_strings),
+  .error_strings = ovpn_handoff_error_strings,
+  .n_next_nodes = 1,
+  .next_nodes = {
+    [0] = "error-drop",
+  },
+};
+
+VLIB_REGISTER_NODE (ovpn6_handoff_output_node) = {
+  .name = "ovpn6-handoff-output-tun",
+  .vector_size = sizeof (u32),
+  .format_trace = format_ovpn_handoff_trace,
+  .type = VLIB_NODE_TYPE_INTERNAL,
+  .n_errors = ARRAY_LEN (ovpn_handoff_error_strings),
+  .error_strings = ovpn_handoff_error_strings,
+  .n_next_nodes = 1,
+  .next_nodes = {
+    [0] = "error-drop",
+  },
+};
+#endif /* CLIB_MARCH_VARIANT */
 /* *INDENT-ON* */
 
 /* *INDENT-OFF* */

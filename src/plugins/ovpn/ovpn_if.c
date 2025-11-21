@@ -31,7 +31,8 @@ u8 *
 format_ovpn_if (u8 *s, va_list *args)
 {
   index_t ovpnii = va_arg (*args, index_t);
-  ovpn_if_t *ovpni = ovpn_if_get (ovpnii);
+  ovpn_main_t *omp = &ovpn_main;
+  ovpn_if_t *ovpni = &omp->if_instance;
   return format (s, "[%d] %U src:%U", ovpnii, format_vnet_sw_if_index_name,
 		 vnet_get_main (), ovpni->sw_if_index);
 }
@@ -54,7 +55,6 @@ ovpn_if_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai)
 {
   adj_nbr_midchain_update_rewrite (ai, NULL, NULL, ADJ_FLAG_NONE, NULL);
 }
-
 
 VNET_DEVICE_CLASS (ovpn_if_device_class) = {
   .name = "OpenVPN Tunnel",
@@ -99,7 +99,7 @@ ovpn_if_delete (ovpn_if_t *ovpnii, index_t sw_if_index)
 {
   vnet_main_t *vnm = vnet_get_main ();
   vnet_hw_interface_t *hi;
-  pool_free (ovpnii);
+  /* pool_free (ovpnii); - single instance, no pool */
   hi = vnet_get_hw_interface (vnm, sw_if_index);
   vnet_delete_hw_interface (vnm, hi->hw_if_index);
   return 0;

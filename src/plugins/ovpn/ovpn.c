@@ -139,6 +139,8 @@ ovpn_init (vlib_main_t *vm)
 
   omp->in4_index = vlib_frame_queue_main_init (ovpn4_input_node.index, 0);
   omp->in6_index = vlib_frame_queue_main_init (ovpn6_input_node.index, 0);
+  omp->out4_index = vlib_frame_queue_main_init (ovpn4_output_node.index, 0);
+  omp->out6_index = vlib_frame_queue_main_init (ovpn6_output_node.index, 0);
   /*
    * TODO: Initialize SSL context
    * 从配置文件中加载SSL证书和密钥以及
