@@ -1,5 +1,5 @@
 /*
- * ovpn_reliable.h - ovpn reliable header file
+ * ovpn_peer.h - ovpn peer header file
  *
  * Copyright (c) 2025 <blackfaceuncle@gmail.com>.
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,8 +15,30 @@
  * limitations under the License.
  */
 
+#ifndef __included_ovpn_peer_h__
+#define __included_ovpn_peer_h__
+
+#include "vnet/adj/adj.h"
+#include <vnet/udp/udp_local.h>
+#include <ovpn/ovpn_message.h>
 #include <vnet/ip/ip.h>
 #include <vlib/vlib.h>
+
+typedef struct ip4_udp_ovpn_header
+{
+  ip4_udp_header_t ip4_udp;
+  ovpn_msg_hdr_t ovpn_msg_hdr;
+  u8 iv[OVPN_DATA_IV_LEN];
+  u8 data[];
+} __clib_packed ip4_udp_ovpn_header_t;
+
+typedef struct ip6_udp_ovpn_header
+{
+  ip6_udp_header_t ip6_udp;
+  ovpn_msg_hdr_t ovpn_msg_hdr;
+  u8 iv[OVPN_DATA_IV_LEN];
+  u8 data[];
+} __clib_packed ip6_udp_ovpn_header_t;
 
 typedef struct ovpn_peer_endpoint
 {
@@ -27,15 +49,52 @@ typedef struct ovpn_peer_endpoint
 typedef struct ovpn_peer
 {
   u32 index;
+
+  u32 input_thread_index;
+  u32 output_thread_index;
   u32 sess_index;
-  ip46_address_t ip;
+
+  /* tunnel ip */
+  u8 tunnel_is_ip4;
+  ip46_address_t tunnel_ip;
+
+  /* Peer addresses */
+  u8 is_ip4;
+  ovpn_peer_endpoint_t src;
+  ovpn_peer_endpoint_t dst;
+
+  /* rewrite built from address information */
+  u8 *rewrite;
 } ovpn_peer_t;
 
-static inline void
-ovpn_peer_init (ovpn_peer_t *peer, u32 index, ip46_address_t *ip,
-		u32 sess_index)
+int ovpn_peer_create (u32 *index, ip46_address_t *tunnel_ip, u8 tunnel_is_ip4,
+		      ip46_address_t *src, ip46_address_t *dst, u16 dst_port,
+		      u8 is_ip4, u32 sess_index);
+int ovpn_peer_delete (index_t peeri);
+ovpn_peer_t *ovpn_peer_get (index_t peeri);
+void ovpn_peer_adj_stack (ovpn_peer_t *peer, adj_index_t ai);
+void ovpn_peer_adj_reset_stacking (adj_index_t ai);
+adj_midchain_fixup_t ovpn_peer_get_fixup (ovpn_peer_t *peer, vnet_link_t lt);
+walk_rc_t ovpn_peer_if_adj_change (index_t peeri, void *data);
+
+extern index_t *ovpn_peer_by_adj_index;
+
+always_inline index_t
+ovpn_peer_get_by_adj_index (adj_index_t ai)
 {
-  peer->index = index;
-  peer->sess_index = sess_index;
-  ip46_address_copy (ip, &peer->ip);
+  if (ai == ADJ_INDEX_INVALID)
+    return INDEX_INVALID;
+  if (ai >= vec_len (ovpn_peer_by_adj_index))
+    return INDEX_INVALID;
+  return ovpn_peer_by_adj_index[ai];
 }
+
+#endif /* __included_ovpn_peer_h__ */
+
+/*
+ * fd.io coding-style-patch-verification: ON
+ *
+ * Local Variables:
+ * eval: (c-set-style "gnu")
+ * End:
+ */

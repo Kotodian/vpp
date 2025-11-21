@@ -27,7 +27,7 @@
 typedef struct ovpn_if_t_
 {
   index_t sw_if_index;
-  ovpn_peer_t *peers;
+  uword *peers;
 } ovpn_if_t;
 
 typedef struct ovpn_ip_pool
@@ -37,9 +37,11 @@ typedef struct ovpn_ip_pool
   ip46_address_t last_ip;
 } ovpn_ip_pool_t;
 
+typedef walk_rc_t (*ovpn_if_peer_walk_cb_t) (index_t peeri, void *data);
 int ovpn_if_create (index_t *sw_if_indexp);
 int ovpn_if_add_peer (ovpn_if_t *ovpnii, ovpn_ip_pool_t *ip_pool,
-		      u32 sess_index, u32 *peer_index);
+		      u32 sess_index, u32 *peer_index, ip46_address_t *src,
+		      ip46_address_t *dst, u16 dst_port, u8 is_ip4);
 int ovpn_if_remove_peer (ovpn_if_t *ovpnii, u32 peer_index);
 int ovpn_if_delete (ovpn_if_t *ovpnii, index_t sw_if_index);
 

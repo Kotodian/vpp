@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "vnet/udp/udp_local.h"
 #include <ovpn/ovpn_session.h>
 #include <vlib/threads.h>
 #include <vppinfra/clib.h>
@@ -52,6 +53,9 @@ ovpn_enable (vlib_main_t *vm, ip46_address_t *src_addr, ip_prefix_t *prefix,
       omp->psk_set = 1;
     }
   ovpn_if_create (&omp->if_instance.sw_if_index);
+
+  udp_register_dst_port (vm, UDP_DST_PORT_ovpn, ovpn4_input_node.index, 1);
+  udp_register_dst_port (vm, UDP_DST_PORT_ovpn, ovpn6_input_node.index, 0);
 
   omp->enabled = 1;
 

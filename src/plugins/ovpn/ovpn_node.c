@@ -320,7 +320,8 @@ ovpn_find_session (ip46_address_t *remote_addr, index_t *sess_index)
 }
 
 always_inline void
-ovpn_activate_session (ovpn_session_t *sess, ovpn_channel_t *ch)
+ovpn_activate_session (ovpn_session_t *sess, ovpn_channel_t *ch,
+		       u16 remote_port)
 {
   ovpn_main_t *omp = &ovpn_main;
   vlib_main_t *vm = omp->vlib_main;
@@ -338,7 +339,8 @@ ovpn_activate_session (ovpn_session_t *sess, ovpn_channel_t *ch)
 
   vlib_worker_thread_barrier_sync (vm);
   ovpn_if_add_peer (&omp->if_instance, &omp->tunnel_ip_pool, sess->index,
-		    &sess->peer_index);
+		    &sess->peer_index, &omp->src_ip, &sess->remote_addr,
+		    remote_port, sess->is_ip4);
   ovpn_set_channel_state (ch, OVPN_CHANNEL_STATE_SSL_HANDSHAKE_FINISHED);
   sess->state = OVPN_SESSION_STATE_ACTIVE;
 
@@ -465,6 +467,45 @@ ovpn_prepend_rewrite (vlib_buffer_t *b0, ip46_address_t *remote_addr,
       hdr6->udp.dst_port = clib_host_to_net_u16 (remote_port);
       hdr6->udp.length =
 	clib_host_to_net_u16 (b0->current_length - sizeof (ip6_header_t));
+    }
+}
+
+always_inline void
+ovpn_buffer_apply_rewrite (vlib_main_t *vm, vlib_buffer_t *b0,
+			   const ovpn_peer_t *peer)
+{
+  ASSERT (peer && peer->rewrite);
+  b0->flags |= VNET_BUFFER_F_LOCALLY_ORIGINATED;
+
+  if (peer->is_ip4)
+    {
+      ip4_udp_header_t *tmpl = (ip4_udp_header_t *) peer->rewrite;
+      ip4_udp_header_t *hdr;
+
+      vlib_buffer_advance (b0, -(word) sizeof (*hdr));
+      hdr = vlib_buffer_get_current (b0);
+      clib_memcpy_fast (hdr, tmpl, sizeof (*hdr));
+
+      hdr->udp.length =
+	clib_host_to_net_u16 (b0->current_length - sizeof (ip4_header_t));
+      ip4_header_set_len_w_chksum (&hdr->ip4,
+				   clib_host_to_net_u16 (b0->current_length));
+    }
+  else
+    {
+      ip6_udp_header_t *tmpl = (ip6_udp_header_t *) peer->rewrite;
+      ip6_udp_header_t *hdr;
+      int bogus = 0;
+
+      vlib_buffer_advance (b0, -(word) sizeof (*hdr));
+      hdr = vlib_buffer_get_current (b0);
+      clib_memcpy_fast (hdr, tmpl, sizeof (*hdr));
+
+      hdr->ip6.payload_length = hdr->udp.length =
+	clib_host_to_net_u16 (b0->current_length - sizeof (ip6_header_t));
+      hdr->udp.checksum =
+	ip6_tcp_udp_icmp_compute_checksum (vm, b0, &hdr->ip6, &bogus);
+      ASSERT (!bogus);
     }
 }
 
@@ -1057,7 +1098,7 @@ ovpn_handle_key_negotiation_pkt (vlib_main_t *vm, ovpn_channel_t *ch,
       ptls_buffer_dispose (&encbuf);
       vec_free (resp);
 
-      ovpn_activate_session (sess, ch);
+      ovpn_activate_session (sess, ch, remote_port);
       ovpn_set_channel_state (ch, OVPN_CHANNEL_STATE_CLOSED);
     }
 
@@ -1481,8 +1522,8 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 			 LOAD);
 	}
 
-      vlib_buffer_t *b0 = b[0];
       u32 bi0 = from[b - bufs];
+      vlib_buffer_t *b0 = b[0];
       u32 error0 = OVPN_ERROR_NONE;
       u16 next0 = OVPN_NEXT_DROP;
       bool enqueue_data = false;
@@ -1955,12 +1996,16 @@ ovpn_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
   u32 n_left_from = frame->n_vectors;
   vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b = bufs;
   vlib_buffer_t *data_bufs[VLIB_FRAME_SIZE];
-  u32 data_bi[VLIB_FRAME_SIZE];
   u16 nexts[VLIB_FRAME_SIZE], *next = nexts;
+  ovpn_peer_t *data_peers[VLIB_FRAME_SIZE];
+  u16 data_nexts[VLIB_FRAME_SIZE];
+  u16 data_slots[VLIB_FRAME_SIZE];
   u16 n_data = 0;
   clib_thread_index_t thread_index = vlib_get_thread_index ();
   ovpn_per_thread_data_t *ptd =
     vec_elt_at_index (omp->per_thread_data, thread_index);
+  const u16 drop_next = OVPN_NEXT_OUTPUT_DROP;
+  (void) is_ip4;
 
   vlib_get_buffers (vm, from, bufs, n_left_from);
   vec_reset_length (ptd->crypto_ops);
@@ -1977,107 +2022,107 @@ ovpn_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	}
 
       vlib_buffer_t *b0 = b[0];
-      u32 bi0 = from[b - bufs];
       u32 sw_if_index0 = vnet_buffer (b0)->sw_if_index[VLIB_TX];
-      ovpn_if_t *ovpni;
-      ovpn_session_t *sess;
-      ovpn_peer_t *peer;
-      u32 next0 = OVPN_NEXT_DROP;
+      u32 next0 = drop_next;
+      ovpn_peer_t *peer = NULL;
+      ovpn_session_t *sess = NULL;
+      ovpn_key2_t *key2 = NULL;
+      vlib_buffer_t *lb = b0;
 
       if (sw_if_index0 != omp->if_instance.sw_if_index)
+	goto next;
+
+      adj_index_t adj_index = vnet_buffer (b0)->ip.adj_index[VLIB_TX];
+      index_t peeri = ovpn_peer_get_by_adj_index (adj_index);
+
+      if (PREDICT_FALSE (peeri == INDEX_INVALID))
 	{
+	  b0->error = node->errors[OVPN_ERROR_UNKNOWN_OPCODE];
 	  goto next;
 	}
-      ovpni = &omp->if_instance;
 
-      if (PREDICT_FALSE (pool_elts (ovpni->peers) == 0))
+      peer = ovpn_peer_get (peeri);
+      if (PREDICT_FALSE (!peer || !peer->rewrite ||
+			 peer->sess_index == INDEX_INVALID))
 	{
+	  b0->error = node->errors[OVPN_ERROR_INVALID_KEY_METHOD];
 	  goto next;
 	}
 
-      if (pool_elts (ovpni->peers) == 1)
-	{
-	  peer = pool_elt_at_index (ovpni->peers, 0);
-	}
-      else
-	{
-	  /* Multi-peer lookup based on destination IP */
-	  ip46_address_t dst_ip;
-	  if (is_ip4)
-	    {
-	      ip4_header_t *ip4 = vlib_buffer_get_current (b0);
-	      ip46_address_set_ip4 (&dst_ip, &ip4->dst_address);
-	    }
-	  else
-	    {
-	      ip6_header_t *ip6 = vlib_buffer_get_current (b0);
-	      ip46_address_set_ip6 (&dst_ip, &ip6->dst_address);
-	    }
-
-	  peer = NULL;
-	  ovpn_peer_t *p;
-	  pool_foreach (p, ovpni->peers)
-	    {
-	      if (ip46_address_is_equal (&p->ip, &dst_ip))
-		{
-		  peer = p;
-		  break;
-		}
-	    }
-
-	  if (peer == NULL)
-	    {
-	      /* Peer not found for destination IP */
-	      goto next;
-	    }
-	}
-
-      if (PREDICT_FALSE (pool_is_free_index (omp->sessions, peer->sess_index)))
-	{
-	  goto next;
-	}
       sess = pool_elt_at_index (omp->sessions, peer->sess_index);
-
       if (PREDICT_FALSE (sess->state != OVPN_SESSION_STATE_ACTIVE))
 	{
+	  b0->error = node->errors[OVPN_ERROR_SSL_HANDSHAKE_FAILED];
 	  goto next;
 	}
 
-      if (PREDICT_FALSE (sess->input_thread_index == ~0))
+      key2 = pool_elt_at_index (omp->key2s, sess->key2_index);
+      if (PREDICT_FALSE (!key2 || key2->send_key_index == ~0))
 	{
-	  clib_atomic_cmp_and_swap (&sess->input_thread_index, ~0,
-				    thread_index);
-	}
-
-      if (sess->input_thread_index != thread_index)
-	{
-	  next0 = OVPN_NEXT_OUTPUT_HANDOFF;
+	  b0->error = node->errors[OVPN_ERROR_INVALID_KEY_METHOD];
 	  goto next;
 	}
 
-      ovpn_key2_t *key2 = pool_elt_at_index (omp->key2s, sess->key2_index);
-      if (PREDICT_FALSE (key2->send_key_index == ~0))
+      u16 n_bufs = vlib_buffer_chain_linearize (vm, b0);
+      if (PREDICT_FALSE (n_bufs == 0))
 	{
+	  b0->error = node->errors[OVPN_ERROR_FAILED_TO_ALLOCATE_BUFFER];
 	  goto next;
 	}
 
-      /* Add OpenVPN header space */
-      vlib_buffer_advance (b0, -(word) (sizeof (ovpn_msg_hdr_t) +
-					OVPN_DATA_IV_LEN + OVPN_DATA_TAG_LEN));
+      while (lb->flags & VLIB_BUFFER_NEXT_PRESENT)
+	lb = vlib_get_buffer (vm, lb->next_buffer);
 
-      /* Fill OpenVPN header */
+      if (PREDICT_FALSE (vlib_buffer_space_left_at_end (vm, lb) <
+			 OVPN_DATA_TAG_LEN))
+	{
+	  u32 tmp_bi = 0;
+	  if (vlib_buffer_alloc (vm, &tmp_bi, 1) != 1)
+	    {
+	      b0->error = node->errors[OVPN_ERROR_FAILED_TO_ALLOCATE_BUFFER];
+	      goto next;
+	    }
+	  lb = vlib_buffer_chain_buffer (vm, lb, tmp_bi);
+	}
+
+      const u32 ovpn_hdr_sz = sizeof (ovpn_msg_hdr_t) + OVPN_DATA_IV_LEN;
+      const u32 outer_hdr_sz =
+	peer->is_ip4 ? sizeof (ip4_udp_header_t) : sizeof (ip6_udp_header_t);
+      u32 headroom = VLIB_BUFFER_PRE_DATA_SIZE + (u32) b0->current_data;
+
+      if (PREDICT_FALSE (headroom < (ovpn_hdr_sz + outer_hdr_sz)))
+	{
+	  u32 need = ovpn_hdr_sz + outer_hdr_sz - headroom;
+	  if (PREDICT_FALSE (lb != b0 ||
+			     vlib_buffer_space_left_at_end (vm, b0) < need))
+	    {
+	      b0->error = node->errors[OVPN_ERROR_FAILED_TO_ALLOCATE_BUFFER];
+	      goto next;
+	    }
+	  vlib_buffer_move (vm, b0, b0->current_data + (i16) need);
+	}
+
+      vlib_buffer_advance (b0, -(word) ovpn_hdr_sz);
+
       ovpn_msg_hdr_t *msg_hdr0 = vlib_buffer_get_current (b0);
       msg_hdr0->opcode = OVPN_OPCODE_TYPE_P_DATA_V1;
       msg_hdr0->key_id = 0;
 
       u8 *iv = (u8 *) (msg_hdr0 + 1);
-      u8 *tag = iv + OVPN_DATA_IV_LEN;
-      u8 *payload = tag + OVPN_DATA_TAG_LEN;
+      u8 *payload = iv + OVPN_DATA_IV_LEN;
 
-      /* Generate IV */
-      RAND_bytes (iv, OVPN_DATA_IV_LEN);
+      if (PREDICT_FALSE (RAND_bytes (iv, OVPN_DATA_IV_LEN) != 1))
+	{
+	  b0->error = node->errors[OVPN_ERROR_FAILED_TO_ALLOCATE_BUFFER];
+	  goto next;
+	}
 
-      /* Prepare crypto op */
+      vlib_buffer_chain_increase_length (b0, lb, OVPN_DATA_TAG_LEN);
+      u8 *tag = vlib_buffer_get_tail (lb) - OVPN_DATA_TAG_LEN;
+
+      u32 payload_len =
+	vlib_buffer_length_in_chain (vm, b0) - ovpn_hdr_sz - OVPN_DATA_TAG_LEN;
+
       vnet_crypto_op_t *op;
       vec_add2_aligned (ptd->crypto_ops, op, 1, CLIB_CACHE_LINE_BYTES);
       vnet_crypto_op_init (op, VNET_CRYPTO_OP_CHACHA20_POLY1305_ENC);
@@ -2089,27 +2134,16 @@ ovpn_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       op->aad_len = sizeof (ovpn_msg_hdr_t);
       op->src = payload;
       op->dst = payload;
-      op->len = b0->current_length - sizeof (ovpn_msg_hdr_t) -
-		OVPN_DATA_IV_LEN - OVPN_DATA_TAG_LEN;
+      op->len = payload_len;
       op->user_data = n_data;
 
-      /* Encapsulate UDP/IP */
-      ovpn_prepend_rewrite (b0, &sess->remote_addr, UDP_DST_PORT_ovpn,
-			    sess->is_ip4);
-
-      if (sess->is_ip4)
-	{
-	  next0 = OVPN_NEXT_OUTPUT_INTERFACE;
-	  vnet_buffer (b0)->sw_if_index[VLIB_TX] = (u32) ~0;
-	}
-      else
-	{
-	  next0 = OVPN_NEXT_OUTPUT_INTERFACE;
-	  vnet_buffer (b0)->sw_if_index[VLIB_TX] = (u32) ~0;
-	}
+      next0 = OVPN_NEXT_OUTPUT_INTERFACE;
+      vnet_buffer (b0)->sw_if_index[VLIB_TX] = (u32) ~0;
 
       data_bufs[n_data] = b0;
-      data_bi[n_data] = bi0;
+      data_peers[n_data] = peer;
+      data_nexts[n_data] = next0;
+      data_slots[n_data] = next - nexts;
       n_data++;
 
     next:
@@ -2119,11 +2153,19 @@ ovpn_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       n_left_from--;
     }
 
-  if (n_data > 0)
+  if (n_data)
     {
-      vlib_buffer_t **b = data_bufs;
-      ovpn_input_process_ops (vm, node, ptd->crypto_ops, b, nexts,
-			      OVPN_NEXT_DROP);
+      ovpn_input_process_ops (vm, node, ptd->crypto_ops, data_bufs, data_nexts,
+			      drop_next);
+
+      for (u16 i = 0; i < n_data; i++)
+	{
+	  if (data_nexts[i] == OVPN_NEXT_OUTPUT_INTERFACE)
+	    {
+	      ovpn_buffer_apply_rewrite (vm, data_bufs[i], data_peers[i]);
+	    }
+	  nexts[data_slots[i]] = data_nexts[i];
+	}
     }
 
   vlib_buffer_enqueue_to_next (vm, node, from, nexts, frame->n_vectors);

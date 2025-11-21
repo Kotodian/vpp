@@ -32,6 +32,7 @@ add_vpp_plugin(ovpn
   ovpn_reliable.c
   ovpn_timer.c
   ovpn_if.c
+  ovpn_peer.c
 
   ovpn.h
   ovpn_message.h
@@ -40,6 +41,7 @@ add_vpp_plugin(ovpn
   ovpn_reliable.h
   ovpn_timer.h
   ovpn_if.h
+  ovpn_peer.h
   private.h
 
 
