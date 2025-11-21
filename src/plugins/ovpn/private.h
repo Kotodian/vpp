@@ -75,7 +75,7 @@ typedef struct ovpn_per_thread_data
   u8 data[OVN_DEFAULT_DATA_SIZE];
 } ovpn_per_thread_data_t;
 
-void
+always_inline void
 ovpn_secure_zero_memory (void *v, size_t n)
 {
   static void *(*const volatile memset_v) (void *, int, size_t) = &memset;

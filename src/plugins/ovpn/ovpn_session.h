@@ -58,13 +58,12 @@ typedef struct ovpn_session_t
   CLIB_CACHE_LINE_ALIGN_MARK (cacheline0);
 
   ip46_address_t remote_addr;
-  ip46_address_t tunnel_addr;
   ovpn_session_state_t state;
   u32 channel_index;
   u32 index;
   u32 key2_index;
+  u32 peer_index;
   u32 input_thread_index;
-  u32 sw_if_index;
   u8 is_ip4;
 } ovpn_session_t;
 

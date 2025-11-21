@@ -51,6 +51,8 @@ ovpn_enable (vlib_main_t *vm, ip46_address_t *src_addr, ip_prefix_t *prefix,
       clib_memcpy_fast (omp->psk, psk, 256);
       omp->psk_set = 1;
     }
+  ovpn_if_create (&omp->if_instance.sw_if_index);
+
   omp->enabled = 1;
 
   return 0;
@@ -130,6 +132,7 @@ ovpn_init (vlib_main_t *vm)
   omp->vnet_main = vnet_get_main ();
   omp->enabled = 0;
   omp->psk_set = 0;
+  omp->if_instance.sw_if_index = INDEX_INVALID;
   clib_memset (&omp->src_ip, 0, sizeof (ip46_address_t));
   vec_validate_aligned (omp->per_thread_data, tm->n_vlib_mains - 1,
 			CLIB_CACHE_LINE_BYTES);

@@ -232,6 +232,34 @@ ovpn_create_ctrl_frame (vlib_main_t *vm, ovpn_channel_t *ch, u8 opcode,
   clib_memcpy_fast (ctrl_msg_hdr->hmac, hmac, 20);
 }
 
+always_inline void
+ovpn_create_channel (ovpn_session_t *sess, ip46_address_t *remote_addr,
+		     u8 is_ip4, u64 remote_session_id, index_t *ch_index)
+{
+  ovpn_main_t *omp = &ovpn_main;
+  ovpn_channel_t *ch;
+  u32 index = ~0;
+  pool_get (omp->channels, ch);
+  index = ch - omp->channels;
+  ovpn_channel_init (omp->vlib_main, ch, omp->ptls_ctx, remote_session_id,
+		     remote_addr, is_ip4, index);
+  *ch_index = index;
+  sess->channel_index = index;
+  tw_timer_start_2t_1w_2048sl (&omp->channels_timer_wheel, index, 0,
+			       (u64) OVN_CHANNEL_EXPIRED_TIMEOUT);
+}
+always_inline void
+ovpn_set_channel_state (ovpn_channel_t *ch, ovpn_channel_state_t state)
+{
+  ovpn_main_t *omp = &ovpn_main;
+  ch->state = state;
+  if (ch->state != OVPN_CHANNEL_STATE_CLOSED)
+    {
+      tw_timer_update_2t_1w_2048sl (&omp->channels_timer_wheel, ch->index,
+				    (u64) OVN_CHANNEL_EXPIRED_TIMEOUT);
+    }
+}
+
 always_inline ovpn_session_error_t
 ovpn_create_session (ip46_address_t remote_addr, u8 is_ip4, u32 *sess_index)
 {
@@ -250,7 +278,6 @@ ovpn_create_session (ip46_address_t remote_addr, u8 is_ip4, u32 *sess_index)
   pool_get_aligned (omp->sessions, sess, CLIB_CACHE_LINE_BYTES);
   *sess_index = sess - omp->sessions;
   ovpn_session_init (omp->vlib_main, sess, *sess_index, &remote_addr, is_ip4);
-  ovpn_ip_pool_alloc (&omp->tunnel_ip_pool, &sess->tunnel_addr);
 
   kv.value = *sess_index;
   BV (clib_bihash_add_del) (&omp->session_hash, &kv, 1);
@@ -296,13 +323,9 @@ ovpn_activate_session (ovpn_session_t *sess, ovpn_channel_t *ch)
 			 sizeof (key2->keys[OVPN_KEY_DIR_TO_CLIENT].cipher));
 
   vlib_worker_thread_barrier_sync (vm);
-  /* Create tunnel interface */
-  ovpn_if_create (sess->index, &sess->tunnel_addr,
-		  ovpn_ip_pool_is_ip4 (&omp->tunnel_ip_pool),
-		  &sess->sw_if_index, sess->index);
-
-  /* Free channel */
-  sess->channel_index = ~0;
+  ovpn_if_add_peer (&omp->if_instance, &omp->tunnel_ip_pool, sess->index,
+		    &sess->peer_index);
+  ovpn_set_channel_state (ch, OVPN_CHANNEL_STATE_SSL_HANDSHAKE_FINISHED);
   sess->state = OVPN_SESSION_STATE_ACTIVE;
 
   tw_timer_update_2t_1w_2048sl (&omp->sessions_timer_wheel, sess->index,
@@ -370,41 +393,12 @@ ovpn_free_session (vlib_main_t *vm, ovpn_session_t *sess)
       sess->key2_index = ~0;
     }
   sess->input_thread_index = ~0;
-
-  ovpn_if_delete (sess->sw_if_index);
+  ovpn_if_remove_peer (&omp->if_instance, sess->peer_index);
 
   ovpn_session_free (sess);
   pool_put (omp->sessions, sess);
 
   vlib_worker_thread_barrier_release (vm);
-}
-
-always_inline void
-ovpn_create_channel (ovpn_session_t *sess, ip46_address_t *remote_addr,
-		     u8 is_ip4, u64 remote_session_id, index_t *ch_index)
-{
-  ovpn_main_t *omp = &ovpn_main;
-  ovpn_channel_t *ch;
-  u32 index = ~0;
-  pool_get (omp->channels, ch);
-  index = ch - omp->channels;
-  ovpn_channel_init (omp->vlib_main, ch, omp->ptls_ctx, remote_session_id,
-		     remote_addr, is_ip4, index);
-  *ch_index = index;
-  sess->channel_index = index;
-  tw_timer_start_2t_1w_2048sl (&omp->channels_timer_wheel, index, 0,
-			       (u64) OVN_CHANNEL_EXPIRED_TIMEOUT);
-}
-always_inline void
-ovpn_set_channel_state (ovpn_channel_t *ch, ovpn_channel_state_t state)
-{
-  ovpn_main_t *omp = &ovpn_main;
-  ch->state = state;
-  if (ch->state != OVPN_CHANNEL_STATE_CLOSED)
-    {
-      tw_timer_update_2t_1w_2048sl (&omp->channels_timer_wheel, ch->index,
-				    (u64) OVN_CHANNEL_EXPIRED_TIMEOUT);
-    }
 }
 
 always_inline void
@@ -1065,7 +1059,8 @@ cleanup:
 always_inline ovpn_error_t
 ovpn_handle_handshake (vlib_main_t *vm, ip46_address_t *remote_addr,
 		       u32 pkt_id, u16 remote_port, u8 is_ip4,
-		       u64 remote_session_id, u8 *data, u32 data_len)
+		       u64 remote_session_id, u8 *data, u32 data_len,
+		       u32 acks_len, u32 *acks)
 {
   ovpn_main_t *omp = &ovpn_main;
   u32 sess_index = ~0;
@@ -1093,6 +1088,21 @@ ovpn_handle_handshake (vlib_main_t *vm, ip46_address_t *remote_addr,
   queue = pool_elt_at_index (omp->reliable_queues, ch->reliable_queue_index);
   ovpn_handshake_buffer_t *hs = ovpn_get_handshake_buffer (ch);
   hs->offset = 0;
+
+  if (acks_len > 0)
+    {
+      for (u32 i = 0; i < acks_len; i++)
+	{
+	  u32 pkt_id = acks[i];
+	  ovpn_reliable_dequeue_pkt (vm, queue, pkt_id);
+	  u32 handle = ovpn_reliable_get_timer_handle (queue, pkt_id);
+	  if (!tw_timer_handle_is_free_2t_1w_2048sl (&omp->queues_timer_wheel,
+						     handle))
+	    {
+	      tw_timer_stop_2t_1w_2048sl (&omp->queues_timer_wheel, handle);
+	    }
+	}
+    }
 
   // reliable receive
   int rv = ovpn_reliable_queue_recv_pkt (vm, queue, pkt_id, data, data_len);
@@ -1718,6 +1728,7 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      goto enqueue_other;
 	    }
 
+	  u32 *acks = (u32 *) (payload + sizeof (ovpn_ctrl_msg_hdr_t));
 	  payload += sizeof (ovpn_ctrl_msg_hdr_t) +
 		     ctrl_msg_hdr0->acks_len * sizeof (u32);
 	  ovpn_ctrl_msg_control_v1_t *ctrl_msg_control_v1 =
@@ -1745,7 +1756,7 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		clib_net_to_host_u32 (pkt_id),
 		clib_net_to_host_u16 (udp0->src_port), 1,
 		clib_net_to_host_u64 (ctrl_msg_hdr0->session_id), payload,
-		(u32) payload_len);
+		(u32) payload_len, ctrl_msg_hdr0->acks_len, acks);
 	    }
 	  else
 	    {
@@ -1756,7 +1767,7 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		clib_net_to_host_u32 (pkt_id),
 		clib_net_to_host_u16 (udp0->src_port), 0,
 		clib_net_to_host_u64 (ctrl_msg_hdr0->session_id), payload,
-		(u32) payload_len);
+		(u32) payload_len, ctrl_msg_hdr0->acks_len, acks);
 	    }
 	}
       else
@@ -1823,8 +1834,9 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	{
 	  ovpn_trace_t *t = vlib_add_trace (vm, node, b[0], sizeof (*t));
 	  t->next_index = data_next[0];
-	  /* We can try to find the session again or pass it down, but for now
-	   * let's just set it to ~0 or we need to store it in the buffer ctx
+	  /* We can try to find the session again or pass it down, but for
+	   * now let's just set it to ~0 or we need to store it in the buffer
+	   * ctx
 	   */
 	  t->sw_if_index = ~0; // TODO: retrieve sw_if_index from session
 	}

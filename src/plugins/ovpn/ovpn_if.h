@@ -22,14 +22,12 @@
 #include <vnet/ip/ip46_address.h>
 #include <vnet/ip/ip_types.h>
 #include <vlib/vlib.h>
+#include <ovpn/ovpn_peer.h>
 
 typedef struct ovpn_if_t_
 {
-  int user_instance;
-
-  index_t tunnel_ip_index;
   index_t sw_if_index;
-  index_t sess_index;
+  ovpn_peer_t *peers;
 } ovpn_if_t;
 
 typedef struct ovpn_ip_pool
@@ -41,9 +39,11 @@ typedef struct ovpn_ip_pool
 
 extern ovpn_if_t *ovpn_if_pool;
 
-int ovpn_if_create (u32 user_instance, const ip46_address_t *tunnel_ip,
-		    u8 is_ip4, index_t *sw_if_indexp, index_t sess_index);
-int ovpn_if_delete (u32 sw_if_index);
+int ovpn_if_create (index_t *sw_if_indexp);
+int ovpn_if_add_peer (ovpn_if_t *ovpnii, ovpn_ip_pool_t *ip_pool,
+		      u32 sess_index, u32 *peer_index);
+int ovpn_if_remove_peer (ovpn_if_t *ovpnii, u32 peer_index);
+int ovpn_if_delete (ovpn_if_t *ovpnii, index_t sw_if_index);
 
 always_inline ovpn_if_t *
 ovpn_if_get (index_t ovpnii)
