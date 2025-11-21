@@ -2099,15 +2099,12 @@ ovpn_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
       if (sess->is_ip4)
 	{
-	  next0 = OVPN_NEXT_IP4_INPUT; /* Should be output really, but reusing
-					  input nodes for now? */
-	  /* Actually we should send to ip4-lookup or interface output */
-	  /* For now let's assume we send to ip4-lookup */
+	  next0 = OVPN_NEXT_OUTPUT_INTERFACE;
 	  vnet_buffer (b0)->sw_if_index[VLIB_TX] = (u32) ~0;
 	}
       else
 	{
-	  next0 = OVPN_NEXT_IP6_INPUT;
+	  next0 = OVPN_NEXT_OUTPUT_INTERFACE;
 	  vnet_buffer (b0)->sw_if_index[VLIB_TX] = (u32) ~0;
 	}
 
