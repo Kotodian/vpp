@@ -55,6 +55,7 @@ ovpn_if_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai)
   adj_nbr_midchain_update_rewrite (ai, NULL, NULL, ADJ_FLAG_NONE, NULL);
 }
 
+
 VNET_DEVICE_CLASS (ovpn_if_device_class) = {
   .name = "OpenVPN Tunnel",
   .format_device_name = format_ovpn_if_name,

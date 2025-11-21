@@ -37,21 +37,11 @@ typedef struct ovpn_ip_pool
   ip46_address_t last_ip;
 } ovpn_ip_pool_t;
 
-extern ovpn_if_t *ovpn_if_pool;
-
 int ovpn_if_create (index_t *sw_if_indexp);
 int ovpn_if_add_peer (ovpn_if_t *ovpnii, ovpn_ip_pool_t *ip_pool,
 		      u32 sess_index, u32 *peer_index);
 int ovpn_if_remove_peer (ovpn_if_t *ovpnii, u32 peer_index);
 int ovpn_if_delete (ovpn_if_t *ovpnii, index_t sw_if_index);
-
-always_inline ovpn_if_t *
-ovpn_if_get (index_t ovpnii)
-{
-  if (INDEX_INVALID == ovpnii)
-    return (NULL);
-  return (pool_elt_at_index (ovpn_if_pool, ovpnii));
-}
 
 always_inline u8
 ovpn_ip_pool_is_ip4 (ovpn_ip_pool_t *pool)
