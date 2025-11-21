@@ -18,6 +18,12 @@
 #include <vnet/ip/ip.h>
 #include <vlib/vlib.h>
 
+typedef struct ovpn_peer_endpoint
+{
+  ip46_address_t addr;
+  u16 port;
+} ovpn_peer_endpoint_t;
+
 typedef struct ovpn_peer
 {
   u32 index;

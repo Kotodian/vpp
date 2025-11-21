@@ -1074,7 +1074,7 @@ always_inline ovpn_error_t
 ovpn_handle_handshake (vlib_main_t *vm, ip46_address_t *remote_addr,
 		       u32 pkt_id, u16 remote_port, u8 is_ip4,
 		       u64 remote_session_id, u8 *data, u32 data_len,
-		       u32 acks_len, u32 *acks)
+		       u8 acks_len, u32 *acks)
 {
   ovpn_main_t *omp = &ovpn_main;
   u32 sess_index = ~0;
