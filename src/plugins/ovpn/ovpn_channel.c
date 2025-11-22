@@ -31,18 +31,19 @@
 
 void
 ovpn_channel_init (vlib_main_t *vm, ovpn_channel_t *ch,
-		   ptls_context_t *ssl_ctx, u64 remote_session_id,
-		   ip46_address_t *remote_addr, u8 is_ip4, index_t ch_index)
+		   ptls_context_t *ssl_ctx, u64 session_id,
+		   u64 remote_session_id, ip46_address_t *remote_addr,
+		   u8 is_ip4, index_t ch_index)
 {
   clib_memset (ch, 0, sizeof (ovpn_channel_t));
   ch->index = ch_index;
-  ch->seed = 0x1badf00d;
   ch->state = OVPN_CHANNEL_STATE_INIT;
   ch->expired_time = vlib_time_now (vm) + OVN_CHANNEL_EXPIRED_TIMEOUT;
   ch->tls = ptls_new (ssl_ctx, 1);
-  ch->session_id = random_u64 (&ch->seed);
   ch->remote_session_id = remote_session_id;
   ch->is_ip4 = is_ip4;
+  ch->hmac_ctx_index = ~0;
+  ch->session_id = session_id;
   ch->key_source_index = ~0;
   ch->hs_buf.data = NULL;
   ch->hs_buf.offset = 0;

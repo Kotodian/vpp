@@ -49,6 +49,7 @@ typedef struct
   /* options */
   u8 *options;
   u32 options_length;
+  u32 handwindow;
 
   /* local SSL context */
   ptls_context_t *ptls_ctx;

@@ -14,6 +14,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "vppinfra/time.h"
+#include <openssl/core_names.h>
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
+#include <openssl/params.h>
+#include <openssl/sha.h>
 #include <vnet/ip/ip_types.h>
 #include <vnet/crypto/crypto.h>
 #include <vnet/ip/ip46_address.h>
@@ -37,6 +43,90 @@
 #include <ovpn/ovpn_if.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
+
+typedef struct ovpn_hmac_ctx
+{
+  OSSL_PARAM params[3];
+  u8 key[64];
+  EVP_MAC_CTX *ctx;
+} ovpn_hmac_ctx_t;
+
+ovpn_hmac_ctx_t *ovpn_hmac_ctxs;
+
+static EVP_MD *
+md_get (const char *digest)
+{
+  EVP_MD *md = NULL;
+  ASSERT (digest);
+  md = EVP_MD_fetch (NULL, digest, NULL);
+  return md;
+}
+
+always_inline u32
+ovpn_hmac_ctx_new ()
+{
+  ovpn_hmac_ctx_t *ctx;
+  pool_get (ovpn_hmac_ctxs, ctx);
+  EVP_MAC *mac = EVP_MAC_fetch (NULL, "HMAC", NULL);
+  ctx->ctx = EVP_MAC_CTX_new (mac);
+
+  EVP_MAC_free (mac);
+  return ctx - ovpn_hmac_ctxs;
+}
+
+always_inline void
+ovpn_hmac_ctx_free (ovpn_hmac_ctx_t *ctx)
+{
+  EVP_MAC_CTX_free (ctx->ctx);
+  ovpn_secure_zero_memory (ctx, sizeof (ovpn_hmac_ctx_t));
+  pool_put (ovpn_hmac_ctxs, ctx);
+}
+
+always_inline void
+ovpn_hmac_ctx_init (ovpn_hmac_ctx_t *ctx, u8 *key, const char *mdname)
+{
+  EVP_MD *kt = md_get (mdname);
+  clib_memcpy_fast (ctx->key, key, EVP_MD_size (kt));
+  ctx->params[0] = OSSL_PARAM_construct_utf8_string (
+    OSSL_MAC_PARAM_DIGEST, (char *) mdname, strlen (mdname));
+  ctx->params[1] = OSSL_PARAM_construct_octet_string (
+    OSSL_MAC_PARAM_KEY, ctx->key, EVP_MD_size (kt));
+  ctx->params[2] = OSSL_PARAM_construct_end ();
+  EVP_MAC_init (ctx->ctx, ctx->key, EVP_MD_size (kt), ctx->params);
+  EVP_MD_free (kt);
+}
+
+// always_inline void
+// ovpn_hmac_ctx_cleanup (ovpn_hmac_ctx_t *ctx)
+// {
+//   EVP_MAC_init (ctx->ctx, NULL, 0, NULL);
+// }
+
+// always_inline void
+// ovpn_hmac_ctx_reset (ovpn_hmac_ctx_t *ctx)
+// {
+//   EVP_MAC_init (ctx->ctx, NULL, 0, ctx->params);
+// }
+
+always_inline void
+ovpn_hmac_ctx_update (ovpn_hmac_ctx_t *ctx, u8 *data, u32 len)
+{
+  EVP_MAC_update (ctx->ctx, data, len);
+}
+
+always_inline void
+ovpn_hmac_ctx_final (ovpn_hmac_ctx_t *ctx, u8 *dst)
+{
+  size_t in_hmac_len = EVP_MAC_CTX_get_mac_size (ctx->ctx);
+
+  EVP_MAC_final (ctx->ctx, dst, &in_hmac_len, in_hmac_len);
+}
+
+// always_inline int
+// ovpn_memcmp_constant_time (const void *a, const void *b, size_t len)
+// {
+//   return CRYPTO_memcmp (a, b, len);
+// }
 
 typedef struct
 {
@@ -246,17 +336,69 @@ ovpn_create_ctrl_frame (vlib_main_t *vm, ovpn_channel_t *ch, u8 opcode,
   clib_memcpy_fast (ctrl_msg_hdr->hmac, hmac, 20);
 }
 
+always_inline u32
+ovpn_session_id_hmac_ctx ()
+{
+  ovpn_hmac_ctx_t *hmac_ctx;
+  u32 hmac_ctx_index = ovpn_hmac_ctx_new ();
+  hmac_ctx = pool_elt_at_index (ovpn_hmac_ctxs, hmac_ctx_index);
+  u8 key[64];
+  RAND_bytes (key, sizeof (key));
+  ovpn_hmac_ctx_init (hmac_ctx, key, "SHA256");
+  return hmac_ctx_index;
+}
+
+always_inline u64
+ovpn_calculate_session_id (ovpn_hmac_ctx_t *hmac_ctx, u64 remote_session_id,
+			   int handwindow, int offset,
+			   ip46_address_t *remote_addr, u8 is_ip4,
+			   u16 remote_port)
+{
+  union
+  {
+    u8 hmac_result[SHA256_DIGEST_LENGTH];
+    u64 session_id;
+  } result;
+
+  u32 session_id_time =
+    clib_net_to_host_u32 (unix_time_now () / ((handwindow + 1) / 2) + offset);
+  ovpn_hmac_ctx_update (hmac_ctx, (u8 *) &session_id_time,
+			sizeof (session_id_time));
+  if (is_ip4)
+    ovpn_hmac_ctx_update (hmac_ctx, (u8 *) &remote_addr->ip4,
+			  sizeof (remote_addr->ip4));
+  else
+    ovpn_hmac_ctx_update (hmac_ctx, (u8 *) &remote_addr->ip6,
+			  sizeof (remote_addr->ip6));
+  ovpn_hmac_ctx_update (hmac_ctx, (u8 *) &remote_port, sizeof (remote_port));
+  ovpn_hmac_ctx_update (hmac_ctx, (u8 *) &remote_session_id,
+			sizeof (remote_session_id));
+  ovpn_hmac_ctx_final (hmac_ctx, result.hmac_result);
+
+  return result.session_id;
+}
+
 always_inline void
 ovpn_create_channel (ovpn_session_t *sess, ip46_address_t *remote_addr,
-		     u8 is_ip4, u64 remote_session_id, index_t *ch_index)
+		     u8 is_ip4, u64 remote_session_id, index_t *ch_index,
+		     u16 remote_port)
 {
   ovpn_main_t *omp = &ovpn_main;
   ovpn_channel_t *ch;
+  ovpn_hmac_ctx_t *hmac_ctx;
   u32 index = ~0;
+  u32 hmac_ctx_index = ~0;
+
   pool_get (omp->channels, ch);
+  hmac_ctx_index = ovpn_session_id_hmac_ctx ();
+  hmac_ctx = pool_elt_at_index (ovpn_hmac_ctxs, hmac_ctx_index);
   index = ch - omp->channels;
-  ovpn_channel_init (omp->vlib_main, ch, omp->ptls_ctx, remote_session_id,
-		     remote_addr, is_ip4, index);
+  hmac_ctx = pool_elt_at_index (ovpn_hmac_ctxs, ovpn_session_id_hmac_ctx ());
+  ovpn_channel_init (
+    omp->vlib_main, ch, omp->ptls_ctx, remote_session_id,
+    ovpn_calculate_session_id (hmac_ctx, remote_session_id, omp->handwindow, 0,
+			       remote_addr, is_ip4, remote_port),
+    remote_addr, is_ip4, index);
   *ch_index = index;
   sess->channel_index = index;
   tw_timer_start_2t_1w_2048sl (&omp->channels_timer_wheel, index, 0,
@@ -375,6 +517,13 @@ ovpn_free_channel (vlib_main_t *vm, ovpn_channel_t *ch)
       ovpn_secure_zero_memory (ks->server_prf_seed_master_secret, 32);
       ovpn_secure_zero_memory (ks->server_prf_seed_key_expansion, 32);
       pool_put (omp->key_sources, ks);
+    }
+  if (ch->hmac_ctx_index != ~0 &&
+      !pool_is_free_index (ovpn_hmac_ctxs, ch->hmac_ctx_index))
+    {
+      ovpn_hmac_ctx_free (
+	pool_elt_at_index (ovpn_hmac_ctxs, ch->hmac_ctx_index));
+      ch->hmac_ctx_index = ~0;
     }
   ovpn_reliable_queue_free (queue);
   ovpn_channel_free (ch);
@@ -790,7 +939,8 @@ ovpn_handle_hard_reset_client_v2 (vlib_main_t *vm, uword event_data)
       sess = pool_elt_at_index (omp->sessions, session_index);
     }
   ovpn_create_channel (sess, &event->remote_addr, event->is_ip4,
-		       event->remote_session_id, &channel_index);
+		       event->remote_session_id, &channel_index,
+		       event->client_port);
   ch = pool_elt_at_index (omp->channels, channel_index);
 
   /* create reliable queue */
