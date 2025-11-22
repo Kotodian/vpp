@@ -23,6 +23,23 @@
 ovpn_peer_t *ovpn_peer_pool;
 index_t *ovpn_peer_by_adj_index;
 
+always_inline bool
+fib_prefix_is_cover_addr_46 (const fib_prefix_t *p1, const ip46_address_t *ip)
+{
+  switch (p1->fp_proto)
+    {
+    case FIB_PROTOCOL_IP4:
+      return (ip4_destination_matches_route (&ip4_main, &p1->fp_addr.ip4,
+					     &ip->ip4, p1->fp_len) != 0);
+    case FIB_PROTOCOL_IP6:
+      return (ip6_destination_matches_route (&ip6_main, &p1->fp_addr.ip6,
+					     &ip->ip6, p1->fp_len) != 0);
+    case FIB_PROTOCOL_MPLS:
+      break;
+    }
+  return (false);
+}
+
 int
 ovpn_peer_create (u32 *index, ip46_address_t *tunnel_ip, u8 tunnel_is_ip4,
 		  ip46_address_t *src, ip46_address_t *dst, u16 dst_port,
@@ -167,19 +184,30 @@ ovpn_peer_if_adj_change (index_t peeri, void *data)
 {
   adj_index_t *adj_index = data;
   ovpn_peer_t *peer;
+  ip_adjacency_t *adj;
   adj_midchain_fixup_t fixup;
+  fib_prefix_t tunnel_prefix;
+
+  adj = adj_get (*adj_index);
 
   peer = pool_elt_at_index (ovpn_peer_pool, peeri);
   ovpn_peer_adj_stack (peer, *adj_index);
   vec_validate_init_empty (ovpn_peer_by_adj_index, *adj_index, INDEX_INVALID);
-  ovpn_peer_by_adj_index[*adj_index] = peeri;
-  fixup = ovpn_peer_get_fixup (peer, adj_get_link_type (*adj_index));
-  adj_nbr_midchain_update_rewrite (*adj_index, fixup, NULL,
-				   ADJ_FLAG_MIDCHAIN_IP_STACK,
-				   vec_dup (peer->rewrite));
-  ovpn_peer_adj_stack (peer, *adj_index);
-
-  return (WALK_STOP);
+  tunnel_prefix.fp_len = peer->tunnel_is_ip4 ? 32 : 128;
+  tunnel_prefix.fp_proto =
+    peer->tunnel_is_ip4 ? FIB_PROTOCOL_IP4 : FIB_PROTOCOL_IP6;
+  tunnel_prefix.fp_addr = peer->tunnel_ip;
+  if (fib_prefix_is_cover_addr_46 (&tunnel_prefix,
+				   &adj->sub_type.nbr.next_hop))
+    {
+      ovpn_peer_by_adj_index[*adj_index] = peeri;
+      fixup = ovpn_peer_get_fixup (peer, adj_get_link_type (*adj_index));
+      adj_nbr_midchain_update_rewrite (*adj_index, fixup, NULL,
+				       ADJ_FLAG_MIDCHAIN_IP_STACK,
+				       vec_dup (peer->rewrite));
+      ovpn_peer_adj_stack (peer, *adj_index);
+    }
+  return (WALK_CONTINUE);
 }
 
 /*
