@@ -102,11 +102,11 @@ ovpn_hmac_ctx_init (ovpn_hmac_ctx_t *ctx, u8 *key, const char *mdname)
 //   EVP_MAC_init (ctx->ctx, NULL, 0, NULL);
 // }
 
-// always_inline void
-// ovpn_hmac_ctx_reset (ovpn_hmac_ctx_t *ctx)
-// {
-//   EVP_MAC_init (ctx->ctx, NULL, 0, ctx->params);
-// }
+always_inline void
+ovpn_hmac_ctx_reset (ovpn_hmac_ctx_t *ctx)
+{
+  EVP_MAC_init (ctx->ctx, NULL, 0, ctx->params);
+}
 
 always_inline void
 ovpn_hmac_ctx_update (ovpn_hmac_ctx_t *ctx, u8 *data, u32 len)
@@ -241,25 +241,24 @@ typedef enum
 } ovpn_output_next_t;
 
 always_inline void
-ovpn_calculate_hmac (u8 *key, u8 *data, u32 len, u8 *out)
-{
-  unsigned int out_len;
-  HMAC (EVP_sha256 (), key, 256, data, len, out, &out_len);
-}
-
-always_inline void
 ovpn_create_ctrl_frame (vlib_main_t *vm, ovpn_channel_t *ch, u8 opcode,
 			u32 *replay_pkt_id, u32 *pkt_id, u8 *payload,
 			u32 payload_len, u32 *bi0)
 {
   vlib_buffer_t *b0;
   ovpn_msg_hdr_t *msg_header;
-  ovpn_ctrl_msg_hdr_t *ctrl_msg_hdr;
-  u32 *acks;
   u8 *buf;
+  u8 *cur;
+  u8 *hmac_insert_pos;
   u8 hmac[20];
   u32 pkt_len = 0;
-  ovpn_main_t *omp = &ovpn_main;
+  ovpn_hmac_ctx_t *hmac_ctx;
+  u32 frame_len_wo_hmac;
+  u32 tail_len;
+  u8 acks_len;
+  u64 session_id_net;
+  u32 replay_pkt_id_net;
+  u32 timestamp_net;
 
   if (vlib_buffer_alloc (vm, bi0, 1) != 1)
     {
@@ -268,72 +267,76 @@ ovpn_create_ctrl_frame (vlib_main_t *vm, ovpn_channel_t *ch, u8 opcode,
     }
   b0 = vlib_get_buffer (vm, *bi0);
   buf = vlib_buffer_get_current (b0);
+  cur = buf;
 
   /* message header */
-  msg_header = (ovpn_msg_hdr_t *) buf;
+  msg_header = (ovpn_msg_hdr_t *) cur;
   msg_header->opcode = opcode;
   msg_header->key_id = 0;
+  cur += sizeof (ovpn_msg_hdr_t);
 
-  /* ctrl header */
-  ctrl_msg_hdr = (ovpn_ctrl_msg_hdr_t *) (buf + sizeof (ovpn_msg_hdr_t));
+  /* ctrl header without hmac */
+  session_id_net = clib_host_to_net_u64 (ch->session_id);
+  clib_memcpy_fast (cur, &session_id_net, sizeof (session_id_net));
+  cur += sizeof (session_id_net);
+  hmac_insert_pos = cur;
 
-  /* local session id */
-  ctrl_msg_hdr->session_id = clib_host_to_net_u64 (ch->session_id);
-
-  /* TODO: generate hmac */
-  clib_memset_u8 (hmac, 0, 20);
-  clib_memcpy_fast (ctrl_msg_hdr->hmac, hmac, 20);
-
-  /* replay packet id */
-  ctrl_msg_hdr->replay_packet_id = clib_host_to_net_u32 (*replay_pkt_id);
+  replay_pkt_id_net = clib_host_to_net_u32 (*replay_pkt_id);
+  clib_memcpy_fast (cur, &replay_pkt_id_net, sizeof (replay_pkt_id_net));
+  cur += sizeof (replay_pkt_id_net);
   (*replay_pkt_id)++;
 
-  /* timestamp */
-  ctrl_msg_hdr->timestamp = clib_host_to_net_u32 (unix_time_now ());
+  timestamp_net = clib_host_to_net_u32 (unix_time_now ());
+  clib_memcpy_fast (cur, &timestamp_net, sizeof (timestamp_net));
+  cur += sizeof (timestamp_net);
 
-  /* acks len */
-  ctrl_msg_hdr->acks_len = vec_len (ch->client_acks);
+  acks_len = vec_len (ch->client_acks);
+  *cur = acks_len;
+  cur += sizeof (acks_len);
 
-  /* acks */
-  acks = (u32 *) (buf + sizeof (ovpn_ctrl_msg_hdr_t));
-  for (u8 i = 0; i < ctrl_msg_hdr->acks_len; i++)
+  for (u8 i = 0; i < acks_len; i++)
     {
-      *acks = clib_host_to_net_u32 (ch->client_acks[i]);
-      acks++;
+      u32 ack_net = clib_host_to_net_u32 (ch->client_acks[i]);
+      clib_memcpy_fast (cur, &ack_net, sizeof (ack_net));
+      cur += sizeof (ack_net);
     }
   vec_reset_length (ch->client_acks);
-  buf += sizeof (ovpn_ctrl_msg_hdr_t) + ctrl_msg_hdr->acks_len * sizeof (u32);
 
   if (pkt_id != NULL)
     {
-      clib_memcpy_fast (buf, pkt_id, sizeof (u32));
-      buf += sizeof (u32);
+      clib_memcpy_fast (cur, pkt_id, sizeof (u32));
+      cur += sizeof (u32);
     }
 
   /* payload */
   if (PREDICT_FALSE (payload_len > 0))
     {
-      clib_memcpy_fast (buf, payload, payload_len);
-      buf += payload_len;
+      clib_memcpy_fast (cur, payload, payload_len);
+      cur += payload_len;
     }
 
-  pkt_len += sizeof (ovpn_msg_hdr_t) + sizeof (ovpn_ctrl_msg_hdr_t) +
-	     ctrl_msg_hdr->acks_len * sizeof (u32);
-  if (pkt_id != NULL)
-    {
-      pkt_len += sizeof (u32);
-    }
-  if (payload_len > 0)
-    {
-      pkt_len += payload_len;
-    }
-  /* update buffer length */
-  b0->current_length = pkt_len;
+  frame_len_wo_hmac = cur - buf;
+  tail_len = frame_len_wo_hmac - (hmac_insert_pos - buf);
 
   /* Calculate HMAC */
-  if (omp->psk_set)
-    ovpn_calculate_hmac (omp->psk, buf, pkt_len, hmac);
-  clib_memcpy_fast (ctrl_msg_hdr->hmac, hmac, 20);
+  if (ch->hmac_ctx_index != ~0)
+    {
+      hmac_ctx = pool_elt_at_index (ovpn_hmac_ctxs, ch->hmac_ctx_index);
+      ovpn_hmac_ctx_reset (hmac_ctx);
+      ovpn_hmac_ctx_update (hmac_ctx, buf, frame_len_wo_hmac);
+      ovpn_hmac_ctx_final (hmac_ctx, hmac);
+    }
+  else
+    {
+      clib_memset (hmac, 0, sizeof (hmac));
+    }
+
+  if (tail_len > 0)
+    clib_memmove (hmac_insert_pos + sizeof (hmac), hmac_insert_pos, tail_len);
+  clib_memcpy_fast (hmac_insert_pos, hmac, sizeof (hmac));
+
+  pkt_len = frame_len_wo_hmac + sizeof (hmac);
+  b0->current_length = pkt_len;
 }
 
 always_inline u32
@@ -401,6 +404,13 @@ ovpn_create_channel (ovpn_session_t *sess, ip46_address_t *remote_addr,
     remote_addr, is_ip4, index);
   *ch_index = index;
   sess->channel_index = index;
+  ovpn_hmac_ctx_free (hmac_ctx);
+  if (omp->psk_set)
+    {
+      pool_get (ovpn_hmac_ctxs, hmac_ctx);
+      ovpn_hmac_ctx_init (hmac_ctx, omp->psk, "SHA256");
+      ch->hmac_ctx_index = hmac_ctx - ovpn_hmac_ctxs;
+    }
   tw_timer_start_2t_1w_2048sl (&omp->channels_timer_wheel, index, 0,
 			       (u64) OVN_CHANNEL_EXPIRED_TIMEOUT);
 }
@@ -700,11 +710,19 @@ ovpn_create_ctrl_ack_v1 (vlib_main_t *vm, u32 *bi0, ovpn_channel_t *ch,
 {
   vlib_buffer_t *b0;
   ovpn_msg_hdr_t *msg_header;
-  ovpn_ctrl_msg_hdr_t *ctrl_msg_hdr;
-  ovpn_ctrl_msg_ack_v1_t *ctrl_msg_ack_v1;
-  u32 *acks;
+  ovpn_hmac_ctx_t *hmac_ctx;
   u8 *buf;
+  u8 *cur;
+  u8 *hmac_insert_pos;
   u8 hmac[20];
+  u8 acks_len;
+  u32 frame_len_wo_hmac;
+  u32 tail_len;
+  u64 session_id_net;
+  u64 remote_session_id_net;
+  u32 replay_pkt_id_net;
+  u32 timestamp_net;
+  u32 pkt_len;
   if (vlib_buffer_alloc (vm, bi0, 1) != 1)
     {
       clib_warning ("Failed to allocate buffer");
@@ -712,58 +730,69 @@ ovpn_create_ctrl_ack_v1 (vlib_main_t *vm, u32 *bi0, ovpn_channel_t *ch,
     }
   b0 = vlib_get_buffer (vm, *bi0);
   buf = vlib_buffer_get_current (b0);
+  cur = buf;
 
   /* message header */
-  msg_header = (ovpn_msg_hdr_t *) buf;
+  msg_header = (ovpn_msg_hdr_t *) cur;
   msg_header->opcode = OVPN_OPCODE_TYPE_P_ACK_V1;
   msg_header->key_id = 0;
+  cur += sizeof (ovpn_msg_hdr_t);
 
-  /* ctrl header */
-  ctrl_msg_hdr = (ovpn_ctrl_msg_hdr_t *) (buf + sizeof (ovpn_msg_hdr_t));
+  /* ctrl header without hmac */
+  session_id_net = clib_host_to_net_u64 (ch->session_id);
+  clib_memcpy_fast (cur, &session_id_net, sizeof (session_id_net));
+  cur += sizeof (session_id_net);
+  hmac_insert_pos = cur;
 
-  /* local session id */
-  ctrl_msg_hdr->session_id = clib_host_to_net_u64 (ch->session_id);
-
-  /* TODO: generate hmac */
-  /* OpenVPN uses HMAC-SHA1 or SHA256. For now we zero it out.
-   * Real implementation should use vnet_crypto to compute HMAC
-   * using the integrity key derived during handshake.
-   */
-  ovpn_main_t *omp = &ovpn_main;
-  clib_memset_u8 (hmac, 0, 20);
-  clib_memcpy_fast (ctrl_msg_hdr->hmac, hmac, 20);
-
-  /* replay packet id */
-  ctrl_msg_hdr->replay_packet_id = clib_host_to_net_u32 (*replay_pkt_id);
+  replay_pkt_id_net = clib_host_to_net_u32 (*replay_pkt_id);
+  clib_memcpy_fast (cur, &replay_pkt_id_net, sizeof (replay_pkt_id_net));
+  cur += sizeof (replay_pkt_id_net);
   (*replay_pkt_id)++;
 
-  /* acks len */
-  ctrl_msg_hdr->acks_len = vec_len (ch->client_acks);
+  timestamp_net = clib_host_to_net_u32 (unix_time_now ());
+  clib_memcpy_fast (cur, &timestamp_net, sizeof (timestamp_net));
+  cur += sizeof (timestamp_net);
 
-  /* acks */
-  acks = (u32 *) (buf + sizeof (ovpn_ctrl_msg_hdr_t));
-  for (u8 i = 0; i < ctrl_msg_hdr->acks_len; i++)
+  acks_len = vec_len (ch->client_acks);
+  *cur = acks_len;
+  cur += sizeof (acks_len);
+
+  for (u8 i = 0; i < acks_len; i++)
     {
-      *acks = clib_host_to_net_u32 (ch->client_acks[i]);
-      acks++;
+      u32 ack_net = clib_host_to_net_u32 (ch->client_acks[i]);
+      clib_memcpy_fast (cur, &ack_net, sizeof (ack_net));
+      cur += sizeof (ack_net);
     }
   vec_reset_length (ch->client_acks);
 
-  /* payload */
-  buf += sizeof (ovpn_ctrl_msg_hdr_t) + ctrl_msg_hdr->acks_len * sizeof (u32);
-  /* remote session id */
-  ctrl_msg_ack_v1 = (ovpn_ctrl_msg_ack_v1_t *) buf;
-  ctrl_msg_ack_v1->session_id = clib_host_to_net_u64 (ch->remote_session_id);
+  /* payload: remote session id */
+  remote_session_id_net = clib_host_to_net_u64 (ch->remote_session_id);
+  clib_memcpy_fast (cur, &remote_session_id_net,
+		    sizeof (remote_session_id_net));
+  cur += sizeof (remote_session_id_net);
 
-  /* update buffer length */
-  b0->current_length = sizeof (ovpn_msg_hdr_t) + sizeof (ovpn_ctrl_msg_hdr_t) +
-		       ctrl_msg_hdr->acks_len * sizeof (u32) +
-		       sizeof (ovpn_ctrl_msg_ack_v1_t);
+  frame_len_wo_hmac = cur - buf;
+  tail_len = frame_len_wo_hmac - (hmac_insert_pos - buf);
 
   /* Calculate HMAC */
-  if (omp->psk_set)
-    ovpn_calculate_hmac (omp->psk, buf, b0->current_length, hmac);
-  clib_memcpy_fast (ctrl_msg_hdr->hmac, hmac, 20);
+  if (ch->hmac_ctx_index != ~0)
+    {
+      hmac_ctx = pool_elt_at_index (ovpn_hmac_ctxs, ch->hmac_ctx_index);
+      ovpn_hmac_ctx_reset (hmac_ctx);
+      ovpn_hmac_ctx_update (hmac_ctx, buf, frame_len_wo_hmac);
+      ovpn_hmac_ctx_final (hmac_ctx, hmac);
+    }
+  else
+    {
+      clib_memset (hmac, 0, sizeof (hmac));
+    }
+
+  if (tail_len > 0)
+    clib_memmove (hmac_insert_pos + sizeof (hmac), hmac_insert_pos, tail_len);
+  clib_memcpy_fast (hmac_insert_pos, hmac, sizeof (hmac));
+
+  pkt_len = frame_len_wo_hmac + sizeof (hmac);
+  b0->current_length = pkt_len;
 }
 
 always_inline void
@@ -1841,22 +1870,10 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
       /* Verify HMAC for control packets */
       ovpn_ctrl_msg_hdr_t *ctrl_msg_hdr0 = (ovpn_ctrl_msg_hdr_t *) payload;
-      u8 received_hmac[20];
-      u8 calculated_hmac[20];
-      u8 zero_hmac[20] = { 0 };
-
-      clib_memcpy_fast (received_hmac, ctrl_msg_hdr0->hmac, 20);
-      clib_memcpy_fast (ctrl_msg_hdr0->hmac, zero_hmac, 20);
-      if (omp->psk_set)
-	ovpn_calculate_hmac (omp->psk, (u8 *) msg_hdr0, b0->current_length,
-			     calculated_hmac);
-
-      if (PREDICT_FALSE (clib_memcmp (received_hmac, calculated_hmac, 20) !=
-			 0))
-	{
-	  error0 = OVPN_ERROR_HMAC_CHECK_FAILED;
-	  goto enqueue_other;
-	}
+      {
+	error0 = OVPN_ERROR_HMAC_CHECK_FAILED;
+	goto enqueue_other;
+      }
 
       if (PREDICT_FALSE (msg_hdr0->opcode ==
 			 OVPN_OPCODE_TYPE_P_CONTROL_HARD_RESET_CLIENT_V1))
