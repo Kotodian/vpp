@@ -187,6 +187,18 @@ ovpn_reliable_get_recv_pkt (ovpn_reliable_queue_t *queue, u32 pkt_id,
 }
 
 void
+ovpn_reliable_expire_recv_pkt (vlib_main_t *vm, ovpn_reliable_queue_t *queue,
+			       u32 pkt_id)
+{
+  uword *p = NULL;
+  p = hash_get (queue->recv_pkts_wnd_keys, &pkt_id);
+  if (p == NULL)
+    return;
+  ovpn_reliable_pkt_t *pkt = pool_elt_at_index (queue->recv_pkts_wnd, p[0]);
+  ovpn_reliable_free_pkt (queue, pkt, 0);
+}
+
+void
 ovpn_reliable_dequeue_recv_pkt (vlib_main_t *vm, ovpn_reliable_queue_t *queue,
 				ovpn_reliable_pkt_t **pkt)
 {

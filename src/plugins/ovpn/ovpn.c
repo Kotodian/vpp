@@ -152,9 +152,8 @@ ovpn_init (vlib_main_t *vm)
    */
 
   /* Initialize session */
-  BV (clib_bihash_init)
-  (&omp->session_hash, "ovpn session hash table", OVPN_SESSION_HASH_BUCKETS,
-   OVPN_SESSION_HASH_MEMORY);
+  BV (clib_bihash_init) (&omp->session_hash, "ovpn session hash table",
+			 OVPN_SESSION_HASH_BUCKETS, OVPN_SESSION_HASH_MEMORY);
   tw_timer_wheel_init_2t_1w_2048sl (&omp->sessions_timer_wheel,
 				    ovpn_expired_sessions_callback, 1.0, ~0);
 
@@ -165,6 +164,9 @@ ovpn_init (vlib_main_t *vm)
   /* Initialize reliable queue */
   tw_timer_wheel_init_2t_1w_2048sl (
     &omp->queues_timer_wheel, ovpn_expired_reliable_queues_callback, 1.0, ~0);
+  tw_timer_wheel_init_2t_1w_2048sl (&omp->recv_queues_timer_wheel,
+				    ovpn_expired_reliable_recv_queues_callback,
+				    1.0, ~0);
 
   /* Process Node */
   omp->ctrl_node_index = ovpn_ctrl_process_node.index;

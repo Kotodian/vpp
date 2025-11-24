@@ -105,6 +105,9 @@ void ovpn_reliable_dequeue_recv_pkt (vlib_main_t *vm,
 void ovpn_reliable_get_recv_pkt (ovpn_reliable_queue_t *queue, u32 pkt_id,
 				 ovpn_reliable_pkt_t **pkt);
 
+void ovpn_reliable_expire_recv_pkt (vlib_main_t *vm,
+				    ovpn_reliable_queue_t *queue, u32 pkt_id);
+
 void ovpn_reliable_ack_recv_pkt (vlib_main_t *vm, ovpn_reliable_queue_t *queue,
 				 u32 pkt_id);
 

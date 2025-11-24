@@ -561,9 +561,9 @@ ovpn_free_session (vlib_main_t *vm, ovpn_session_t *sess)
   if (!pool_is_free_index (omp->key2s, sess->key2_index))
     {
       ovpn_key2_t *key2 = pool_elt_at_index (omp->key2s, sess->key2_index);
-      ovpn_secure_zero_memory (key2->keys, sizeof (key2->keys));
       vnet_crypto_key_del (vm, key2->recv_key_index);
       vnet_crypto_key_del (vm, key2->send_key_index);
+      ovpn_secure_zero_memory (key2->keys, sizeof (key2->keys));
       pool_put (omp->key2s, key2);
       sess->key2_index = ~0;
     }
@@ -840,6 +840,8 @@ ovpn_send_ack_recv_pkt (vlib_main_t *vm, ovpn_channel_t *ch,
   ovpn_create_ctrl_ack_v1 (vm, &bi0, ch, &queue->replay_packet_id);
   ovpn_send_reliable_pkt (vm, queue, is_ip4, bi0, remote_addr, remote_port);
   ovpn_reliable_ack_recv_pkt (vm, queue, pkt->pkt_id);
+  tw_timer_start_2t_1w_2048sl (&omp->recv_queues_timer_wheel, queue->index,
+			       pkt->pkt_id, OVN_RELIABLE_RETRANS_TIMEOUT);
 }
 
 always_inline void
@@ -1291,10 +1293,10 @@ cleanup:
 }
 
 always_inline ovpn_error_t
-ovpn_handle_handshake (vlib_main_t *vm, ip46_address_t *remote_addr,
-		       u32 pkt_id, u16 remote_port, u8 is_ip4,
-		       u64 remote_session_id, u8 *data, u32 data_len,
-		       u8 acks_len, u32 *acks)
+ovpn_handle_control_v1_pkt (vlib_main_t *vm, ip46_address_t *remote_addr,
+			    u32 pkt_id, u16 remote_port, u8 is_ip4,
+			    u64 remote_session_id, u8 *data, u32 data_len,
+			    u8 acks_len, u32 *acks)
 {
   ovpn_main_t *omp = &ovpn_main;
   u32 sess_index = ~0;
@@ -1464,6 +1466,19 @@ ovpn_handle_channel_expired (vlib_main_t *vm, uword event_data)
 }
 
 always_inline void
+ovpn_handle_reliable_recv_queue_expired (vlib_main_t *vm, uword event_data)
+{
+  ovpn_main_t *omp = &ovpn_main;
+  ovpn_reliable_recv_queue_event_t *event =
+    (ovpn_reliable_recv_queue_event_t *) event_data;
+  ovpn_reliable_queue_t *queue =
+    pool_elt_at_index (omp->reliable_queues, event->queue_index);
+  u32 pkt_id = event->pkt_id;
+  ovpn_reliable_expire_recv_pkt (vm, queue, pkt_id);
+  clib_mem_free (event);
+}
+
+always_inline void
 ovpn_handle_reliable_send_queue_expired (vlib_main_t *vm, uword event_data)
 {
   ovpn_main_t *omp = &ovpn_main;
@@ -1514,6 +1529,7 @@ ovpn_timer_process (vlib_main_t *vm, vlib_node_runtime_t *node,
       tw_timer_expire_timers_2t_1w_2048sl (&omp->sessions_timer_wheel, now);
       tw_timer_expire_timers_2t_1w_2048sl (&omp->channels_timer_wheel, now);
       tw_timer_expire_timers_2t_1w_2048sl (&omp->queues_timer_wheel, now);
+      tw_timer_expire_timers_2t_1w_2048sl (&omp->recv_queues_timer_wheel, now);
     }
   return 0;
 }
@@ -1557,6 +1573,10 @@ ovpn_ctrl_process (vlib_main_t *vm, vlib_node_runtime_t *node,
 	case OVPN_CTRL_EVENT_TYPE_RELIABLE_SEND_QUEUE_EXPIRED:
 	  for (i = 0; i < vec_len (event_data); i++)
 	    ovpn_handle_reliable_send_queue_expired (vm, event_data[i]);
+	  break;
+	case OVPN_CTRL_EVENT_TYPE_RELIABLE_RECV_QUEUE_EXPIRED:
+	  for (i = 0; i < vec_len (event_data); i++)
+	    ovpn_handle_reliable_recv_queue_expired (vm, event_data[i]);
 	  break;
 	default:
 	  clib_warning ("Unexpected event type %d", event_type);
@@ -1973,7 +1993,7 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	    {
 	      ip4_header_t *ip40 =
 		(ip4_header_t *) ((u8 *) udp0 - sizeof (ip4_header_t));
-	      ovpn_handle_handshake (
+	      ovpn_handle_control_v1_pkt (
 		vm, (ip46_address_t *) &ip40->src_address,
 		clib_net_to_host_u32 (pkt_id),
 		clib_net_to_host_u16 (udp0->src_port), 1,
@@ -1984,7 +2004,7 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	    {
 	      ip6_header_t *ip60 =
 		(ip6_header_t *) ((u8 *) udp0 - sizeof (ip6_header_t));
-	      ovpn_handle_handshake (
+	      ovpn_handle_control_v1_pkt (
 		vm, (ip46_address_t *) &ip60->src_address,
 		clib_net_to_host_u32 (pkt_id),
 		clib_net_to_host_u16 (udp0->src_port), 0,

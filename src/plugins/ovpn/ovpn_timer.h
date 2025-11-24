@@ -22,6 +22,7 @@
 void ovpn_expired_sessions_callback (u32 *expired_timers);
 void ovpn_expired_channels_callback (u32 *expired_timers);
 void ovpn_expired_reliable_queues_callback (u32 *expired_timers);
+void ovpn_expired_reliable_recv_queues_callback (u32 *expired_timers);
 
 #endif /* __included_ovpn_timer_h__ */
 

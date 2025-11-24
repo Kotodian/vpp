@@ -30,7 +30,8 @@
   _ (SESSION_EXPIRED, "Session expired")                                      \
   _ (SESSION_KEEPALIVE, "Session keepalive")                                  \
   _ (CHANNEL_EXPIRED, "Channel expired")                                      \
-  _ (RELIABLE_SEND_QUEUE_EXPIRED, "Reliable send queue expired")
+  _ (RELIABLE_SEND_QUEUE_EXPIRED, "Reliable send queue expired")              \
+  _ (RELIABLE_RECV_QUEUE_EXPIRED, "Reliable recv queue expired")
 
 typedef enum ovpn_ctrl_event_type
 {
@@ -65,6 +66,12 @@ typedef struct ovpn_reliable_send_queue_event
   u32 queue_index;
   u32 pkt_id;
 } ovpn_reliable_send_queue_event_t;
+
+typedef struct ovpn_reliable_recv_queue_event
+{
+  u32 queue_index;
+  u32 pkt_id;
+} ovpn_reliable_recv_queue_event_t;
 
 typedef struct ovpn_per_thread_data
 {

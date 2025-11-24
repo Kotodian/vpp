@@ -80,6 +80,27 @@ ovpn_expired_reliable_queues_callback (u32 *expired_timers)
     }
 }
 
+void
+ovpn_expired_reliable_recv_queues_callback (u32 *expired_timers)
+{
+  ovpn_main_t *omp = &ovpn_main;
+  int i;
+  u32 pool_index, pkt_id;
+  vlib_main_t *vm = vlib_get_main ();
+
+  for (i = 0; i < vec_len (expired_timers); i++)
+    {
+      ovpn_reliable_recv_queue_event_t *event =
+	clib_mem_alloc (sizeof (ovpn_reliable_recv_queue_event_t));
+
+      ovpn_reliable_get_pkt_id_and_queue_index (expired_timers[i], &pkt_id,
+						&pool_index);
+      vlib_process_signal_event_mt (
+	vm, omp->timer_node_index,
+	OVPN_CTRL_EVENT_TYPE_RELIABLE_RECV_QUEUE_EXPIRED, (uword) event);
+    }
+}
+
 /*
  * fd.io coding-style-patch-verification: ON
  *

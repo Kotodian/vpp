@@ -80,6 +80,7 @@ typedef struct
   /* reliable queue */
   ovpn_reliable_queue_t *reliable_queues;
   tw_timer_wheel_2t_1w_2048sl_t queues_timer_wheel;
+  tw_timer_wheel_2t_1w_2048sl_t recv_queues_timer_wheel;
 
   /* per thread data */
   ovpn_per_thread_data_t *per_thread_data;
