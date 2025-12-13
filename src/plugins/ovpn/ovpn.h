@@ -66,6 +66,9 @@ typedef struct ovpn_main_t_
   /* TLS-Crypt context for control channel encryption */
   ovpn_tls_crypt_t tls_crypt;
 
+  /* TLS-Auth context for control channel authentication (with replay protection) */
+  ovpn_tls_auth_t tls_auth;
+
   /* Cipher algorithm for data channel */
   ovpn_cipher_alg_t cipher_alg;
 

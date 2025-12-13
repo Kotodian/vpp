@@ -53,9 +53,12 @@ typedef struct ovpn_options_t_
   u32 replay_time;
 
   /* Negotiation */
-  u32 renegotiate_seconds;
-  u32 handshake_window;
-  u32 transition_window;
+  u32 renegotiate_seconds;  /* Renegotiate data channel key after n seconds */
+  u64 renegotiate_bytes;    /* Renegotiate after n bytes transferred (0=disabled) */
+  u64 renegotiate_packets;  /* Renegotiate after n packets (0=disabled) */
+  u32 handshake_window;     /* TLS handshake must complete within n seconds */
+  u32 transition_window;    /* Old key allowed to live n seconds after new key */
+  u32 tls_timeout;          /* Control channel packet retransmit timeout */
 
   /* Client*/
   ip_address_t pool_start;

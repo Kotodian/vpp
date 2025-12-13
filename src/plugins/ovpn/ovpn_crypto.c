@@ -21,6 +21,12 @@
 /* Per-thread crypto data */
 static ovpn_per_thread_crypto_t *ovpn_per_thread_crypto;
 
+ovpn_per_thread_crypto_t *
+ovpn_crypto_get_ptd (u32 thread_index)
+{
+  return &ovpn_per_thread_crypto[thread_index];
+}
+
 clib_error_t *
 ovpn_crypto_init (vlib_main_t *vm)
 {
@@ -34,7 +40,13 @@ ovpn_crypto_init (vlib_main_t *vm)
     {
       ovpn_per_thread_crypto_t *ptd = &ovpn_per_thread_crypto[i];
       vec_validate_aligned (ptd->crypto_ops, 0, CLIB_CACHE_LINE_BYTES);
+      vec_validate_aligned (ptd->chained_crypto_ops, 0, CLIB_CACHE_LINE_BYTES);
+      vec_validate_aligned (ptd->chunks, 0, CLIB_CACHE_LINE_BYTES);
+      vec_validate_aligned (ptd->ivs, 0, CLIB_CACHE_LINE_BYTES);
       vec_reset_length (ptd->crypto_ops);
+      vec_reset_length (ptd->chained_crypto_ops);
+      vec_reset_length (ptd->chunks);
+      vec_reset_length (ptd->ivs);
     }
 
   return 0;
@@ -243,32 +255,115 @@ ovpn_crypto_update_replay (ovpn_crypto_context_t *ctx, u32 packet_id)
   ctx->replay_bitmap |= (1ULL << diff);
 }
 
-int
-ovpn_crypto_encrypt (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
-		     vlib_buffer_t *b, u32 peer_id, u8 key_id)
+/*
+ * Build chunks for chained buffer crypto operations
+ * This creates chunk descriptors for each buffer in the chain
+ */
+static_always_inline void
+ovpn_crypto_chain_chunks (vlib_main_t *vm, ovpn_per_thread_crypto_t *ptd,
+			  vlib_buffer_t *b, vlib_buffer_t *lb, u8 *start,
+			  u32 start_len, u16 *n_ch, i32 last_buf_adj)
 {
-  u32 thread_index = vm->thread_index;
-  ovpn_per_thread_crypto_t *ptd = &ovpn_per_thread_crypto[thread_index];
+  vnet_crypto_op_chunk_t *ch;
+  vlib_buffer_t *cb = b;
+  u32 n_chunks = 1;
+
+  /* First chunk from the first buffer */
+  vec_add2 (ptd->chunks, ch, 1);
+  ch->len = start_len;
+  ch->src = ch->dst = start;
+
+  /* Move to next buffer in chain */
+  if (cb->flags & VLIB_BUFFER_NEXT_PRESENT)
+    cb = vlib_get_buffer (vm, cb->next_buffer);
+  else
+    goto done;
+
+  /* Process remaining buffers in chain */
+  while (1)
+    {
+      vec_add2 (ptd->chunks, ch, 1);
+      n_chunks += 1;
+
+      /* Last buffer may need adjustment (e.g., exclude tag) */
+      if (lb == cb)
+	ch->len = cb->current_length + last_buf_adj;
+      else
+	ch->len = cb->current_length;
+
+      ch->src = ch->dst = vlib_buffer_get_current (cb);
+
+      if (!(cb->flags & VLIB_BUFFER_NEXT_PRESENT))
+	break;
+
+      cb = vlib_get_buffer (vm, cb->next_buffer);
+    }
+
+done:
+  if (n_ch)
+    *n_ch = n_chunks;
+}
+
+/*
+ * Find the last buffer in a chain
+ */
+static_always_inline vlib_buffer_t *
+ovpn_find_last_buffer (vlib_main_t *vm, vlib_buffer_t *b)
+{
+  while (b->flags & VLIB_BUFFER_NEXT_PRESENT)
+    b = vlib_get_buffer (vm, b->next_buffer);
+  return b;
+}
+
+/*
+ * Prepare encryption operation for a buffer (supports chained buffers)
+ */
+int
+ovpn_crypto_encrypt_prepare (vlib_main_t *vm, ovpn_per_thread_crypto_t *ptd,
+			     ovpn_crypto_context_t *ctx, vlib_buffer_t *b,
+			     u32 bi, u32 peer_id, u8 key_id)
+{
+  vlib_buffer_t *lb;
   vnet_crypto_op_t *op;
   ovpn_data_v2_header_t *hdr;
-  ovpn_aead_nonce_t nonce;
+  u32 n_bufs;
   u32 packet_id;
   u8 *payload;
   u32 payload_len;
   u8 *tag;
+  u8 *iv;
 
   if (!ctx->is_valid)
     return -1;
 
-  /* Get next packet ID */
-  packet_id = ovpn_crypto_get_next_packet_id (ctx);
+  /* Linearize buffer chain if needed */
+  lb = b;
+  n_bufs = vlib_buffer_chain_linearize (vm, b);
+  if (n_bufs == 0)
+    return -2; /* No buffers available */
 
-  /* Calculate payload length (current buffer data) */
-  payload_len = b->current_length;
+  /* Find last buffer in chain */
+  if (n_bufs > 1)
+    lb = ovpn_find_last_buffer (vm, b);
+
+  /* Ensure there is enough space at the end of last buffer for auth tag */
+  if (PREDICT_FALSE (vlib_buffer_space_left_at_end (vm, lb) < OVPN_TAG_SIZE))
+    {
+      u32 tmp_bi = 0;
+      if (vlib_buffer_alloc (vm, &tmp_bi, 1) != 1)
+	return -3; /* No buffers available */
+      lb = vlib_buffer_chain_buffer (vm, lb, tmp_bi);
+    }
+
+  /* Calculate payload length from chain before modifying */
+  payload_len = vlib_buffer_length_in_chain (vm, b);
 
   /* Reserve space for header at the beginning */
   hdr =
     (ovpn_data_v2_header_t *) vlib_buffer_push_uninit (b, sizeof (*hdr));
+
+  /* Get next packet ID */
+  packet_id = ovpn_crypto_get_next_packet_id (ctx);
 
   /* Fill in header */
   hdr->opcode_keyid = ovpn_op_compose (OVPN_OP_DATA_V2, key_id);
@@ -278,62 +373,120 @@ ovpn_crypto_encrypt (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
   /* Payload starts after header */
   payload = (u8 *) (hdr + 1);
 
-  /* Tag goes at the end */
-  tag = vlib_buffer_put_uninit (b, OVPN_TAG_SIZE);
+  /* Reserve space for tag at end of chain */
+  vlib_buffer_chain_increase_length (b, lb, OVPN_TAG_SIZE);
 
-  /* Build nonce */
-  ovpn_aead_nonce_build (&nonce, packet_id, ctx->encrypt_implicit_iv);
+  /* Tag goes at the end of last buffer */
+  tag = vlib_buffer_get_tail (lb) - OVPN_TAG_SIZE;
+
+  /* Allocate IV storage */
+  vec_add2 (ptd->ivs, iv, OVPN_NONCE_SIZE);
+  ovpn_aead_nonce_build ((ovpn_aead_nonce_t *) iv, packet_id,
+			 ctx->encrypt_implicit_iv);
 
   /* Set up crypto operation */
-  vec_reset_length (ptd->crypto_ops);
-  vec_add2 (ptd->crypto_ops, op, 1);
+  if (b != lb)
+    {
+      /* Chained buffers - use chunked crypto */
+      vec_add2_aligned (ptd->chained_crypto_ops, op, 1, CLIB_CACHE_LINE_BYTES);
+      vnet_crypto_op_init (op, ctx->encrypt_op_id);
 
-  vnet_crypto_op_init (op, ctx->encrypt_op_id);
+      op->flags |= VNET_CRYPTO_OP_FLAG_CHAINED_BUFFERS;
+      op->chunk_index = vec_len (ptd->chunks);
+      ovpn_crypto_chain_chunks (vm, ptd, b, lb, payload, b->current_length -
+						sizeof (*hdr),
+				&op->n_chunks, -OVPN_TAG_SIZE);
+    }
+  else
+    {
+      /* Single buffer */
+      vec_add2_aligned (ptd->crypto_ops, op, 1, CLIB_CACHE_LINE_BYTES);
+      vnet_crypto_op_init (op, ctx->encrypt_op_id);
+
+      op->src = payload;
+      op->dst = payload;
+      op->len = payload_len;
+    }
+
   op->key_index = ctx->encrypt_key_index;
-  op->iv = (u8 *) &nonce;
-  op->src = payload;
-  op->dst = payload;
-  op->len = payload_len;
+  op->iv = iv;
   op->aad = (u8 *) hdr;
   op->aad_len = sizeof (*hdr);
   op->tag = tag;
   op->tag_len = OVPN_TAG_SIZE;
-
-  /* Execute crypto operation */
-  vnet_crypto_process_ops (vm, ptd->crypto_ops, 1);
-
-  if (op->status != VNET_CRYPTO_OP_STATUS_COMPLETED)
-    return -1;
+  op->user_data = bi;
 
   return 0;
 }
 
+/*
+ * Prepare decryption operation for a buffer (supports chained buffers)
+ */
 int
-ovpn_crypto_decrypt (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
-		     vlib_buffer_t *b, u32 *packet_id_out)
+ovpn_crypto_decrypt_prepare (vlib_main_t *vm, ovpn_per_thread_crypto_t *ptd,
+			     ovpn_crypto_context_t *ctx, vlib_buffer_t *b,
+			     u32 bi, u32 *packet_id_out)
 {
-  u32 thread_index = vm->thread_index;
-  ovpn_per_thread_crypto_t *ptd = &ovpn_per_thread_crypto[thread_index];
+  vlib_buffer_t *lb;
   vnet_crypto_op_t *op;
-  ovpn_aead_nonce_t nonce;
+  u32 n_bufs;
   u32 packet_id;
-  u8 *src;
-  u32 src_len;
-  u8 *tag;
   u8 *aad;
   u32 aad_len;
+  u8 *src;
+  u32 src_len;
+  u32 total_len;
+  u8 *tag;
+  u8 *iv;
 
   if (!ctx->is_valid)
     return -1;
+
+  /* Linearize buffer chain if needed */
+  lb = b;
+  n_bufs = vlib_buffer_chain_linearize (vm, b);
+  if (n_bufs == 0)
+    return -2; /* No buffers available */
+
+  /* Find last buffer in chain */
+  if (n_bufs > 1)
+    {
+      vlib_buffer_t *before_last = b;
+      lb = b;
+
+      while (lb->flags & VLIB_BUFFER_NEXT_PRESENT)
+	{
+	  before_last = lb;
+	  lb = vlib_get_buffer (vm, lb->next_buffer);
+	}
+
+      /*
+       * Ensure auth tag is contiguous in the last buffer
+       * (not split across the last two buffers)
+       */
+      if (PREDICT_FALSE (lb->current_length < OVPN_TAG_SIZE))
+	{
+	  u32 len_diff = OVPN_TAG_SIZE - lb->current_length;
+
+	  before_last->current_length -= len_diff;
+	  if (before_last == b)
+	    before_last->flags &= ~VLIB_BUFFER_TOTAL_LENGTH_VALID;
+
+	  vlib_buffer_advance (lb, (signed) -len_diff);
+	  clib_memcpy_fast (vlib_buffer_get_current (lb),
+			    vlib_buffer_get_tail (before_last), len_diff);
+	}
+    }
+
+  /* Get total length from chain */
+  total_len = vlib_buffer_length_in_chain (vm, b);
 
   /*
    * Buffer should point to start of OpenVPN packet (opcode byte)
    * Layout: [opcode+keyid:1][peer_id:3][packet_id:4][ciphertext][tag:16]
    */
-  src_len = b->current_length;
-
-  if (src_len < OVPN_DATA_V2_MIN_SIZE + OVPN_TAG_SIZE)
-    return -1;
+  if (total_len < OVPN_DATA_V2_MIN_SIZE + OVPN_TAG_SIZE)
+    return -3;
 
   /* AAD is the full header (opcode + peer_id + packet_id) */
   aad = vlib_buffer_get_current (b);
@@ -344,50 +497,271 @@ ovpn_crypto_decrypt (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
 
   /* Check replay */
   if (!ovpn_crypto_check_replay (ctx, packet_id))
-    return -2; /* Replay detected */
+    return -4; /* Replay detected */
 
   /* Ciphertext starts after the header */
   src = aad + aad_len;
-  src_len = src_len - aad_len - OVPN_TAG_SIZE;
+  src_len = total_len - aad_len - OVPN_TAG_SIZE;
 
-  /* Tag is at the end */
-  tag = aad + b->current_length - OVPN_TAG_SIZE;
+  /* Tag is at the end of the last buffer */
+  tag = vlib_buffer_get_tail (lb) - OVPN_TAG_SIZE;
 
-  /* Build nonce */
-  ovpn_aead_nonce_build (&nonce, packet_id, ctx->decrypt_implicit_iv);
+  /* Allocate IV storage */
+  vec_add2 (ptd->ivs, iv, OVPN_NONCE_SIZE);
+  ovpn_aead_nonce_build ((ovpn_aead_nonce_t *) iv, packet_id,
+			 ctx->decrypt_implicit_iv);
 
   /* Set up crypto operation */
-  vec_reset_length (ptd->crypto_ops);
-  vec_add2 (ptd->crypto_ops, op, 1);
+  if (b != lb)
+    {
+      /* Chained buffers - use chunked crypto */
+      vec_add2_aligned (ptd->chained_crypto_ops, op, 1, CLIB_CACHE_LINE_BYTES);
+      vnet_crypto_op_init (op, ctx->decrypt_op_id);
 
-  vnet_crypto_op_init (op, ctx->decrypt_op_id);
+      op->flags |= VNET_CRYPTO_OP_FLAG_CHAINED_BUFFERS;
+      op->flags |= VNET_CRYPTO_OP_FLAG_HMAC_CHECK;
+      op->chunk_index = vec_len (ptd->chunks);
+
+      /* For decrypt, include tag in chunk calculation for verification */
+      ovpn_crypto_chain_chunks (vm, ptd, b, lb, src,
+				b->current_length - aad_len, &op->n_chunks,
+				0);
+    }
+  else
+    {
+      /* Single buffer */
+      vec_add2_aligned (ptd->crypto_ops, op, 1, CLIB_CACHE_LINE_BYTES);
+      vnet_crypto_op_init (op, ctx->decrypt_op_id);
+
+      op->src = src;
+      op->dst = src;
+      op->len = src_len;
+      op->flags |= VNET_CRYPTO_OP_FLAG_HMAC_CHECK;
+    }
+
   op->key_index = ctx->decrypt_key_index;
-  op->iv = (u8 *) &nonce;
-  op->src = src;
-  op->dst = src;
-  op->len = src_len;
+  op->iv = iv;
   op->aad = aad;
   op->aad_len = aad_len;
   op->tag = tag;
   op->tag_len = OVPN_TAG_SIZE;
-
-  /* Execute crypto operation */
-  vnet_crypto_process_ops (vm, ptd->crypto_ops, 1);
-
-  if (op->status != VNET_CRYPTO_OP_STATUS_COMPLETED)
-    return -3; /* Decryption/auth failed */
-
-  /* Update replay window */
-  ovpn_crypto_update_replay (ctx, packet_id);
-
-  /* Advance buffer past header to plaintext */
-  vlib_buffer_advance (b, aad_len); /* Skip header */
-
-  /* Trim tag from end */
-  b->current_length -= OVPN_TAG_SIZE;
+  op->user_data = bi;
 
   if (packet_id_out)
     *packet_id_out = packet_id;
+
+  return 0;
+}
+
+/*
+ * Process all pending encryption operations
+ */
+void
+ovpn_crypto_encrypt_process (vlib_main_t *vm, vlib_node_runtime_t *node,
+			     ovpn_per_thread_crypto_t *ptd,
+			     vlib_buffer_t *bufs[], u16 *nexts, u16 drop_next)
+{
+  u32 n_ops, n_chained_ops;
+  u32 n_fail;
+  vnet_crypto_op_t *op;
+
+  /* Process single-buffer operations */
+  n_ops = vec_len (ptd->crypto_ops);
+  if (n_ops > 0)
+    {
+      op = ptd->crypto_ops;
+      n_fail = n_ops - vnet_crypto_process_ops (vm, op, n_ops);
+
+      while (n_fail)
+	{
+	  ASSERT (op - ptd->crypto_ops < n_ops);
+
+	  if (op->status != VNET_CRYPTO_OP_STATUS_COMPLETED)
+	    {
+	      u32 bi = op->user_data;
+	      bufs[bi]->error = node->errors[0]; /* Encrypt failed */
+	      nexts[bi] = drop_next;
+	      n_fail--;
+	    }
+	  op++;
+	}
+    }
+
+  /* Process chained-buffer operations */
+  n_chained_ops = vec_len (ptd->chained_crypto_ops);
+  if (n_chained_ops > 0)
+    {
+      op = ptd->chained_crypto_ops;
+      n_fail = n_chained_ops -
+	       vnet_crypto_process_chained_ops (vm, op, ptd->chunks,
+						n_chained_ops);
+
+      while (n_fail)
+	{
+	  ASSERT (op - ptd->chained_crypto_ops < n_chained_ops);
+
+	  if (op->status != VNET_CRYPTO_OP_STATUS_COMPLETED)
+	    {
+	      u32 bi = op->user_data;
+	      bufs[bi]->error = node->errors[0]; /* Encrypt failed */
+	      nexts[bi] = drop_next;
+	      n_fail--;
+	    }
+	  op++;
+	}
+    }
+}
+
+/*
+ * Process all pending decryption operations
+ */
+void
+ovpn_crypto_decrypt_process (vlib_main_t *vm, vlib_node_runtime_t *node,
+			     ovpn_per_thread_crypto_t *ptd,
+			     vlib_buffer_t *bufs[], u16 *nexts, u16 drop_next)
+{
+  u32 n_ops, n_chained_ops;
+  u32 n_fail;
+  vnet_crypto_op_t *op;
+
+  /* Process single-buffer operations */
+  n_ops = vec_len (ptd->crypto_ops);
+  if (n_ops > 0)
+    {
+      op = ptd->crypto_ops;
+      n_fail = n_ops - vnet_crypto_process_ops (vm, op, n_ops);
+
+      while (n_fail)
+	{
+	  ASSERT (op - ptd->crypto_ops < n_ops);
+
+	  if (op->status != VNET_CRYPTO_OP_STATUS_COMPLETED)
+	    {
+	      u32 bi = op->user_data;
+	      bufs[bi]->error = node->errors[0]; /* Decrypt failed */
+	      nexts[bi] = drop_next;
+	      n_fail--;
+	    }
+	  op++;
+	}
+    }
+
+  /* Process chained-buffer operations */
+  n_chained_ops = vec_len (ptd->chained_crypto_ops);
+  if (n_chained_ops > 0)
+    {
+      op = ptd->chained_crypto_ops;
+      n_fail = n_chained_ops -
+	       vnet_crypto_process_chained_ops (vm, op, ptd->chunks,
+						n_chained_ops);
+
+      while (n_fail)
+	{
+	  ASSERT (op - ptd->chained_crypto_ops < n_chained_ops);
+
+	  if (op->status != VNET_CRYPTO_OP_STATUS_COMPLETED)
+	    {
+	      u32 bi = op->user_data;
+	      bufs[bi]->error = node->errors[0]; /* Decrypt failed */
+	      nexts[bi] = drop_next;
+	      n_fail--;
+	    }
+	  op++;
+	}
+    }
+}
+
+/*
+ * Legacy single-packet encrypt function (kept for compatibility)
+ * Uses the new batch infrastructure internally
+ */
+int
+ovpn_crypto_encrypt (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
+		     vlib_buffer_t *b, u32 peer_id, u8 key_id)
+{
+  u32 thread_index = vm->thread_index;
+  ovpn_per_thread_crypto_t *ptd = &ovpn_per_thread_crypto[thread_index];
+  int rv;
+
+  ovpn_crypto_reset_ptd (ptd);
+
+  rv = ovpn_crypto_encrypt_prepare (vm, ptd, ctx, b, 0, peer_id, key_id);
+  if (rv < 0)
+    return rv;
+
+  /* Process single-buffer ops */
+  if (vec_len (ptd->crypto_ops) > 0)
+    {
+      vnet_crypto_process_ops (vm, ptd->crypto_ops, vec_len (ptd->crypto_ops));
+      if (ptd->crypto_ops[0].status != VNET_CRYPTO_OP_STATUS_COMPLETED)
+	return -1;
+    }
+
+  /* Process chained-buffer ops */
+  if (vec_len (ptd->chained_crypto_ops) > 0)
+    {
+      vnet_crypto_process_chained_ops (vm, ptd->chained_crypto_ops,
+				       ptd->chunks,
+				       vec_len (ptd->chained_crypto_ops));
+      if (ptd->chained_crypto_ops[0].status !=
+	  VNET_CRYPTO_OP_STATUS_COMPLETED)
+	return -1;
+    }
+
+  return 0;
+}
+
+/*
+ * Legacy single-packet decrypt function (kept for compatibility)
+ * Uses the new batch infrastructure internally
+ */
+int
+ovpn_crypto_decrypt (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
+		     vlib_buffer_t *b, u32 *packet_id_out)
+{
+  u32 thread_index = vm->thread_index;
+  ovpn_per_thread_crypto_t *ptd = &ovpn_per_thread_crypto[thread_index];
+  vlib_buffer_t *lb;
+  u32 aad_len = sizeof (ovpn_data_v2_header_t);
+  int rv;
+
+  ovpn_crypto_reset_ptd (ptd);
+
+  rv = ovpn_crypto_decrypt_prepare (vm, ptd, ctx, b, 0, packet_id_out);
+  if (rv < 0)
+    return rv;
+
+  /* Process single-buffer ops */
+  if (vec_len (ptd->crypto_ops) > 0)
+    {
+      vnet_crypto_process_ops (vm, ptd->crypto_ops, vec_len (ptd->crypto_ops));
+      if (ptd->crypto_ops[0].status != VNET_CRYPTO_OP_STATUS_COMPLETED)
+	return -3;
+    }
+
+  /* Process chained-buffer ops */
+  if (vec_len (ptd->chained_crypto_ops) > 0)
+    {
+      vnet_crypto_process_chained_ops (vm, ptd->chained_crypto_ops,
+				       ptd->chunks,
+				       vec_len (ptd->chained_crypto_ops));
+      if (ptd->chained_crypto_ops[0].status !=
+	  VNET_CRYPTO_OP_STATUS_COMPLETED)
+	return -3;
+    }
+
+  /* Update replay window */
+  if (packet_id_out && *packet_id_out)
+    ovpn_crypto_update_replay (ctx, *packet_id_out);
+
+  /* Find last buffer */
+  lb = ovpn_find_last_buffer (vm, b);
+
+  /* Advance buffer past header to plaintext */
+  vlib_buffer_advance (b, aad_len);
+
+  /* Remove tag from chain length */
+  vlib_buffer_chain_increase_length (b, lb, -OVPN_TAG_SIZE);
 
   return 0;
 }

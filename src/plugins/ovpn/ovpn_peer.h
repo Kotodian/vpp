@@ -21,12 +21,29 @@
 #include <vlib/vlib.h>
 #include <vnet/ip/ip.h>
 #include <vnet/adj/adj.h>
+#include <vppinfra/bihash_8_8.h>
+#include <vppinfra/bihash_24_8.h>
 #include <ovpn/ovpn_crypto.h>
 #include <ovpn/ovpn_session_id.h>
 #include <ovpn/ovpn_packet.h>
 #include <ovpn/ovpn_reliable.h>
 #include <ovpn/ovpn_buffer.h>
 #include <picotls.h>
+
+/*
+ * Synchronization for multi-threaded access
+ *
+ * Race conditions addressed:
+ * 1. Peer add/delete - control plane modifies while data plane reads
+ * 2. Rekey - key slots change while data plane uses them
+ * 3. Peer lookup - hash table modified during lookup
+ *
+ * Strategy:
+ * - Generation counter: detect stale peer references
+ * - Soft delete: mark DEAD, defer actual free until safe
+ * - Bihash for key lookup: lock-free (peer_id, key_id) -> crypto context
+ * - Worker barrier for peer add/delete operations
+ */
 
 /* Peer state */
 typedef enum
@@ -142,8 +159,15 @@ typedef struct ovpn_peer_t_
   /* Associated interface */
   u32 sw_if_index;
 
-  /* Peer state */
-  ovpn_peer_state_t state;
+  /* Peer state - use atomic access */
+  volatile ovpn_peer_state_t state;
+
+  /*
+   * Generation counter for detecting stale references.
+   * Incremented on significant state changes (delete, rekey complete).
+   * Data plane can check if peer changed since lookup.
+   */
+  volatile u32 generation;
 
   CLIB_CACHE_LINE_ALIGN_MARK (cacheline1);
 
@@ -170,6 +194,10 @@ typedef struct ovpn_peer_t_
   u8 rekey_key_id;	 /* Key ID for current/pending rekey */
   u8 rekey_initiated;	 /* 1 if we initiated the rekey */
   u8 pending_key_slot;	 /* Key slot for pending rekey keys */
+
+  /* Bytes/packets since last rekey (for reneg-bytes/reneg-pkts) */
+  u64 bytes_since_rekey;
+  u64 packets_since_rekey;
 
   /* Statistics */
   u64 rx_bytes;
@@ -218,17 +246,43 @@ typedef struct ovpn_peer_db_t_
   /* Lookup by peer_id (direct index, peer_id = pool index) */
   /* For large deployments, might need a hash table */
 
-  /* Lookup by remote address + port */
-  uword *peer_index_by_remote; /* hash of ip:port -> peer index */
+  /*
+   * Bihash for lock-free lookup by remote address + port.
+   * Key: 24 bytes (ip_address_t + port padded)
+   * Value: peer_id
+   * Used for P_DATA_V1 and handshake packets.
+   */
+  clib_bihash_24_8_t remote_hash;
 
-  /* Lookup by virtual IP */
+  /* Lookup by virtual IP (control plane only, not performance critical) */
   uword *peer_index_by_virtual_ip;
+
+  /*
+   * Bihash for lock-free key lookup by (peer_id, key_id).
+   * Key: (peer_id << 8) | key_id
+   * Value: pointer to ovpn_peer_key_t
+   * Provides lock-free concurrent access for data plane crypto lookups.
+   */
+  clib_bihash_8_8_t key_hash;
 
   /* Next peer_id to allocate */
   u32 next_peer_id;
 
   /* Associated interface sw_if_index */
   u32 sw_if_index;
+
+  /*
+   * Global generation counter.
+   * Incremented on any structural change to help detect stale state.
+   */
+  u32 generation;
+
+  /*
+   * NOTE: Peer add/delete operations use worker thread barrier
+   * (vlib_worker_thread_barrier_sync/release) for synchronization.
+   * This pauses all worker threads, ensuring no stale references.
+   * No spinlock needed - barrier provides stronger guarantee.
+   */
 
 } ovpn_peer_db_t;
 
@@ -283,6 +337,7 @@ u32 ovpn_peer_create (ovpn_peer_db_t *db, const ip_address_t *remote_addr,
 
 /*
  * Delete a peer
+ * MUST be called with worker barrier held (vlib_worker_thread_barrier_sync)
  */
 void ovpn_peer_delete (ovpn_peer_db_t *db, u32 peer_id);
 
@@ -298,6 +353,64 @@ ovpn_peer_get (ovpn_peer_db_t *db, u32 peer_id)
 }
 
 /*
+ * Atomic state access functions
+ */
+always_inline ovpn_peer_state_t
+ovpn_peer_get_state (ovpn_peer_t *peer)
+{
+  return __atomic_load_n (&peer->state, __ATOMIC_ACQUIRE);
+}
+
+always_inline void
+ovpn_peer_set_state (ovpn_peer_t *peer, ovpn_peer_state_t state)
+{
+  __atomic_store_n (&peer->state, state, __ATOMIC_RELEASE);
+}
+
+always_inline int
+ovpn_peer_is_valid (ovpn_peer_t *peer)
+{
+  ovpn_peer_state_t state = ovpn_peer_get_state (peer);
+  return state != OVPN_PEER_STATE_DEAD && state != OVPN_PEER_STATE_INITIAL;
+}
+
+/*
+ * Generation counter functions
+ */
+always_inline u32
+ovpn_peer_get_generation (ovpn_peer_t *peer)
+{
+  return __atomic_load_n (&peer->generation, __ATOMIC_ACQUIRE);
+}
+
+always_inline void
+ovpn_peer_increment_generation (ovpn_peer_t *peer)
+{
+  __atomic_add_fetch (&peer->generation, 1, __ATOMIC_RELEASE);
+}
+
+/*
+ * Bihash key helper for (peer_id, key_id) -> crypto context lookup
+ */
+always_inline u64
+ovpn_peer_key_hash_key (u32 peer_id, u8 key_id)
+{
+  return ((u64) peer_id << 8) | key_id;
+}
+
+/*
+ * Check if peer is usable by data plane
+ * Returns 1 if peer is in a valid state for data processing
+ */
+always_inline int
+ovpn_peer_is_established (ovpn_peer_t *peer)
+{
+  ovpn_peer_state_t state = ovpn_peer_get_state (peer);
+  return state == OVPN_PEER_STATE_ESTABLISHED ||
+	 state == OVPN_PEER_STATE_REKEYING;
+}
+
+/*
  * Lookup peer by remote address and port
  */
 ovpn_peer_t *ovpn_peer_lookup_by_remote (ovpn_peer_db_t *db,
@@ -310,10 +423,10 @@ ovpn_peer_t *ovpn_peer_lookup_by_virtual_ip (ovpn_peer_db_t *db,
 					     const ip_address_t *addr);
 
 /*
- * Set peer crypto key
+ * Set peer crypto key (updates bihash for lock-free lookup)
  */
-int ovpn_peer_set_key (vlib_main_t *vm, ovpn_peer_t *peer, u8 key_slot,
-		       ovpn_cipher_alg_t cipher_alg,
+int ovpn_peer_set_key (vlib_main_t *vm, ovpn_peer_db_t *db, ovpn_peer_t *peer,
+		       u8 key_slot, ovpn_cipher_alg_t cipher_alg,
 		       const ovpn_key_material_t *keys, u8 key_id);
 
 /*
@@ -326,10 +439,10 @@ ovpn_peer_get_crypto (ovpn_peer_t *peer)
 }
 
 /*
- * Get crypto context by key_id
+ * Get crypto context by key_id using bihash lookup
  */
-ovpn_crypto_context_t *ovpn_peer_get_crypto_by_key_id (ovpn_peer_t *peer,
-						       u8 key_id);
+ovpn_crypto_context_t *ovpn_peer_get_crypto_by_key_id (ovpn_peer_db_t *db,
+						       u32 peer_id, u8 key_id);
 
 /*
  * Update peer activity timestamp
@@ -340,6 +453,9 @@ ovpn_peer_update_rx (ovpn_peer_t *peer, f64 now, u32 bytes)
   peer->last_rx_time = now;
   peer->rx_bytes += bytes;
   peer->rx_packets++;
+  /* Track for reneg-bytes/reneg-pkts */
+  peer->bytes_since_rekey += bytes;
+  peer->packets_since_rekey++;
 }
 
 always_inline void
@@ -348,6 +464,9 @@ ovpn_peer_update_tx (ovpn_peer_t *peer, f64 now, u32 bytes)
   peer->last_tx_time = now;
   peer->tx_bytes += bytes;
   peer->tx_packets++;
+  /* Track for reneg-bytes/reneg-pkts */
+  peer->bytes_since_rekey += bytes;
+  peer->packets_since_rekey++;
 }
 
 /*
@@ -360,6 +479,22 @@ int ovpn_peer_build_rewrite (ovpn_peer_t *peer, const ip_address_t *local_addr,
  * Format peer for display
  */
 u8 *format_ovpn_peer (u8 *s, va_list *args);
+
+/*
+ * Cleanup expired keys for a peer
+ * Called by periodic timer to remove "lame duck" keys after transition window
+ * Returns number of keys cleaned up
+ */
+int ovpn_peer_cleanup_expired_keys (vlib_main_t *vm, ovpn_peer_db_t *db,
+				    ovpn_peer_t *peer, f64 now);
+
+/*
+ * Cleanup expired keys for all peers in database
+ * Called by periodic timer process
+ * Returns number of keys cleaned up
+ */
+int ovpn_peer_db_cleanup_expired_keys (vlib_main_t *vm, ovpn_peer_db_t *db,
+				       f64 now);
 
 /*
  * Initialize TLS handshake context for a peer
@@ -411,8 +546,8 @@ int ovpn_peer_start_rekey (vlib_main_t *vm, ovpn_peer_t *peer,
  * Called after TLS handshake completes during rekey
  * Returns 0 on success, <0 on error
  */
-int ovpn_peer_complete_rekey (vlib_main_t *vm, ovpn_peer_t *peer,
-			      ovpn_cipher_alg_t cipher_alg);
+int ovpn_peer_complete_rekey (vlib_main_t *vm, ovpn_peer_db_t *db,
+			      ovpn_peer_t *peer, ovpn_cipher_alg_t cipher_alg);
 
 /*
  * Get the next key_id for rekey
@@ -426,35 +561,56 @@ ovpn_peer_next_key_id (ovpn_peer_t *peer)
 }
 
 /*
- * Check if peer needs rekey based on time
+ * Check if peer needs rekey based on time, bytes, or packets
+ * Following OpenVPN: reneg-sec, reneg-bytes, reneg-pkts
  */
 always_inline int
-ovpn_peer_needs_rekey (ovpn_peer_t *peer, f64 now)
+ovpn_peer_needs_rekey (ovpn_peer_t *peer, f64 now, u64 reneg_bytes,
+		       u64 reneg_pkts)
 {
   if (peer->state != OVPN_PEER_STATE_ESTABLISHED)
     return 0;
-  if (peer->rekey_interval <= 0)
-    return 0;
-  return now >= peer->next_rekey_time;
+  if (peer->rekey_initiated)
+    return 0; /* Already rekeying */
+
+  /* Check time-based rekey (reneg-sec) */
+  if (peer->rekey_interval > 0 && now >= peer->next_rekey_time)
+    return 1;
+
+  /* Check bytes-based rekey (reneg-bytes) */
+  if (reneg_bytes > 0 && peer->bytes_since_rekey >= reneg_bytes)
+    return 1;
+
+  /* Check packets-based rekey (reneg-pkts) */
+  if (reneg_pkts > 0 && peer->packets_since_rekey >= reneg_pkts)
+    return 1;
+
+  return 0;
 }
 
 /*
- * Hash key for remote address lookup
+ * Build 24-byte key for remote address bihash lookup
+ * Key structure: [ip_address (16 bytes)] [port (2 bytes)] [is_ipv6 (1 byte)] [padding (5 bytes)]
  */
-always_inline u64
-ovpn_peer_remote_hash_key (const ip_address_t *addr, u16 port)
+always_inline void
+ovpn_peer_remote_hash_make_key (clib_bihash_kv_24_8_t *kv,
+				const ip_address_t *addr, u16 port)
 {
-  u64 key = port;
+  clib_memset (kv, 0, sizeof (*kv));
   if (addr->version == AF_IP4)
     {
-      key |= ((u64) addr->ip.ip4.as_u32) << 16;
+      /* IPv4: store in first 4 bytes */
+      kv->key[0] = addr->ip.ip4.as_u32;
+      kv->key[1] = port;
+      kv->key[2] = 0; /* is_ipv6 = 0 */
     }
   else
     {
-      /* For IPv6, use lower 48 bits */
-      key |= ((u64) addr->ip.ip6.as_u64[0]) << 16;
+      /* IPv6: store full 16 bytes */
+      kv->key[0] = addr->ip.ip6.as_u64[0];
+      kv->key[1] = addr->ip.ip6.as_u64[1];
+      kv->key[2] = ((u64) port) | (1ULL << 16); /* port + is_ipv6 flag */
     }
-  return key;
 }
 
 /*

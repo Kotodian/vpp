@@ -160,6 +160,7 @@ done:
 static void
 ovpn_free_options (ovpn_options_t *opt)
 {
+  vec_free (opt->dev_name);
   vec_free (opt->ca_cert);
   vec_free (opt->server_cert);
   vec_free (opt->server_key);
@@ -252,15 +253,19 @@ ovpn_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
   u8 *tls_auth_key = 0;
   ip_address_t pool_start, pool_end;
   fib_prefix_t server_addr;
-  u32 max_clients = 100;
+  /* OpenVPN defaults from upstream */
+  u32 max_clients = 1024;
   u32 keepalive_ping = 10;
   u32 keepalive_timeout = 120;
-  u32 handshake_timeout = 60;
-  u32 renegotiate_seconds = 3600;
+  u32 handshake_timeout = 60;       /* hand-window default */
+  u32 renegotiate_seconds = 3600;   /* reneg-sec default */
+  u64 renegotiate_bytes = 0;	    /* reneg-bytes (0=disabled) */
+  u64 renegotiate_packets = 0;	    /* reneg-pkts (0=disabled) */
+  u32 tls_timeout = 2;		    /* tls-timeout default */
   u8 replay_protection = 1;
   u32 replay_window = 64;
   u32 replay_time = 15;
-  u32 transition_window = 3600;
+  u32 transition_window = 3600;	    /* transition-window default */
   u16 mtu = 1420; /* Default MTU */
   u8 is_tun = 1;  /* Default to TUN mode (L3) */
   u8 enable = 0;
@@ -350,6 +355,20 @@ ovpn_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
       else if (unformat (line_input, "renegotiate-seconds %u",
 			 &renegotiate_seconds))
 	;
+      else if (unformat (line_input, "reneg-sec %u", &renegotiate_seconds))
+	;
+      else if (unformat (line_input, "renegotiate-bytes %lu",
+			 &renegotiate_bytes))
+	;
+      else if (unformat (line_input, "reneg-bytes %lu", &renegotiate_bytes))
+	;
+      else if (unformat (line_input, "renegotiate-packets %lu",
+			 &renegotiate_packets))
+	;
+      else if (unformat (line_input, "reneg-pkts %lu", &renegotiate_packets))
+	;
+      else if (unformat (line_input, "tls-timeout %u", &tls_timeout))
+	;
       else if (unformat (line_input, "replay-protection %u",
 			 &replay_protection))
 	;
@@ -381,6 +400,12 @@ ovpn_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
   if (enable == disable)
     {
       error = clib_error_return (0, "must specify either enable or disable");
+      goto done;
+    }
+
+  if (enable && omp->is_enabled)
+    {
+      error = clib_error_return (0, "OpenVPN is already enabled");
       goto done;
     }
 
@@ -421,7 +446,10 @@ ovpn_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
   omp->options.is_tun = is_tun;
 
   if (dev_name)
-    omp->options.dev_name = (char *) dev_name;
+    {
+      omp->options.dev_name = (char *) dev_name;
+      dev_name = 0; /* Ownership transferred */
+    }
 
   if (server_addr.fp_proto != 0)
     omp->options.server_addr = server_addr;
@@ -439,6 +467,8 @@ ovpn_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	}
       vlib_cli_output (vm, "Loaded CA certificate from %s (%u bytes)", ca_cert,
 		       vec_len (omp->options.ca_cert));
+      vec_free (ca_cert);
+      ca_cert = 0;
     }
 
   if (server_cert)
@@ -454,6 +484,8 @@ ovpn_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	}
       vlib_cli_output (vm, "Loaded server certificate from %s (%u bytes)",
 		       server_cert, vec_len (omp->options.server_cert));
+      vec_free (server_cert);
+      server_cert = 0;
     }
 
   if (server_key)
@@ -468,6 +500,8 @@ ovpn_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	}
       vlib_cli_output (vm, "Loaded server key from %s (%u bytes)", server_key,
 		       vec_len (omp->options.server_key));
+      vec_free (server_key);
+      server_key = 0;
     }
 
   if (dh_params)
@@ -482,6 +516,8 @@ ovpn_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	}
       vlib_cli_output (vm, "Loaded DH parameters from %s (%u bytes)",
 		       dh_params, vec_len (omp->options.dh_params));
+      vec_free (dh_params);
+      dh_params = 0;
     }
 
   if (tls_crypt_key)
@@ -496,6 +532,8 @@ ovpn_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	}
       vlib_cli_output (vm, "Loaded TLS-Crypt key from %s (%u bytes)",
 		       tls_crypt_key, vec_len (omp->options.tls_crypt_key));
+      vec_free (tls_crypt_key);
+      tls_crypt_key = 0;
 
       /* Parse and initialize TLS-Crypt context */
       int rv = ovpn_tls_crypt_parse_key (omp->options.tls_crypt_key,
@@ -512,13 +550,14 @@ ovpn_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
   if (cipher)
     {
-      omp->options.cipher_name = cipher;
       omp->cipher_alg = ovpn_crypto_cipher_alg_from_name ((char *) cipher);
       if (omp->cipher_alg == OVPN_CIPHER_ALG_NONE)
 	{
 	  error = clib_error_return (0, "unsupported cipher: %s", cipher);
 	  goto done;
 	}
+      omp->options.cipher_name = cipher;
+      cipher = 0; /* Ownership transferred */
     }
   else
     {
@@ -534,7 +573,10 @@ ovpn_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
 						     "CHACHA20-POLY1305" :
 						     "NONE");
   if (auth)
-    omp->options.auth_name = auth;
+    {
+      omp->options.auth_name = auth;
+      auth = 0; /* Ownership transferred */
+    }
 
   if (tls_auth_key)
     {
@@ -548,6 +590,8 @@ ovpn_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	}
       vlib_cli_output (vm, "Loaded TLS-Auth key from %s (%u bytes)",
 		       tls_auth_key, vec_len (omp->options.tls_auth_key));
+      vec_free (tls_auth_key);
+      tls_auth_key = 0;
     }
 
   if (pool_start.version != 0)
@@ -560,6 +604,9 @@ ovpn_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
   omp->options.keepalive_timeout = keepalive_timeout;
   omp->options.handshake_window = handshake_timeout;
   omp->options.renegotiate_seconds = renegotiate_seconds;
+  omp->options.renegotiate_bytes = renegotiate_bytes;
+  omp->options.renegotiate_packets = renegotiate_packets;
+  omp->options.tls_timeout = tls_timeout;
   omp->options.replay_protection = replay_protection;
   omp->options.replay_window = replay_window;
   omp->options.replay_time = replay_time;
@@ -656,6 +703,18 @@ done:
       ovpn_free_options (&omp->options);
       ovpn_cleanup_picotls_context (omp);
     }
+
+  /* Free any remaining local strings that weren't transferred */
+  vec_free (dev_name);
+  vec_free (ca_cert);
+  vec_free (server_cert);
+  vec_free (server_key);
+  vec_free (dh_params);
+  vec_free (cipher);
+  vec_free (auth);
+  vec_free (tls_crypt_key);
+  vec_free (tls_auth_key);
+
   unformat_free (line_input);
   return error;
 }
@@ -731,7 +790,16 @@ ovpn_show_command_fn (vlib_main_t *vm,
 		   opt->keepalive_timeout);
   vlib_cli_output (vm, "  Handshake Window: %u seconds",
 		   opt->handshake_window);
-  vlib_cli_output (vm, "  Renegotiate: %u seconds", opt->renegotiate_seconds);
+  vlib_cli_output (vm, "  TLS Timeout: %u seconds", opt->tls_timeout);
+  vlib_cli_output (vm, "  Renegotiate Seconds: %u", opt->renegotiate_seconds);
+  if (opt->renegotiate_bytes > 0)
+    vlib_cli_output (vm, "  Renegotiate Bytes: %lu", opt->renegotiate_bytes);
+  else
+    vlib_cli_output (vm, "  Renegotiate Bytes: disabled");
+  if (opt->renegotiate_packets > 0)
+    vlib_cli_output (vm, "  Renegotiate Packets: %lu", opt->renegotiate_packets);
+  else
+    vlib_cli_output (vm, "  Renegotiate Packets: disabled");
   vlib_cli_output (vm, "  Replay Protection: %s",
 		   opt->replay_protection ? "Enabled" : "Disabled");
   vlib_cli_output (vm, "  Replay Window: %u", opt->replay_window);
@@ -768,7 +836,8 @@ VLIB_CLI_COMMAND (ovpn_enable_command, static) = {
 		"[server-addr <ip>/<len>] "
 		"[pool-start <ip>] [pool-end <ip>] [max-clients <n>] "
 		"[keepalive-ping <sec>] [keepalive-timeout <sec>] "
-		"[handshake-timeout <sec>] [renegotiate-seconds <sec>] "
+		"[handshake-timeout <sec>] [tls-timeout <sec>] "
+		"[reneg-sec <sec>] [reneg-bytes <n>] [reneg-pkts <n>] "
 		"[replay-protection <0|1>] [replay-window <n>] "
 		"[replay-time <sec>] [transition-window <sec>]",
   .function = ovpn_enable_command_fn,
@@ -860,6 +929,9 @@ ovpn_periodic_process (vlib_main_t *vm, vlib_node_runtime_t *rt,
       /* Expire old pending connections */
       ovpn_pending_db_expire (&omp->multi_context.pending_db, now);
 
+      /* Cleanup expired keys (lame duck keys after transition window) */
+      ovpn_peer_db_cleanup_expired_keys (vm, &omp->multi_context.peer_db, now);
+
       /* Get keepalive settings */
       f64 ping_interval = omp->options.keepalive_ping > 0 ?
 			    (f64) omp->options.keepalive_ping :
@@ -911,8 +983,9 @@ ovpn_periodic_process (vlib_main_t *vm, vlib_node_runtime_t *rt,
 	      ovpn_peer_send_ping (vm, peer);
 	    }
 
-	  /* Check if rekey is needed */
-	  if (ovpn_peer_needs_rekey (peer, now))
+	  /* Check if rekey is needed (time, bytes, or packets) */
+	  if (ovpn_peer_needs_rekey (peer, now, omp->options.renegotiate_bytes,
+				    omp->options.renegotiate_packets))
 	    {
 	      /* Start server-initiated rekey */
 	      u8 new_key_id = ovpn_peer_next_key_id (peer);

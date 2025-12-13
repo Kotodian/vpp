@@ -97,13 +97,18 @@ typedef struct ovpn_per_thread_crypto_t_
 {
   CLIB_CACHE_LINE_ALIGN_MARK (cacheline0);
 
-  /* Crypto operation arrays */
+  /* Crypto operation arrays - separate for single buffer vs chained */
   vnet_crypto_op_t *crypto_ops;
   vnet_crypto_op_t *chained_crypto_ops;
+
+  /* Chunks for chained buffer crypto operations */
   vnet_crypto_op_chunk_t *chunks;
 
   /* Async crypto frames */
   vnet_crypto_async_frame_t **async_frames;
+
+  /* IV storage for batch operations (12 bytes per op) */
+  u8 *ivs;
 
   /* Temporary buffer for crypto operations */
   u8 scratch[2048];
@@ -210,6 +215,61 @@ ovpn_crypto_key_size (ovpn_cipher_alg_t alg)
 int ovpn_crypto_set_static_key (ovpn_crypto_context_t *ctx,
 				ovpn_cipher_alg_t cipher_alg, const u8 *key,
 				u8 key_len, const u8 *implicit_iv);
+
+/*
+ * Get per-thread crypto data
+ */
+ovpn_per_thread_crypto_t *ovpn_crypto_get_ptd (u32 thread_index);
+
+/*
+ * Prepare encryption operation for a buffer (supports chained buffers)
+ * This function linearizes the buffer chain and prepares the crypto op
+ * Returns: 0 on success, <0 on error
+ */
+int ovpn_crypto_encrypt_prepare (vlib_main_t *vm,
+				 ovpn_per_thread_crypto_t *ptd,
+				 ovpn_crypto_context_t *ctx, vlib_buffer_t *b,
+				 u32 bi, u32 peer_id, u8 key_id);
+
+/*
+ * Prepare decryption operation for a buffer (supports chained buffers)
+ * This function linearizes the buffer chain and prepares the crypto op
+ * Returns: 0 on success, <0 on error
+ */
+int ovpn_crypto_decrypt_prepare (vlib_main_t *vm,
+				 ovpn_per_thread_crypto_t *ptd,
+				 ovpn_crypto_context_t *ctx, vlib_buffer_t *b,
+				 u32 bi, u32 *packet_id_out);
+
+/*
+ * Process all pending encryption operations (batch)
+ * Handles both single-buffer and chained-buffer operations
+ */
+void ovpn_crypto_encrypt_process (vlib_main_t *vm, vlib_node_runtime_t *node,
+				  ovpn_per_thread_crypto_t *ptd,
+				  vlib_buffer_t *bufs[], u16 *nexts,
+				  u16 drop_next);
+
+/*
+ * Process all pending decryption operations (batch)
+ * Handles both single-buffer and chained-buffer operations
+ */
+void ovpn_crypto_decrypt_process (vlib_main_t *vm, vlib_node_runtime_t *node,
+				  ovpn_per_thread_crypto_t *ptd,
+				  vlib_buffer_t *bufs[], u16 *nexts,
+				  u16 drop_next);
+
+/*
+ * Reset per-thread crypto state for new frame processing
+ */
+always_inline void
+ovpn_crypto_reset_ptd (ovpn_per_thread_crypto_t *ptd)
+{
+  vec_reset_length (ptd->crypto_ops);
+  vec_reset_length (ptd->chained_crypto_ops);
+  vec_reset_length (ptd->chunks);
+  vec_reset_length (ptd->ivs);
+}
 
 #endif /* __included_ovpn_crypto_h__ */
 

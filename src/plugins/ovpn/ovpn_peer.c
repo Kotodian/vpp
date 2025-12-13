@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <ovpn/ovpn.h>
 #include <ovpn/ovpn_peer.h>
 #include <ovpn/ovpn_ssl.h>
 #include <ovpn/ovpn_session_id.h>
@@ -39,9 +40,16 @@ ovpn_peer_db_init (ovpn_peer_db_t *db, u32 sw_if_index)
 {
   clib_memset (db, 0, sizeof (*db));
   db->sw_if_index = sw_if_index;
-  db->peer_index_by_remote = hash_create (0, sizeof (uword));
   db->peer_index_by_virtual_ip = hash_create (0, sizeof (uword));
   db->next_peer_id = 1; /* Start from 1, 0 is reserved */
+
+  /* Initialize bihash for remote address -> peer_id lookup (lock-free) */
+  clib_bihash_init_24_8 (&db->remote_hash, "ovpn peer remote hash",
+			 1024 /* nbuckets */, 64 << 10 /* memory_size */);
+
+  /* Initialize bihash for (peer_id, key_id) -> crypto context lookup */
+  clib_bihash_init_8_8 (&db->key_hash, "ovpn peer key hash",
+			1024 /* nbuckets */, 64 << 10 /* memory_size */);
 }
 
 void
@@ -62,8 +70,12 @@ ovpn_peer_db_free (ovpn_peer_db_t *db)
     }
 
   pool_free (db->peers);
-  hash_free (db->peer_index_by_remote);
   hash_free (db->peer_index_by_virtual_ip);
+
+  /* Free bihashes */
+  clib_bihash_free_24_8 (&db->remote_hash);
+  clib_bihash_free_8_8 (&db->key_hash);
+
   clib_memset (db, 0, sizeof (*db));
 }
 
@@ -73,7 +85,7 @@ ovpn_peer_create (ovpn_peer_db_t *db, const ip_address_t *remote_addr,
 {
   ovpn_peer_t *peer;
   u32 peer_id;
-  u64 remote_key;
+  clib_bihash_kv_24_8_t kv;
 
   /* Check if peer already exists */
   peer = ovpn_peer_lookup_by_remote (db, remote_addr, remote_port);
@@ -94,6 +106,7 @@ ovpn_peer_create (ovpn_peer_db_t *db, const ip_address_t *remote_addr,
   peer->peer_id = peer_id;
   peer->state = OVPN_PEER_STATE_INITIAL;
   peer->sw_if_index = db->sw_if_index;
+  peer->generation = 0;
 
   /* Set remote address */
   ip_address_copy (&peer->remote_addr, remote_addr);
@@ -113,38 +126,67 @@ ovpn_peer_create (ovpn_peer_db_t *db, const ip_address_t *remote_addr,
   /* Thread index unassigned - will be set on first packet */
   peer->input_thread_index = ~0;
 
-  /* Add to remote address hash */
-  remote_key = ovpn_peer_remote_hash_key (remote_addr, remote_port);
-  hash_set (db->peer_index_by_remote, remote_key, peer_id);
+  /* Add to remote address bihash (lock-free) */
+  ovpn_peer_remote_hash_make_key (&kv, remote_addr, remote_port);
+  kv.value = peer_id;
+  clib_bihash_add_del_24_8 (&db->remote_hash, &kv, 1 /* is_add */);
 
   return peer_id;
 }
 
+/*
+ * Delete a peer
+ *
+ * IMPORTANT: Caller MUST hold worker barrier (vlib_worker_thread_barrier_sync)
+ * to ensure no data plane workers are accessing this peer.
+ */
 void
 ovpn_peer_delete (ovpn_peer_db_t *db, u32 peer_id)
 {
   ovpn_peer_t *peer;
-  u64 remote_key;
+  clib_bihash_kv_8_8_t kv;
+  clib_bihash_kv_24_8_t kv24;
 
   peer = ovpn_peer_get (db, peer_id);
   if (!peer)
     return;
 
-  /* Remove from remote hash */
-  remote_key =
-    ovpn_peer_remote_hash_key (&peer->remote_addr, peer->remote_port);
-  hash_unset (db->peer_index_by_remote, remote_key);
+  /*
+   * Mark peer as DEAD first.
+   * Any data plane code that somehow runs (shouldn't happen with barrier)
+   * will see DEAD state and skip processing.
+   */
+  ovpn_peer_set_state (peer, OVPN_PEER_STATE_DEAD);
+  ovpn_peer_increment_generation (peer);
+
+  /* Remove from remote address bihash */
+  ovpn_peer_remote_hash_make_key (&kv24, &peer->remote_addr, peer->remote_port);
+  clib_bihash_add_del_24_8 (&db->remote_hash, &kv24, 0 /* is_add */);
 
   /* Remove from virtual IP hash if set */
   if (peer->virtual_ip_set)
     {
-      u64 vip_key = ovpn_peer_remote_hash_key (&peer->virtual_ip, 0);
+      u64 vip_key;
+      if (peer->virtual_ip.version == AF_IP4)
+	vip_key = peer->virtual_ip.ip.ip4.as_u32;
+      else
+	vip_key = peer->virtual_ip.ip.ip6.as_u64[0] ^
+		  peer->virtual_ip.ip.ip6.as_u64[1];
       hash_unset (db->peer_index_by_virtual_ip, vip_key);
     }
 
-  /* Free crypto contexts */
+  /* Free TLS context if exists */
+  if (peer->tls_ctx)
+    ovpn_peer_tls_free (peer);
+
+  /* Remove key entries from bihash and free crypto contexts */
   for (int i = 0; i < OVPN_KEY_SLOT_COUNT; i++)
     {
+      if (peer->keys[i].is_active)
+	{
+	  kv.key = ovpn_peer_key_hash_key (peer_id, peer->keys[i].key_id);
+	  clib_bihash_add_del_8_8 (&db->key_hash, &kv, 0 /* is_add */);
+	}
       if (peer->keys[i].crypto.is_valid)
 	ovpn_crypto_context_free (&peer->keys[i].crypto);
     }
@@ -156,23 +198,31 @@ ovpn_peer_delete (ovpn_peer_db_t *db, u32 peer_id)
   if (peer->adj_index != ADJ_INDEX_INVALID)
     adj_unlock (peer->adj_index);
 
+  /* Increment database generation */
+  db->generation++;
+
   /* Return to pool */
   pool_put (db->peers, peer);
 }
 
+/*
+ * Lookup peer by remote address + port (lock-free via bihash)
+ * Used for P_DATA_V1 packets and handshake.
+ */
 ovpn_peer_t *
 ovpn_peer_lookup_by_remote (ovpn_peer_db_t *db, const ip_address_t *addr,
 			    u16 port)
 {
-  uword *p;
-  u64 key;
+  clib_bihash_kv_24_8_t kv, value;
 
-  key = ovpn_peer_remote_hash_key (addr, port);
-  p = hash_get (db->peer_index_by_remote, key);
-  if (!p)
-    return NULL;
-
-  return pool_elt_at_index (db->peers, p[0]);
+  ovpn_peer_remote_hash_make_key (&kv, addr, port);
+  if (clib_bihash_search_24_8 (&db->remote_hash, &kv, &value) == 0)
+    {
+      u32 peer_id = (u32) value.value;
+      if (peer_id < pool_elts (db->peers))
+	return pool_elt_at_index (db->peers, peer_id);
+    }
+  return NULL;
 }
 
 ovpn_peer_t *
@@ -181,7 +231,11 @@ ovpn_peer_lookup_by_virtual_ip (ovpn_peer_db_t *db, const ip_address_t *addr)
   uword *p;
   u64 key;
 
-  key = ovpn_peer_remote_hash_key (addr, 0);
+  if (addr->version == AF_IP4)
+    key = addr->ip.ip4.as_u32;
+  else
+    key = addr->ip.ip6.as_u64[0] ^ addr->ip.ip6.as_u64[1];
+
   p = hash_get (db->peer_index_by_virtual_ip, key);
   if (!p)
     return NULL;
@@ -189,12 +243,19 @@ ovpn_peer_lookup_by_virtual_ip (ovpn_peer_db_t *db, const ip_address_t *addr)
   return pool_elt_at_index (db->peers, p[0]);
 }
 
+/*
+ * Set peer crypto key
+ *
+ * Updates bihash for lock-free data plane lookup.
+ * Must be called from main thread or with worker barrier held.
+ */
 int
-ovpn_peer_set_key (vlib_main_t *vm, ovpn_peer_t *peer, u8 key_slot,
-		   ovpn_cipher_alg_t cipher_alg,
+ovpn_peer_set_key (vlib_main_t *vm, ovpn_peer_db_t *db, ovpn_peer_t *peer,
+		   u8 key_slot, ovpn_cipher_alg_t cipher_alg,
 		   const ovpn_key_material_t *keys, u8 key_id)
 {
   ovpn_peer_key_t *pkey;
+  clib_bihash_kv_8_8_t kv;
   int rv;
 
   if (key_slot >= OVPN_KEY_SLOT_COUNT)
@@ -202,7 +263,14 @@ ovpn_peer_set_key (vlib_main_t *vm, ovpn_peer_t *peer, u8 key_slot,
 
   pkey = &peer->keys[key_slot];
 
-  /* Free existing key if any */
+  /* Remove old bihash entry if key was active */
+  if (pkey->is_active)
+    {
+      kv.key = ovpn_peer_key_hash_key (peer->peer_id, pkey->key_id);
+      clib_bihash_add_del_8_8 (&db->key_hash, &kv, 0 /* is_add */);
+    }
+
+  /* Free existing crypto context if any */
   if (pkey->crypto.is_valid)
     ovpn_crypto_context_free (&pkey->crypto);
 
@@ -216,17 +284,34 @@ ovpn_peer_set_key (vlib_main_t *vm, ovpn_peer_t *peer, u8 key_slot,
   pkey->created_at = vlib_time_now (vm);
   pkey->expires_at = 0; /* Set by caller based on config */
 
+  /* Add new entry to bihash for lock-free lookup */
+  kv.key = ovpn_peer_key_hash_key (peer->peer_id, key_id);
+  kv.value = (u64) (uword) pkey;
+  clib_bihash_add_del_8_8 (&db->key_hash, &kv, 1 /* is_add */);
+
+  /* Increment generation to signal key change */
+  ovpn_peer_increment_generation (peer);
+
   return 0;
 }
 
+/*
+ * Get crypto context by key_id using bihash lookup (lock-free)
+ */
 ovpn_crypto_context_t *
-ovpn_peer_get_crypto_by_key_id (ovpn_peer_t *peer, u8 key_id)
+ovpn_peer_get_crypto_by_key_id (ovpn_peer_db_t *db, u32 peer_id, u8 key_id)
 {
-  for (int i = 0; i < OVPN_KEY_SLOT_COUNT; i++)
+  clib_bihash_kv_8_8_t kv, value;
+
+  kv.key = ovpn_peer_key_hash_key (peer_id, key_id);
+
+  if (clib_bihash_search_8_8 (&db->key_hash, &kv, &value) == 0)
     {
-      if (peer->keys[i].is_active && peer->keys[i].key_id == key_id)
-	return &peer->keys[i].crypto;
+      ovpn_peer_key_t *pkey = (ovpn_peer_key_t *) (uword) value.value;
+      if (pkey->is_active && pkey->crypto.is_valid)
+	return &pkey->crypto;
     }
+
   return NULL;
 }
 
@@ -667,8 +752,8 @@ ovpn_peer_start_rekey (vlib_main_t *vm, ovpn_peer_t *peer,
  * Complete a rekey - activate new keys
  */
 int
-ovpn_peer_complete_rekey (vlib_main_t *vm, ovpn_peer_t *peer,
-			  ovpn_cipher_alg_t cipher_alg)
+ovpn_peer_complete_rekey (vlib_main_t *vm, ovpn_peer_db_t *db,
+			  ovpn_peer_t *peer, ovpn_cipher_alg_t cipher_alg)
 {
   ovpn_key_material_t keys;
   int rv;
@@ -700,8 +785,8 @@ ovpn_peer_complete_rekey (vlib_main_t *vm, ovpn_peer_t *peer,
     }
 
   /* Install new keys in the pending slot */
-  rv = ovpn_peer_set_key (vm, peer, peer->pending_key_slot, cipher_alg, &keys,
-			  peer->rekey_key_id);
+  rv = ovpn_peer_set_key (vm, db, peer, peer->pending_key_slot, cipher_alg,
+			  &keys, peer->rekey_key_id);
 
   /* Securely clear key material */
   clib_memset (&keys, 0, sizeof (keys));
@@ -709,19 +794,34 @@ ovpn_peer_complete_rekey (vlib_main_t *vm, ovpn_peer_t *peer,
   if (rv < 0)
     return -5;
 
-  /* Free old key in the slot we're about to switch from */
+  /*
+   * Old key transitions to "lame duck" state.
+   * Keep it active during the transition window to decrypt in-flight packets.
+   * The periodic timer will cleanup when expires_at is reached.
+   */
   u8 old_slot = peer->current_key_slot;
+  ovpn_peer_key_t *old_key = &peer->keys[old_slot];
 
-  /* Switch to new keys */
+  /* Set expiration time for old key (lame duck) */
+  extern ovpn_main_t ovpn_main;
+  f64 transition_window = (f64) ovpn_main.options.transition_window;
+  if (transition_window <= 0)
+    transition_window = 60.0; /* Default 60 seconds */
+  old_key->expires_at = now + transition_window;
+
+  /* Old key remains active until it expires - can still decrypt packets */
+
+  /* Switch to new keys for encryption */
   peer->current_key_slot = peer->pending_key_slot;
-
-  /* Mark old keys as inactive (but keep them for a grace period) */
-  peer->keys[old_slot].is_active = 0;
 
   /* Update timestamps */
   peer->last_rekey_time = now;
   if (peer->rekey_interval > 0)
     peer->next_rekey_time = now + peer->rekey_interval;
+
+  /* Reset bytes/packets counters for reneg-bytes/reneg-pkts */
+  peer->bytes_since_rekey = 0;
+  peer->packets_since_rekey = 0;
 
   /* Free TLS context */
   ovpn_peer_tls_free (peer);
@@ -783,6 +883,74 @@ ovpn_peer_adj_stack (ovpn_peer_t *peer, adj_index_t ai)
 
       adj_midchain_delegate_stack (ai, fib_index, &dst);
     }
+}
+
+/*
+ * Cleanup expired keys for a peer
+ *
+ * Removes "lame duck" keys whose transition window has expired.
+ * Keys are removed from the bihash and crypto context is freed.
+ */
+int
+ovpn_peer_cleanup_expired_keys (vlib_main_t *vm, ovpn_peer_db_t *db,
+				ovpn_peer_t *peer, f64 now)
+{
+  clib_bihash_kv_8_8_t kv;
+  int cleaned = 0;
+
+  for (int i = 0; i < OVPN_KEY_SLOT_COUNT; i++)
+    {
+      ovpn_peer_key_t *pkey = &peer->keys[i];
+
+      /* Skip inactive keys or keys that haven't expired yet */
+      if (!pkey->is_active)
+	continue;
+
+      /* Skip the current key slot (always keep it) */
+      if (i == peer->current_key_slot)
+	continue;
+
+      /* Check if key has expired */
+      if (pkey->expires_at > 0 && now >= pkey->expires_at)
+	{
+	  /* Remove from bihash */
+	  kv.key = ovpn_peer_key_hash_key (peer->peer_id, pkey->key_id);
+	  clib_bihash_add_del_8_8 (&db->key_hash, &kv, 0 /* is_add */);
+
+	  /* Free crypto context */
+	  if (pkey->crypto.is_valid)
+	    ovpn_crypto_context_free (&pkey->crypto);
+
+	  /* Mark as inactive */
+	  pkey->is_active = 0;
+	  pkey->expires_at = 0;
+
+	  cleaned++;
+	}
+    }
+
+  return cleaned;
+}
+
+/*
+ * Cleanup expired keys for all peers in database
+ */
+int
+ovpn_peer_db_cleanup_expired_keys (vlib_main_t *vm, ovpn_peer_db_t *db, f64 now)
+{
+  ovpn_peer_t *peer;
+  int total_cleaned = 0;
+
+  pool_foreach (peer, db->peers)
+    {
+      /* Skip dead peers */
+      if (peer->state == OVPN_PEER_STATE_DEAD)
+	continue;
+
+      total_cleaned += ovpn_peer_cleanup_expired_keys (vm, db, peer, now);
+    }
+
+  return total_cleaned;
 }
 
 /*

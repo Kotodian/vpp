@@ -80,11 +80,29 @@ struct ovpn_pending_db_t_;
 typedef struct ovpn_pending_db_t_ ovpn_pending_db_t;
 
 /*
+ * Control channel replay window size (must be power of 2, max 64)
+ * Used by both TLS-Auth and TLS-Crypt for replay protection
+ */
+#define OVPN_CONTROL_REPLAY_WINDOW_SIZE 64
+
+/*
  * HMAC context for tls-auth
  * Uses SHA256 by default
+ *
+ * TLS-Auth packet format (incoming):
+ * [opcode+keyid (1)] [HMAC (32)] [packet_id (4)] [net_time (4)] [session_id (8)] ...
+ *
+ * The packet_id/net_time after HMAC is for REPLAY PROTECTION (wrapper layer)
+ * The packet_id inside the control packet (after ack_array) is for RELIABLE ORDERING
  */
-#define OVPN_HMAC_KEY_SIZE 64
-#define OVPN_HMAC_SIZE	   32 /* SHA256 output */
+#define OVPN_HMAC_KEY_SIZE	  64
+#define OVPN_HMAC_SIZE		  32 /* SHA256 output */
+#define OVPN_TLS_AUTH_PACKET_ID_SIZE 4
+#define OVPN_TLS_AUTH_NET_TIME_SIZE  4
+
+/* TLS-Auth overhead: HMAC + packet_id + net_time */
+#define OVPN_TLS_AUTH_OVERHEAD                                                \
+  (OVPN_HMAC_SIZE + OVPN_TLS_AUTH_PACKET_ID_SIZE + OVPN_TLS_AUTH_NET_TIME_SIZE)
 
 typedef struct ovpn_tls_auth_t_
 {
@@ -93,7 +111,76 @@ typedef struct ovpn_tls_auth_t_
   u8 key_len;
   /* Key direction: 0 = normal, 1 = inverse */
   u8 key_direction;
+
+  /* Replay protection for incoming packets (wrapper packet_id) */
+  u64 replay_bitmap;
+  u32 replay_packet_id_floor;
+
+  /* Packet ID for outgoing packets */
+  u32 packet_id_send;
 } ovpn_tls_auth_t;
+
+/*
+ * TLS-Auth wrapped packet header (placed after opcode byte)
+ */
+typedef CLIB_PACKED (struct {
+  u8 hmac[OVPN_HMAC_SIZE];
+  u32 packet_id;  /* For replay protection (network byte order) */
+  u32 net_time;	  /* Timestamp (network byte order) */
+  /* followed by: session_id, ack_array, msg_packet_id, payload */
+}) ovpn_tls_auth_header_t;
+
+/*
+ * Check replay for TLS-Auth wrapper packet_id
+ */
+always_inline int
+ovpn_tls_auth_check_replay (const ovpn_tls_auth_t *ctx, u32 packet_id)
+{
+  u32 diff;
+
+  if (packet_id == 0)
+    return 0;
+
+  if (packet_id < ctx->replay_packet_id_floor)
+    return 0;
+
+  diff = packet_id - ctx->replay_packet_id_floor;
+
+  if (diff >= OVPN_CONTROL_REPLAY_WINDOW_SIZE)
+    return 1;
+
+  if (ctx->replay_bitmap & (1ULL << diff))
+    return 0;
+
+  return 1;
+}
+
+/*
+ * Update replay window for TLS-Auth
+ */
+always_inline void
+ovpn_tls_auth_update_replay (ovpn_tls_auth_t *ctx, u32 packet_id)
+{
+  u32 diff;
+
+  if (packet_id < ctx->replay_packet_id_floor)
+    return;
+
+  diff = packet_id - ctx->replay_packet_id_floor;
+
+  if (diff >= OVPN_CONTROL_REPLAY_WINDOW_SIZE)
+    {
+      u32 shift = diff - OVPN_CONTROL_REPLAY_WINDOW_SIZE + 1;
+      if (shift >= 64)
+	ctx->replay_bitmap = 0;
+      else
+	ctx->replay_bitmap >>= shift;
+      ctx->replay_packet_id_floor += shift;
+      diff = packet_id - ctx->replay_packet_id_floor;
+    }
+
+  ctx->replay_bitmap |= (1ULL << diff);
+}
 
 /*
  * TLS-Crypt context
@@ -152,8 +239,13 @@ typedef struct ovpn_tls_crypt_t_
   u8 encrypt_cipher_key[OVPN_TLS_CRYPT_CIPHER_SIZE];
   u8 decrypt_hmac_key[OVPN_TLS_CRYPT_HMAC_SIZE];
   u8 decrypt_cipher_key[OVPN_TLS_CRYPT_CIPHER_SIZE];
-  /* Packet ID for replay protection */
+
+  /* Packet ID for sending */
   u32 packet_id_send;
+
+  /* Replay protection for receiving (sliding window) */
+  u64 replay_bitmap;
+  u32 replay_packet_id_floor;
 } ovpn_tls_crypt_t;
 
 /*
@@ -249,14 +341,41 @@ int ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 				   u8 is_ip6);
 
 /*
- * HMAC verification for tls-auth
+ * TLS-Auth unwrap: verify HMAC and check replay protection
+ *
+ * Input packet format (after opcode byte):
+ *   [HMAC (32)] [packet_id (4)] [net_time (4)] [session_id...payload]
+ *
+ * Output: plaintext starting from session_id (HMAC + packet_id + net_time stripped)
+ *
+ * Returns: length of plaintext, or <0 on error:
+ *   -1: invalid parameters
+ *   -2: packet too short
+ *   -3: HMAC verification failed
+ *   -4: replay detected
+ */
+int ovpn_tls_auth_unwrap (ovpn_tls_auth_t *ctx, const u8 *wrapped, u32 wrapped_len,
+			  u8 *plaintext, u32 plaintext_buf_len);
+
+/*
+ * TLS-Auth wrap: add HMAC and packet_id/net_time for outgoing packets
+ *
+ * Returns: length of wrapped packet, or <0 on error
+ */
+int ovpn_tls_auth_wrap (ovpn_tls_auth_t *ctx, const u8 *plaintext, u32 plain_len,
+			u8 *wrapped, u32 wrapped_buf_len);
+
+/*
+ * Legacy HMAC verification (simple, no replay protection)
  * Returns 1 if HMAC is valid, 0 if invalid
+ * @deprecated Use ovpn_tls_auth_unwrap instead
  */
 int ovpn_handshake_verify_hmac (const u8 *data, u32 len,
 				const ovpn_tls_auth_t *auth);
 
 /*
  * Generate HMAC for outgoing control packet
+ * @deprecated Use ovpn_tls_auth_wrap instead
  */
 void ovpn_handshake_generate_hmac (u8 *data, u32 len, u8 *hmac_out,
 				   const ovpn_tls_auth_t *auth);
@@ -287,9 +406,71 @@ int ovpn_tls_crypt_wrap (const ovpn_tls_crypt_t *ctx, const u8 *plaintext,
  * Output: plaintext control packet written to plaintext buffer
  *
  * Returns: length of plaintext, or <0 on error
+ *
+ * Note: This function performs replay protection check and updates the
+ * replay window on success.
  */
-int ovpn_tls_crypt_unwrap (const ovpn_tls_crypt_t *ctx, const u8 *wrapped,
+int ovpn_tls_crypt_unwrap (ovpn_tls_crypt_t *ctx, const u8 *wrapped,
 			   u32 wrapped_len, u8 *plaintext, u32 plaintext_buf_len);
+
+/*
+ * Check if a packet_id has been seen (replay detection)
+ * Returns: 1 if packet_id is valid (not a replay), 0 if replay detected
+ */
+always_inline int
+ovpn_tls_crypt_check_replay (const ovpn_tls_crypt_t *ctx, u32 packet_id)
+{
+  u32 diff;
+
+  /* packet_id 0 is never valid */
+  if (packet_id == 0)
+    return 0;
+
+  /* Too old - before our window */
+  if (packet_id < ctx->replay_packet_id_floor)
+    return 0;
+
+  diff = packet_id - ctx->replay_packet_id_floor;
+
+  /* Ahead of window - OK */
+  if (diff >= OVPN_CONTROL_REPLAY_WINDOW_SIZE)
+    return 1;
+
+  /* Check bitmap for this position */
+  if (ctx->replay_bitmap & (1ULL << diff))
+    return 0; /* Already seen */
+
+  return 1;
+}
+
+/*
+ * Update replay window after successful packet verification
+ */
+always_inline void
+ovpn_tls_crypt_update_replay (ovpn_tls_crypt_t *ctx, u32 packet_id)
+{
+  u32 diff;
+
+  if (packet_id < ctx->replay_packet_id_floor)
+    return;
+
+  diff = packet_id - ctx->replay_packet_id_floor;
+
+  if (diff >= OVPN_CONTROL_REPLAY_WINDOW_SIZE)
+    {
+      /* Advance window */
+      u32 shift = diff - OVPN_CONTROL_REPLAY_WINDOW_SIZE + 1;
+      if (shift >= 64)
+	ctx->replay_bitmap = 0;
+      else
+	ctx->replay_bitmap >>= shift;
+      ctx->replay_packet_id_floor += shift;
+      diff = packet_id - ctx->replay_packet_id_floor;
+    }
+
+  /* Mark as seen */
+  ctx->replay_bitmap |= (1ULL << diff);
+}
 
 /*
  * OpenVPN Control Channel Message Types

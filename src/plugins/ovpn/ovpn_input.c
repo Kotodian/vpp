@@ -101,6 +101,13 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
   u16 nexts[VLIB_FRAME_SIZE], *next;
   u32 thread_index = vm->thread_index;
   f64 now = vlib_time_now (vm);
+  ovpn_per_thread_crypto_t *ptd = ovpn_crypto_get_ptd (thread_index);
+
+  /* Packet IDs for replay tracking (indexed by buffer position) */
+  u32 packet_ids[VLIB_FRAME_SIZE];
+  ovpn_crypto_context_t *crypto_contexts[VLIB_FRAME_SIZE];
+  ovpn_peer_t *peers[VLIB_FRAME_SIZE];
+  u32 decrypt_count = 0;
 
   from = vlib_frame_vector_args (frame);
   n_left_from = frame->n_vectors;
@@ -108,6 +115,12 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
   vlib_get_buffers (vm, from, bufs, n_left_from);
   b = bufs;
   next = nexts;
+
+  /* Initialize tracking arrays */
+  clib_memset (peers, 0, sizeof (peers));
+
+  /* Reset per-thread crypto state for batch processing */
+  ovpn_crypto_reset_ptd (ptd);
 
   while (n_left_from > 0)
     {
@@ -232,6 +245,16 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	    }
 
 	  /*
+	   * Check peer state - only process data for established peers.
+	   * Peer might be deleted or in handshake state.
+	   */
+	  if (PREDICT_FALSE (!ovpn_peer_is_established (peer)))
+	    {
+	      error = OVPN_INPUT_ERROR_PEER_NOT_FOUND;
+	      goto trace;
+	    }
+
+	  /*
 	   * Check if we need to handoff to peer's assigned thread
 	   * Assign current thread if peer has no assigned thread yet
 	   */
@@ -248,46 +271,38 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      goto trace;
 	    }
 
-	  /* Get crypto context for this key_id */
-	  crypto = ovpn_peer_get_crypto_by_key_id (peer, key_id);
+	  /*
+	   * Get crypto context for this key_id using bihash (lock-free).
+	   */
+	  crypto = ovpn_peer_get_crypto_by_key_id (&omp->multi_context.peer_db,
+						   peer_id, key_id);
 	  if (PREDICT_FALSE (!crypto || !crypto->is_valid))
 	    {
 	      error = OVPN_INPUT_ERROR_NO_CRYPTO;
 	      goto trace;
 	    }
 
-	  /* Decrypt packet */
-	  rv = ovpn_crypto_decrypt (vm, crypto, b0, &packet_id);
+	  /* Prepare decrypt operation (supports chained buffers) */
+	  u32 buf_idx = b - bufs;
+	  rv = ovpn_crypto_decrypt_prepare (vm, ptd, crypto, b0, buf_idx,
+					    &packet_id);
 	  if (PREDICT_FALSE (rv < 0))
 	    {
-	      if (rv == -2)
+	      if (rv == -4)
 		error = OVPN_INPUT_ERROR_REPLAY;
 	      else
 		error = OVPN_INPUT_ERROR_DECRYPT_FAILED;
 	      goto trace;
 	    }
 
-	  /* Update peer statistics */
-	  ovpn_peer_update_rx (peer, now, len);
+	  /* Store context for post-processing after batch crypto */
+	  packet_ids[buf_idx] = packet_id;
+	  crypto_contexts[buf_idx] = crypto;
+	  peers[buf_idx] = peer;
+	  decrypt_count++;
 
-	  /* Set sw_if_index for the tunnel interface */
-	  vnet_buffer (b0)->sw_if_index[VLIB_RX] = peer->sw_if_index;
-
-	  /* Determine inner packet type and route to IP input */
-	  data = vlib_buffer_get_current (b0);
-	  if (PREDICT_TRUE (b0->current_length >= 1))
-	    {
-	      u8 ip_version = (data[0] >> 4);
-	      if (ip_version == 4)
-		next0 = OVPN_INPUT_NEXT_IP4_INPUT;
-	      else if (ip_version == 6)
-		next0 = OVPN_INPUT_NEXT_IP6_INPUT;
-	      else
-		{
-		  error = OVPN_INPUT_ERROR_DECRYPT_FAILED;
-		  next0 = OVPN_INPUT_NEXT_DROP;
-		}
-	    }
+	  /* Mark for pending decryption - will be updated after batch */
+	  next0 = OVPN_INPUT_NEXT_IP4_INPUT; /* Placeholder, will be fixed up */
 	}
       else if (ovpn_opcode_is_control (opcode))
 	{
@@ -333,6 +348,78 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       b += 1;
       next += 1;
       n_left_from -= 1;
+    }
+
+  /*
+   * Batch process all decrypt operations
+   * This handles both single-buffer and chained-buffer crypto
+   */
+  if (decrypt_count > 0)
+    {
+      ovpn_crypto_decrypt_process (vm, node, ptd, bufs, nexts,
+				   OVPN_INPUT_NEXT_DROP);
+
+      /*
+       * Post-process decrypted packets:
+       * - Update replay windows
+       * - Advance buffers past headers
+       * - Determine inner packet type
+       * - Update statistics
+       */
+      for (u32 i = 0; i < frame->n_vectors; i++)
+	{
+	  /* Skip packets that weren't queued for decryption */
+	  if (!peers[i])
+	    continue;
+
+	  /* Skip packets that failed decryption */
+	  if (nexts[i] == OVPN_INPUT_NEXT_DROP)
+	    continue;
+
+	  vlib_buffer_t *b0 = bufs[i];
+	  ovpn_peer_t *peer = peers[i];
+	  ovpn_crypto_context_t *crypto = crypto_contexts[i];
+	  u32 packet_id = packet_ids[i];
+	  vlib_buffer_t *lb;
+	  u8 *data;
+	  u32 aad_len = sizeof (ovpn_data_v2_header_t);
+
+	  /* Update replay window */
+	  ovpn_crypto_update_replay (crypto, packet_id);
+
+	  /* Find last buffer in chain */
+	  lb = b0;
+	  while (lb->flags & VLIB_BUFFER_NEXT_PRESENT)
+	    lb = vlib_get_buffer (vm, lb->next_buffer);
+
+	  /* Advance buffer past header to plaintext */
+	  vlib_buffer_advance (b0, aad_len);
+
+	  /* Remove tag from chain length */
+	  vlib_buffer_chain_increase_length (b0, lb, -OVPN_TAG_SIZE);
+
+	  /* Update peer statistics */
+	  ovpn_peer_update_rx (peer, now, vlib_buffer_length_in_chain (vm, b0));
+
+	  /* Set sw_if_index for the tunnel interface */
+	  vnet_buffer (b0)->sw_if_index[VLIB_RX] = peer->sw_if_index;
+
+	  /* Determine inner packet type and route to IP input */
+	  data = vlib_buffer_get_current (b0);
+	  if (PREDICT_TRUE (b0->current_length >= 1))
+	    {
+	      u8 ip_version = (data[0] >> 4);
+	      if (ip_version == 4)
+		nexts[i] = OVPN_INPUT_NEXT_IP4_INPUT;
+	      else if (ip_version == 6)
+		nexts[i] = OVPN_INPUT_NEXT_IP6_INPUT;
+	      else
+		{
+		  b0->error = node->errors[OVPN_INPUT_ERROR_DECRYPT_FAILED];
+		  nexts[i] = OVPN_INPUT_NEXT_DROP;
+		}
+	    }
+	}
     }
 
   vlib_buffer_enqueue_to_next (vm, node, vlib_frame_vector_args (frame), nexts,

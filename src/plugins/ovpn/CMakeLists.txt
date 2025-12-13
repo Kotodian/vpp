@@ -53,3 +53,12 @@ add_vpp_plugin(ovpn
   ovpn_input.c
   ovpn_output.c
 )
+
+# Unit test plugin
+add_vpp_plugin(ovpn_unittest
+  SOURCES
+  test/ovpn_reliable_test.c
+  test/ovpn_ssl_test.c
+
+  LINK_LIBRARIES ${PICOTLS_LINK_LIBRARIES} ${OPENSSL_LIBRARIES}
+)

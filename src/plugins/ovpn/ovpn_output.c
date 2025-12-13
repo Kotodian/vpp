@@ -112,6 +112,13 @@ ovpn_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
   u32 last_adj_index = ~0;
   u32 last_peer_id = ~0;
   ovpn_peer_t *peer = NULL;
+  u32 thread_index = vm->thread_index;
+  ovpn_per_thread_crypto_t *ptd = ovpn_crypto_get_ptd (thread_index);
+
+  /* Track peers for post-processing */
+  ovpn_peer_t *peers[VLIB_FRAME_SIZE];
+  u16 inner_lens[VLIB_FRAME_SIZE];
+  u32 encrypt_count = 0;
 
   from = vlib_frame_vector_args (frame);
   n_left_from = frame->n_vectors;
@@ -119,6 +126,12 @@ ovpn_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
   vlib_get_buffers (vm, from, bufs, n_left_from);
   b = bufs;
   next = nexts;
+
+  /* Initialize tracking arrays */
+  clib_memset (peers, 0, sizeof (peers));
+
+  /* Reset per-thread crypto state for batch processing */
+  ovpn_crypto_reset_ptd (ptd);
 
   while (n_left_from > 0)
     {
@@ -157,75 +170,60 @@ ovpn_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  peer_id = last_peer_id;
 	}
 
-      if (PREDICT_FALSE (!peer || peer->state != OVPN_PEER_STATE_ESTABLISHED))
+      /*
+       * Check peer state atomically - allow ESTABLISHED and REKEYING.
+       * Peer might be deleted or in wrong state.
+       */
+      if (PREDICT_FALSE (!peer || !ovpn_peer_is_established (peer)))
 	{
 	  error = OVPN_OUTPUT_ERROR_PEER_NOT_FOUND;
 	  goto trace;
 	}
 
-      /* Get crypto context */
-      crypto = ovpn_peer_get_crypto (peer);
+      /*
+       * Get current crypto context (lock-free).
+       * During rekey, peer has two valid keys - output always uses current.
+       * The current_key_slot is updated atomically after new key is installed.
+       */
+      u8 key_slot = peer->current_key_slot;
+      crypto = &peer->keys[key_slot].crypto;
       if (PREDICT_FALSE (!crypto || !crypto->is_valid))
 	{
 	  error = OVPN_OUTPUT_ERROR_NO_CRYPTO;
 	  goto trace;
 	}
 
-      /* Get current key_id */
-      u8 key_id = peer->keys[peer->current_key_slot].key_id;
+      /* Get key_id for the current key slot */
+      u8 key_id = peer->keys[key_slot].key_id;
 
       /*
-       * Encrypt the packet
-       * ovpn_crypto_encrypt will:
-       * 1. Prepend OpenVPN header (opcode + peer_id + packet_id)
-       * 2. Encrypt the payload
-       * 3. Append authentication tag
+       * Prepare encrypt operation (supports chained buffers)
+       * ovpn_crypto_encrypt_prepare will:
+       * 1. Linearize buffer chain if needed
+       * 2. Prepend OpenVPN header (opcode + peer_id + packet_id)
+       * 3. Reserve space for authentication tag
+       * 4. Queue crypto operation for batch processing
        */
-      rv = ovpn_crypto_encrypt (vm, crypto, b0, peer->peer_id, key_id);
+      u32 buf_idx = b - bufs;
+      rv = ovpn_crypto_encrypt_prepare (vm, ptd, crypto, b0, buf_idx,
+					peer->peer_id, key_id);
       if (PREDICT_FALSE (rv < 0))
 	{
-	  error = OVPN_OUTPUT_ERROR_ENCRYPT_FAILED;
+	  if (rv == -3)
+	    error = OVPN_OUTPUT_ERROR_NO_BUFFER_SPACE;
+	  else
+	    error = OVPN_OUTPUT_ERROR_ENCRYPT_FAILED;
 	  goto trace;
 	}
 
+      /* Store context for post-processing after batch crypto */
+      peers[buf_idx] = peer;
+      inner_lens[buf_idx] = inner_len;
+      encrypt_count++;
+
       packet_id = crypto->packet_id_send - 1; /* Was just incremented */
-      outer_len = b0->current_length;
 
-      /*
-       * The rewrite (IP + UDP headers) is already applied by adj-midchain
-       * We just need to fix up the length fields
-       */
-      if (is_ip4)
-	{
-	  ip4_header_t *ip4 = vlib_buffer_get_current (b0);
-	  udp_header_t *udp = (udp_header_t *) (ip4 + 1);
-	  u16 old_len = ip4->length;
-	  u16 new_len = clib_host_to_net_u16 (outer_len);
-
-	  /* Update IP length with checksum fixup */
-	  ip_csum_t sum = ip4->checksum;
-	  sum = ip_csum_update (sum, old_len, new_len, ip4_header_t, length);
-	  ip4->checksum = ip_csum_fold (sum);
-	  ip4->length = new_len;
-
-	  /* Update UDP length */
-	  udp->length =
-	    clib_host_to_net_u16 (outer_len - sizeof (ip4_header_t));
-	}
-      else
-	{
-	  ip6_header_t *ip6 = vlib_buffer_get_current (b0);
-	  udp_header_t *udp = (udp_header_t *) (ip6 + 1);
-
-	  ip6->payload_length =
-	    clib_host_to_net_u16 (outer_len - sizeof (ip6_header_t));
-	  udp->length = ip6->payload_length;
-	}
-
-      /* Update peer statistics */
-      ovpn_peer_update_tx (peer, now, outer_len);
-
-      /* Send to adj-midchain-tx */
+      /* Mark for pending encryption - will be updated after batch */
       next0 = OVPN_OUTPUT_NEXT_INTERFACE_OUTPUT;
 
     trace:
@@ -254,6 +252,70 @@ ovpn_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       b += 1;
       next += 1;
       n_left_from -= 1;
+    }
+
+  /*
+   * Batch process all encrypt operations
+   * This handles both single-buffer and chained-buffer crypto
+   */
+  if (encrypt_count > 0)
+    {
+      ovpn_crypto_encrypt_process (vm, node, ptd, bufs, nexts,
+				   OVPN_OUTPUT_NEXT_ERROR);
+
+      /*
+       * Post-process encrypted packets:
+       * - Update IP/UDP length fields
+       * - Update statistics
+       */
+      for (u32 i = 0; i < frame->n_vectors; i++)
+	{
+	  /* Skip packets that weren't queued for encryption */
+	  if (!peers[i])
+	    continue;
+
+	  /* Skip packets that failed encryption */
+	  if (nexts[i] == OVPN_OUTPUT_NEXT_ERROR)
+	    continue;
+
+	  vlib_buffer_t *b0 = bufs[i];
+	  ovpn_peer_t *peer0 = peers[i];
+	  u16 outer_len = vlib_buffer_length_in_chain (vm, b0);
+
+	  /*
+	   * The rewrite (IP + UDP headers) is already applied by adj-midchain
+	   * We just need to fix up the length fields
+	   */
+	  if (is_ip4)
+	    {
+	      ip4_header_t *ip4 = vlib_buffer_get_current (b0);
+	      udp_header_t *udp = (udp_header_t *) (ip4 + 1);
+	      u16 old_len = ip4->length;
+	      u16 new_len = clib_host_to_net_u16 (outer_len);
+
+	      /* Update IP length with checksum fixup */
+	      ip_csum_t sum = ip4->checksum;
+	      sum = ip_csum_update (sum, old_len, new_len, ip4_header_t, length);
+	      ip4->checksum = ip_csum_fold (sum);
+	      ip4->length = new_len;
+
+	      /* Update UDP length */
+	      udp->length =
+		clib_host_to_net_u16 (outer_len - sizeof (ip4_header_t));
+	    }
+	  else
+	    {
+	      ip6_header_t *ip6 = vlib_buffer_get_current (b0);
+	      udp_header_t *udp = (udp_header_t *) (ip6 + 1);
+
+	      ip6->payload_length =
+		clib_host_to_net_u16 (outer_len - sizeof (ip6_header_t));
+	      udp->length = ip6->payload_length;
+	    }
+
+	  /* Update peer statistics */
+	  ovpn_peer_update_tx (peer0, now, outer_len);
+	}
     }
 
   vlib_buffer_enqueue_to_next (vm, node, vlib_frame_vector_args (frame), nexts,
