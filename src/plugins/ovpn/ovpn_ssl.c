@@ -53,8 +53,9 @@ ovpn_key_source2_alloc (void)
 void
 ovpn_key_source2_free (ovpn_key_source2_t *key_src2)
 {
+  u32 index = key_src2->index;
   ovpn_secure_zero_memory (key_src2, sizeof (ovpn_key_source2_t));
-  pool_put_index (ovpn_key_source2s, key_src2->index);
+  pool_put_index (ovpn_key_source2s, index);
 }
 
 /*

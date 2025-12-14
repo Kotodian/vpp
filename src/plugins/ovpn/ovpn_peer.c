@@ -21,6 +21,7 @@
 #include <ovpn/ovpn_session_id.h>
 #include <ovpn/ovpn_handshake.h>
 #include <ovpn/ovpn_crypto.h>
+#include <ovpn/ovpn_if.h>
 #include <vnet/udp/udp_packet.h>
 #include <vnet/ip/ip4_packet.h>
 #include <vnet/ip/ip6_packet.h>
@@ -50,6 +51,10 @@ ovpn_peer_db_init (ovpn_peer_db_t *db, u32 sw_if_index)
   /* Initialize bihash for (peer_id, key_id) -> crypto context lookup */
   clib_bihash_init_8_8 (&db->key_hash, "ovpn peer key hash",
 			1024 /* nbuckets */, 64 << 10 /* memory_size */);
+
+  /* Initialize bihash for session ID -> peer_id lookup (NAT/float support) */
+  clib_bihash_init_8_8 (&db->session_hash, "ovpn peer session hash",
+			1024 /* nbuckets */, 64 << 10 /* memory_size */);
 }
 
 void
@@ -75,6 +80,7 @@ ovpn_peer_db_free (ovpn_peer_db_t *db)
   /* Free bihashes */
   clib_bihash_free_24_8 (&db->remote_hash);
   clib_bihash_free_8_8 (&db->key_hash);
+  clib_bihash_free_8_8 (&db->session_hash);
 
   clib_memset (db, 0, sizeof (*db));
 }
@@ -115,6 +121,9 @@ ovpn_peer_create (ovpn_peer_db_t *db, const ip_address_t *remote_addr,
 
   /* Generate session ID */
   ovpn_session_id_generate (&peer->session_id);
+
+  /* Add to session ID hash for NAT/float lookup */
+  ovpn_peer_add_to_session_hash (db, peer);
 
   /* Initialize timestamps */
   peer->last_rx_time = vlib_time_now (vlib_get_main ());
@@ -162,6 +171,13 @@ ovpn_peer_delete (ovpn_peer_db_t *db, u32 peer_id)
   /* Remove from remote address bihash */
   ovpn_peer_remote_hash_make_key (&kv24, &peer->remote_addr, peer->remote_port);
   clib_bihash_add_del_24_8 (&db->remote_hash, &kv24, 0 /* is_add */);
+
+  /* Remove from session ID hash */
+  if (ovpn_session_id_defined (&peer->session_id))
+    {
+      kv.key = *(u64 *) peer->session_id.id;
+      clib_bihash_add_del_8_8 (&db->session_hash, &kv, 0 /* is_add */);
+    }
 
   /* Remove from virtual IP hash if set */
   if (peer->virtual_ip_set)
@@ -244,6 +260,140 @@ ovpn_peer_lookup_by_virtual_ip (ovpn_peer_db_t *db, const ip_address_t *addr)
 }
 
 /*
+ * Add peer to session ID hash
+ */
+void
+ovpn_peer_add_to_session_hash (ovpn_peer_db_t *db, ovpn_peer_t *peer)
+{
+  clib_bihash_kv_8_8_t kv;
+
+  if (!ovpn_session_id_defined (&peer->session_id))
+    return;
+
+  kv.key = *(u64 *) peer->session_id.id;
+  kv.value = peer->peer_id;
+  clib_bihash_add_del_8_8 (&db->session_hash, &kv, 1 /* is_add */);
+}
+
+/*
+ * Lookup peer by session ID (NAT/float support)
+ */
+ovpn_peer_t *
+ovpn_peer_lookup_by_session_id (ovpn_peer_db_t *db,
+				const ovpn_session_id_t *session_id)
+{
+  clib_bihash_kv_8_8_t kv, value;
+
+  if (!ovpn_session_id_defined (session_id))
+    return NULL;
+
+  kv.key = *(u64 *) session_id->id;
+  if (clib_bihash_search_8_8 (&db->session_hash, &kv, &value) == 0)
+    {
+      u32 peer_id = (u32) value.value;
+      if (!pool_is_free_index (db->peers, peer_id))
+	return pool_elt_at_index (db->peers, peer_id);
+    }
+  return NULL;
+}
+
+/*
+ * Update peer remote address (NAT/float support)
+ *
+ * IMPORTANT: Caller MUST hold worker barrier (vlib_worker_thread_barrier_sync)
+ * to ensure no data plane workers are accessing this peer.
+ */
+int
+ovpn_peer_update_remote (ovpn_peer_db_t *db, ovpn_peer_t *peer,
+			 const ip_address_t *new_addr, u16 new_port)
+{
+  clib_bihash_kv_24_8_t kv;
+
+  /* Check if address actually changed */
+  if (ip_address_cmp (&peer->remote_addr, new_addr) == 0 &&
+      peer->remote_port == new_port)
+    return 0; /* No change */
+
+  /* Log the address change */
+  clib_warning ("ovpn: peer %u address changed from %U:%u to %U:%u",
+		peer->peer_id, format_ip_address, &peer->remote_addr,
+		peer->remote_port, format_ip_address, new_addr, new_port);
+
+  /* Remove old entry from remote_hash */
+  ovpn_peer_remote_hash_make_key (&kv, &peer->remote_addr, peer->remote_port);
+  clib_bihash_add_del_24_8 (&db->remote_hash, &kv, 0 /* is_add */);
+
+  /* Update peer fields */
+  ip_address_copy (&peer->remote_addr, new_addr);
+  peer->remote_port = new_port;
+  peer->is_ipv6 = (new_addr->version == AF_IP6);
+
+  /* Add new entry to remote_hash */
+  ovpn_peer_remote_hash_make_key (&kv, new_addr, new_port);
+  kv.value = peer->peer_id;
+  clib_bihash_add_del_24_8 (&db->remote_hash, &kv, 1 /* is_add */);
+
+  /* Rebuild rewrite buffer with new destination */
+  if (peer->rewrite)
+    {
+      ovpn_if_t *oif = ovpn_if_get_from_sw_if_index (peer->sw_if_index);
+      if (oif)
+	ovpn_peer_build_rewrite (peer, &oif->local_addr, oif->local_port);
+    }
+
+  /* Increment generation to signal data plane */
+  ovpn_peer_increment_generation (peer);
+
+  /* Clear pending update flag */
+  __atomic_store_n (&peer->pending_addr_update, 0, __ATOMIC_RELEASE);
+
+  return 0;
+}
+
+/*
+ * Queue a pending address update for a peer
+ * Called from data plane - must be lock-free
+ */
+void
+ovpn_peer_queue_address_update (ovpn_peer_t *peer, const ip_address_t *new_addr,
+				u16 new_port)
+{
+  /* Only queue if not already pending */
+  if (__atomic_load_n (&peer->pending_addr_update, __ATOMIC_ACQUIRE))
+    return;
+
+  /* Store new address */
+  ip_address_copy (&peer->pending_remote_addr, new_addr);
+  peer->pending_remote_port = new_port;
+
+  /* Set flag atomically */
+  __atomic_store_n (&peer->pending_addr_update, 1, __ATOMIC_RELEASE);
+}
+
+/*
+ * Apply pending address updates for all peers
+ * Called from control plane timer with worker barrier held.
+ */
+int
+ovpn_peer_db_apply_pending_updates (vlib_main_t *vm, ovpn_peer_db_t *db)
+{
+  ovpn_peer_t *peer;
+  int count = 0;
+
+  pool_foreach (peer, db->peers)
+    {
+      if (__atomic_load_n (&peer->pending_addr_update, __ATOMIC_ACQUIRE))
+	{
+	  ovpn_peer_update_remote (db, peer, &peer->pending_remote_addr,
+				   peer->pending_remote_port);
+	  count++;
+	}
+    }
+
+  return count;
+}
+
+/*
  * Set peer crypto key
  *
  * Updates bihash for lock-free data plane lookup.
@@ -252,7 +402,8 @@ ovpn_peer_lookup_by_virtual_ip (ovpn_peer_db_t *db, const ip_address_t *addr)
 int
 ovpn_peer_set_key (vlib_main_t *vm, ovpn_peer_db_t *db, ovpn_peer_t *peer,
 		   u8 key_slot, ovpn_cipher_alg_t cipher_alg,
-		   const ovpn_key_material_t *keys, u8 key_id)
+		   const ovpn_key_material_t *keys, u8 key_id,
+		   u32 replay_window)
 {
   ovpn_peer_key_t *pkey;
   clib_bihash_kv_8_8_t kv;
@@ -275,7 +426,8 @@ ovpn_peer_set_key (vlib_main_t *vm, ovpn_peer_db_t *db, ovpn_peer_t *peer,
     ovpn_crypto_context_free (&pkey->crypto);
 
   /* Initialize new key */
-  rv = ovpn_crypto_context_init (&pkey->crypto, cipher_alg, keys);
+  rv = ovpn_crypto_context_init (&pkey->crypto, cipher_alg, keys,
+				 replay_window);
   if (rv < 0)
     return rv;
 
@@ -785,8 +937,10 @@ ovpn_peer_complete_rekey (vlib_main_t *vm, ovpn_peer_db_t *db,
     }
 
   /* Install new keys in the pending slot */
+  extern ovpn_main_t ovpn_main;
   rv = ovpn_peer_set_key (vm, db, peer, peer->pending_key_slot, cipher_alg,
-			  &keys, peer->rekey_key_id);
+			  &keys, peer->rekey_key_id,
+			  ovpn_main.options.replay_window);
 
   /* Securely clear key material */
   clib_memset (&keys, 0, sizeof (keys));

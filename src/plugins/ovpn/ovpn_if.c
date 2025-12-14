@@ -31,7 +31,7 @@ ovpn_if_main_t ovpn_if_main;
 static u32 ovpn_instance_counter = 0;
 
 /* Get OpenVPN interface from sw_if_index */
-static ovpn_if_t *
+ovpn_if_t *
 ovpn_if_get_from_sw_if_index (u32 sw_if_index)
 {
   ovpn_if_main_t *oim = &ovpn_if_main;

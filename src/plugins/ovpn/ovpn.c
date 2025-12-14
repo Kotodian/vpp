@@ -166,6 +166,7 @@ ovpn_free_options (ovpn_options_t *opt)
   vec_free (opt->server_key);
   vec_free (opt->dh_params);
   vec_free (opt->tls_crypt_key);
+  vec_free (opt->tls_crypt_v2_key);
   vec_free (opt->tls_auth_key);
   vec_free (opt->cipher_name);
   vec_free (opt->auth_name);
@@ -250,6 +251,7 @@ ovpn_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
   u8 *cipher = 0;
   u8 *auth = 0;
   u8 *tls_crypt_key = 0;
+  u8 *tls_crypt_v2_key = 0;
   u8 *tls_auth_key = 0;
   ip_address_t pool_start, pool_end;
   fib_prefix_t server_addr;
@@ -296,74 +298,58 @@ ovpn_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	;
       else if (unformat (line_input, "dev %s", &dev_name))
 	;
-      else if (unformat (line_input, "ca-cert %s", &ca_cert))
+      else if (unformat (line_input, "ca %s", &ca_cert))
 	;
-      else if (unformat (line_input, "server-cert %s", &server_cert))
+      else if (unformat (line_input, "cert %s", &server_cert))
 	;
-      else if (unformat (line_input, "server-key %s", &server_key))
+      else if (unformat (line_input, "key %s", &server_key))
 	;
-      else if (unformat (line_input, "dh-params %s", &dh_params))
+      else if (unformat (line_input, "dh %s", &dh_params))
 	;
       else if (unformat (line_input, "cipher %s", &cipher))
 	;
       else if (unformat (line_input, "auth %s", &auth))
 	;
-      else if (unformat (line_input, "tls-crypt-key %s", &tls_crypt_key))
+      else if (unformat (line_input, "tls-crypt %s", &tls_crypt_key))
 	;
-      else if (unformat (line_input, "tls-auth-key %s", &tls_auth_key))
+      else if (unformat (line_input, "tls-crypt-v2 %s", &tls_crypt_v2_key))
 	;
-      else if (unformat (line_input, "server-addr %U/%d", unformat_ip4_address,
+      else if (unformat (line_input, "tls-auth %s", &tls_auth_key))
+	;
+      else if (unformat (line_input, "server %U/%d", unformat_ip4_address,
 			 &server_addr.fp_addr.ip4, &server_addr.fp_len))
 	{
 	  server_addr.fp_proto = FIB_PROTOCOL_IP4;
 	}
-      else if (unformat (line_input, "server-addr %U/%d", unformat_ip6_address,
+      else if (unformat (line_input, "server %U/%d", unformat_ip6_address,
 			 &server_addr.fp_addr.ip6, &server_addr.fp_len))
 	{
 	  server_addr.fp_proto = FIB_PROTOCOL_IP6;
 	}
-      else if (unformat (line_input, "pool-start %U", unformat_ip4_address,
-			 &pool_start.ip.ip4))
+      else if (unformat (line_input, "ifconfig-pool %U %U",
+			 unformat_ip4_address, &pool_start.ip.ip4,
+			 unformat_ip4_address, &pool_end.ip.ip4))
 	{
 	  pool_start.version = AF_IP4;
-	}
-      else if (unformat (line_input, "pool-start %U", unformat_ip6_address,
-			 &pool_start.ip.ip6))
-	{
-	  pool_start.version = AF_IP6;
-	}
-      else if (unformat (line_input, "pool-end %U", unformat_ip4_address,
-			 &pool_end.ip.ip4))
-	{
 	  pool_end.version = AF_IP4;
 	}
-      else if (unformat (line_input, "pool-end %U", unformat_ip6_address,
-			 &pool_end.ip.ip6))
+      else if (unformat (line_input, "ifconfig-pool %U %U",
+			 unformat_ip6_address, &pool_start.ip.ip6,
+			 unformat_ip6_address, &pool_end.ip.ip6))
 	{
+	  pool_start.version = AF_IP6;
 	  pool_end.version = AF_IP6;
 	}
       else if (unformat (line_input, "max-clients %u", &max_clients))
 	;
-      else if (unformat (line_input, "keepalive-ping %u", &keepalive_ping))
-	;
-      else if (unformat (line_input, "keepalive-timeout %u",
+      else if (unformat (line_input, "keepalive %u %u", &keepalive_ping,
 			 &keepalive_timeout))
 	;
-      else if (unformat (line_input, "handshake-timeout %u",
-			 &handshake_timeout))
-	;
-      else if (unformat (line_input, "renegotiate-seconds %u",
-			 &renegotiate_seconds))
+      else if (unformat (line_input, "hand-window %u", &handshake_timeout))
 	;
       else if (unformat (line_input, "reneg-sec %u", &renegotiate_seconds))
 	;
-      else if (unformat (line_input, "renegotiate-bytes %lu",
-			 &renegotiate_bytes))
-	;
       else if (unformat (line_input, "reneg-bytes %lu", &renegotiate_bytes))
-	;
-      else if (unformat (line_input, "renegotiate-packets %lu",
-			 &renegotiate_packets))
 	;
       else if (unformat (line_input, "reneg-pkts %lu", &renegotiate_packets))
 	;
@@ -372,20 +358,21 @@ ovpn_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
       else if (unformat (line_input, "replay-protection %u",
 			 &replay_protection))
 	;
-      else if (unformat (line_input, "replay-window %u", &replay_window))
+      else if (unformat (line_input, "replay-window %u %u", &replay_window,
+			 &replay_time))
 	;
-      else if (unformat (line_input, "replay-time %u", &replay_time))
+      else if (unformat (line_input, "replay-window %u", &replay_window))
 	;
       else if (unformat (line_input, "transition-window %u",
 			 &transition_window))
 	;
-      else if (unformat (line_input, "mtu %u", &mtu))
+      else if (unformat (line_input, "tun-mtu %u", &mtu))
 	;
-      else if (unformat (line_input, "mode tun"))
+      else if (unformat (line_input, "dev-type tun"))
 	{
 	  is_tun = 1;
 	}
-      else if (unformat (line_input, "mode tap"))
+      else if (unformat (line_input, "dev-type tap"))
 	{
 	  is_tun = 0;
 	}
@@ -548,6 +535,43 @@ ovpn_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
       vlib_cli_output (vm, "TLS-Crypt initialized successfully");
     }
 
+  if (tls_crypt_v2_key)
+    {
+      /* TLS-Crypt-V2 requires a separate server key */
+      if (tls_crypt_key)
+	{
+	  error = clib_error_return (
+	    0, "cannot use both tls-crypt-key and tls-crypt-v2-key");
+	  goto done;
+	}
+
+      error = ovpn_read_file_contents ((char *) tls_crypt_v2_key,
+				       &omp->options.tls_crypt_v2_key);
+      if (error)
+	{
+	  error = clib_error_return (0, "failed to read TLS-Crypt-V2 key: %U",
+				     format_clib_error, error);
+	  goto done;
+	}
+      vlib_cli_output (vm, "Loaded TLS-Crypt-V2 server key from %s (%u bytes)",
+		       tls_crypt_v2_key,
+		       vec_len (omp->options.tls_crypt_v2_key));
+      vec_free (tls_crypt_v2_key);
+      tls_crypt_v2_key = 0;
+
+      /* Parse and initialize TLS-Crypt-V2 context */
+      int rv = ovpn_tls_crypt_v2_parse_server_key (
+	omp->options.tls_crypt_v2_key,
+	vec_len (omp->options.tls_crypt_v2_key), &omp->tls_crypt_v2);
+      if (rv < 0)
+	{
+	  error =
+	    clib_error_return (0, "failed to parse TLS-Crypt-V2 key: %d", rv);
+	  goto done;
+	}
+      vlib_cli_output (vm, "TLS-Crypt-V2 server initialized successfully");
+    }
+
   if (cipher)
     {
       omp->cipher_alg = ovpn_crypto_cipher_alg_from_name ((char *) cipher);
@@ -611,6 +635,21 @@ ovpn_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
   omp->options.replay_window = replay_window;
   omp->options.replay_time = replay_time;
   omp->options.transition_window = transition_window;
+
+  /*
+   * Initialize time_backtrack for control channel replay protection
+   * This is used with long-form packet_id (packet_id + net_time) in TLS-Auth/TLS-Crypt
+   */
+  if (omp->tls_crypt.enabled && replay_protection)
+    {
+      omp->tls_crypt.time_backtrack = replay_time;
+      omp->tls_crypt.replay_time_floor = 0;
+    }
+  if (omp->tls_auth.enabled && replay_protection)
+    {
+      omp->tls_auth.time_backtrack = replay_time;
+      omp->tls_auth.replay_time_floor = 0;
+    }
 
   /* Initialize picotls context */
   error = ovpn_init_picotls_context (omp);
@@ -713,6 +752,7 @@ done:
   vec_free (cipher);
   vec_free (auth);
   vec_free (tls_crypt_key);
+  vec_free (tls_crypt_v2_key);
   vec_free (tls_auth_key);
 
   unformat_free (line_input);
@@ -774,6 +814,11 @@ ovpn_show_command_fn (vlib_main_t *vm,
   if (opt->tls_crypt_key)
     vlib_cli_output (vm, "  TLS-Crypt Key: loaded (%u bytes)",
 		     vec_len (opt->tls_crypt_key));
+  if (opt->tls_crypt_v2_key)
+    vlib_cli_output (vm, "  TLS-Crypt-V2 Server Key: loaded (%u bytes)",
+		     vec_len (opt->tls_crypt_v2_key));
+  if (omp->tls_crypt_v2.enabled)
+    vlib_cli_output (vm, "  TLS-Crypt-V2: enabled (per-client keys)");
   if (opt->tls_auth_key)
     vlib_cli_output (vm, "  TLS-Auth Key: loaded (%u bytes)",
 		     vec_len (opt->tls_auth_key));
@@ -815,12 +860,12 @@ ovpn_show_command_fn (vlib_main_t *vm,
  *
  * @cliexpar
  * @cliexstart{ovpn}
- * ovpn enable port 1194 dev tun0 mode tun mtu 1420 server-addr 10.8.0.1/24
-pool-start 10.8.0.10 pool-end 10.8.0.250
+ * ovpn enable port 1194 dev tun0 dev-type tun tun-mtu 1420 server 10.8.0.1/24
+ifconfig-pool 10.8.0.10 10.8.0.250
  * @cliexend
  * @cliexstart{ovpn}
- * ovpn enable port 1194 dev tap0 mode tap mtu 1500 ca-cert /path/to/ca.crt
-server-cert /path/to/server.crt server-key /path/to/server.key
+ * ovpn enable port 1194 dev tap0 dev-type tap tun-mtu 1500 ca /path/to/ca.crt
+cert /path/to/server.crt key /path/to/server.key
  * @cliexend
  * @cliexstart{ovpn}
  * ovpn disable
@@ -829,17 +874,16 @@ server-cert /path/to/server.crt server-key /path/to/server.key
 VLIB_CLI_COMMAND (ovpn_enable_command, static) = {
   .path = "ovpn",
   .short_help = "ovpn [enable|disable] [port <port>] [dev <name>] "
-		"[mode tun|tap] [mtu <size>] "
-		"[ca-cert <path>] [server-cert <path>] [server-key <path>] "
-		"[dh-params <path>] [cipher <name>] [auth <name>] "
-		"[tls-crypt-key <path>] [tls-auth-key <path>] "
-		"[server-addr <ip>/<len>] "
-		"[pool-start <ip>] [pool-end <ip>] [max-clients <n>] "
-		"[keepalive-ping <sec>] [keepalive-timeout <sec>] "
-		"[handshake-timeout <sec>] [tls-timeout <sec>] "
+		"[dev-type tun|tap] [tun-mtu <size>] "
+		"[ca <path>] [cert <path>] [key <path>] "
+		"[dh <path>] [cipher <name>] [auth <name>] "
+		"[tls-crypt <path>] [tls-crypt-v2 <path>] [tls-auth <path>] "
+		"[server <ip>/<len>] "
+		"[ifconfig-pool <start-ip> <end-ip>] [max-clients <n>] "
+		"[keepalive <ping> <timeout>] "
+		"[hand-window <sec>] [tls-timeout <sec>] "
 		"[reneg-sec <sec>] [reneg-bytes <n>] [reneg-pkts <n>] "
-		"[replay-protection <0|1>] [replay-window <n>] "
-		"[replay-time <sec>] [transition-window <sec>]",
+		"[replay-window <n> [<t>]] [transition-window <sec>]",
   .function = ovpn_enable_command_fn,
 };
 
@@ -931,6 +975,31 @@ ovpn_periodic_process (vlib_main_t *vm, vlib_node_runtime_t *rt,
 
       /* Cleanup expired keys (lame duck keys after transition window) */
       ovpn_peer_db_cleanup_expired_keys (vm, &omp->multi_context.peer_db, now);
+
+      /*
+       * Apply pending address updates (NAT/float support).
+       * Data plane queues updates, we apply them here with barrier.
+       */
+      {
+	int n_updates = 0;
+	ovpn_peer_t *peer;
+
+	/* First pass: check if any updates pending */
+	pool_foreach (peer, omp->multi_context.peer_db.peers)
+	  {
+	    if (__atomic_load_n (&peer->pending_addr_update, __ATOMIC_ACQUIRE))
+	      n_updates++;
+	  }
+
+	/* Only take barrier if updates are pending */
+	if (n_updates > 0)
+	  {
+	    vlib_worker_thread_barrier_sync (vm);
+	    ovpn_peer_db_apply_pending_updates (vm,
+						&omp->multi_context.peer_db);
+	    vlib_worker_thread_barrier_release (vm);
+	  }
+      }
 
       /* Get keepalive settings */
       f64 ping_interval = omp->options.keepalive_ping > 0 ?

@@ -54,11 +54,18 @@ add_vpp_plugin(ovpn
   ovpn_output.c
 )
 
-# Unit test plugin
+# Unit test plugin - includes source files needed for testing
 add_vpp_plugin(ovpn_unittest
   SOURCES
   test/ovpn_reliable_test.c
   test/ovpn_ssl_test.c
+  test/ovpn_buffer_test.c
+  test/ovpn_handshake_test.c
+  ovpn_reliable.c
+  ovpn_ssl.c
+  ovpn_crypto.c
+  ovpn_handshake.c
+  ovpn_peer.c
 
   LINK_LIBRARIES ${PICOTLS_LINK_LIBRARIES} ${OPENSSL_LIBRARIES}
 )

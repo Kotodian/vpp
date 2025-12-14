@@ -504,6 +504,91 @@ ovpn_test_key_method_buffer_boundaries (vlib_main_t *vm)
 }
 
 /*
+ * Test replay protection with configurable window sizes
+ */
+static int
+ovpn_test_replay_protection (vlib_main_t *vm)
+{
+  ovpn_crypto_context_t ctx;
+  ovpn_key_material_t keys;
+  int rv;
+
+  vlib_cli_output (vm, "=== Test Replay Protection ===\n");
+
+  /* Initialize test key material */
+  clib_memset (&keys, 0x42, sizeof (keys));
+  keys.key_len = OVPN_KEY_SIZE_256;
+
+  /* Test with default window (64) */
+  rv = ovpn_crypto_context_init (&ctx, OVPN_CIPHER_ALG_AES_256_GCM, &keys, 0);
+  OVPN_TEST (rv == 0, "Context init with default window should succeed");
+  OVPN_TEST (ctx.replay_window_size == OVPN_REPLAY_WINDOW_SIZE_DEFAULT,
+	     "Default window should be %d", OVPN_REPLAY_WINDOW_SIZE_DEFAULT);
+  OVPN_TEST (ctx.replay_bitmap_ext == NULL,
+	     "Extended bitmap should be NULL for small window");
+
+  /* Test replay detection */
+  OVPN_TEST (ovpn_crypto_check_replay (&ctx, 0) == 0,
+	     "packet_id 0 should be rejected");
+  OVPN_TEST (ovpn_crypto_check_replay (&ctx, 1) == 1,
+	     "packet_id 1 should be accepted");
+  ovpn_crypto_update_replay (&ctx, 1);
+  OVPN_TEST (ovpn_crypto_check_replay (&ctx, 1) == 0,
+	     "packet_id 1 should be rejected after seen");
+  OVPN_TEST (ovpn_crypto_check_replay (&ctx, 2) == 1,
+	     "packet_id 2 should be accepted");
+
+  /* Test out-of-order packets within window */
+  ovpn_crypto_update_replay (&ctx, 50);
+  OVPN_TEST (ovpn_crypto_check_replay (&ctx, 30) == 1,
+	     "packet_id 30 should be accepted (within window)");
+  ovpn_crypto_update_replay (&ctx, 30);
+  OVPN_TEST (ovpn_crypto_check_replay (&ctx, 30) == 0,
+	     "packet_id 30 should be rejected after seen");
+
+  ovpn_crypto_context_free (&ctx);
+
+  /* Test with larger window (128) */
+  rv = ovpn_crypto_context_init (&ctx, OVPN_CIPHER_ALG_AES_256_GCM, &keys, 128);
+  OVPN_TEST (rv == 0, "Context init with 128 window should succeed");
+  OVPN_TEST (ctx.replay_window_size == 128, "Window should be 128");
+  OVPN_TEST (ctx.replay_bitmap_ext != NULL,
+	     "Extended bitmap should be allocated for larger window");
+  OVPN_TEST (vec_len (ctx.replay_bitmap_ext) == 2,
+	     "Extended bitmap should have 2 words for 128-bit window");
+
+  /* Test replay with larger window */
+  OVPN_TEST (ovpn_crypto_check_replay (&ctx, 1) == 1,
+	     "packet_id 1 should be accepted");
+  ovpn_crypto_update_replay (&ctx, 100);
+  OVPN_TEST (ovpn_crypto_check_replay (&ctx, 50) == 1,
+	     "packet_id 50 should be accepted (within 128 window)");
+  ovpn_crypto_update_replay (&ctx, 50);
+  OVPN_TEST (ovpn_crypto_check_replay (&ctx, 50) == 0,
+	     "packet_id 50 should be rejected after seen");
+
+  ovpn_crypto_context_free (&ctx);
+
+  /* Test window clamping */
+  rv = ovpn_crypto_context_init (&ctx, OVPN_CIPHER_ALG_AES_256_GCM, &keys, 32);
+  OVPN_TEST (rv == 0, "Context init with small window should succeed");
+  OVPN_TEST (ctx.replay_window_size == OVPN_REPLAY_WINDOW_SIZE_MIN,
+	     "Window should be clamped to minimum");
+  ovpn_crypto_context_free (&ctx);
+
+  /* Test maximum window clamping */
+  rv = ovpn_crypto_context_init (&ctx, OVPN_CIPHER_ALG_AES_256_GCM, &keys,
+				 100000);
+  OVPN_TEST (rv == 0, "Context init with huge window should succeed");
+  OVPN_TEST (ctx.replay_window_size <= OVPN_REPLAY_WINDOW_SIZE_MAX,
+	     "Window should be clamped to maximum");
+  ovpn_crypto_context_free (&ctx);
+
+  vlib_cli_output (vm, "Replay protection test PASSED\n");
+  return 0;
+}
+
+/*
  * Test key method read with invalid data
  */
 static int
@@ -564,6 +649,7 @@ ovpn_ssl_test_all (vlib_main_t *vm)
   rv |= ovpn_test_derive_data_channel_keys (vm);
   rv |= ovpn_test_key_method_buffer_boundaries (vm);
   rv |= ovpn_test_key_method_read_invalid (vm);
+  rv |= ovpn_test_replay_protection (vm);
 
   vlib_cli_output (vm, "\n========================================\n");
   if (rv == 0)

@@ -38,6 +38,9 @@ typedef enum
   OVPN_PENDING_STATE_ESTABLISHED, /* Received ACK, ready for TLS */
 } ovpn_pending_state_t;
 
+/* Forward declaration for TLS-Crypt context (defined below) */
+typedef struct ovpn_tls_crypt_t_ ovpn_tls_crypt_t;
+
 typedef struct ovpn_pending_connection_t_
 {
   /* State */
@@ -72,6 +75,16 @@ typedef struct ovpn_pending_connection_t_
 
   /* Reliable send structure for retransmission */
   ovpn_reliable_t *send_reliable;
+
+  /*
+   * Per-client TLS-Crypt context for TLS-Crypt-V2
+   * When client uses tls-crypt-v2, we unwrap their key and store it here
+   * This overrides the global tls_crypt context for this connection
+   */
+  ovpn_tls_crypt_t *client_tls_crypt;
+
+  /* Flag indicating this is a tls-crypt-v2 connection */
+  u8 is_tls_crypt_v2;
 
 } ovpn_pending_connection_t;
 
@@ -116,6 +129,10 @@ typedef struct ovpn_tls_auth_t_
   u64 replay_bitmap;
   u32 replay_packet_id_floor;
 
+  /* Time-based replay protection (control channel uses long-form packet_id) */
+  u32 replay_time_floor; /* Oldest acceptable timestamp (unix seconds) */
+  u32 time_backtrack;	 /* Max seconds a packet can be older than latest */
+
   /* Packet ID for outgoing packets */
   u32 packet_id_send;
 } ovpn_tls_auth_t;
@@ -131,24 +148,54 @@ typedef CLIB_PACKED (struct {
 }) ovpn_tls_auth_header_t;
 
 /*
- * Check replay for TLS-Auth wrapper packet_id
+ * Check replay for TLS-Auth wrapper packet_id with time validation
+ *
+ * Control channel uses long-form packet_id (packet_id + net_time).
+ * Both sequence number and timestamp are validated for replay protection.
+ *
+ * @param ctx       TLS-Auth context
+ * @param packet_id Packet sequence number from wrapper
+ * @param net_time  Timestamp from wrapper (unix seconds, network byte order converted)
+ * @param now       Current time (unix seconds)
+ * @return 1 if packet is valid, 0 if replay/invalid
  */
 always_inline int
-ovpn_tls_auth_check_replay (const ovpn_tls_auth_t *ctx, u32 packet_id)
+ovpn_tls_auth_check_replay (const ovpn_tls_auth_t *ctx, u32 packet_id,
+			    u32 net_time, u32 now)
 {
   u32 diff;
 
+  /* packet_id 0 is never valid */
   if (packet_id == 0)
     return 0;
 
+  /* Check timestamp if time_backtrack is enabled (non-zero) */
+  if (ctx->time_backtrack > 0)
+    {
+      /* Reject if timestamp is too old */
+      if (net_time < ctx->replay_time_floor)
+	return 0;
+
+      /* Reject if timestamp is too far in the past relative to now */
+      if (now > net_time && (now - net_time) > ctx->time_backtrack)
+	return 0;
+
+      /* Reject if timestamp is too far in the future (clock skew protection) */
+      if (net_time > now && (net_time - now) > ctx->time_backtrack)
+	return 0;
+    }
+
+  /* Check packet_id against sliding window */
   if (packet_id < ctx->replay_packet_id_floor)
     return 0;
 
   diff = packet_id - ctx->replay_packet_id_floor;
 
+  /* Ahead of window - OK */
   if (diff >= OVPN_CONTROL_REPLAY_WINDOW_SIZE)
     return 1;
 
+  /* Check if already seen in bitmap */
   if (ctx->replay_bitmap & (1ULL << diff))
     return 0;
 
@@ -157,9 +204,13 @@ ovpn_tls_auth_check_replay (const ovpn_tls_auth_t *ctx, u32 packet_id)
 
 /*
  * Update replay window for TLS-Auth
+ *
+ * @param ctx       TLS-Auth context
+ * @param packet_id Packet sequence number
+ * @param net_time  Timestamp from packet (unix seconds)
  */
 always_inline void
-ovpn_tls_auth_update_replay (ovpn_tls_auth_t *ctx, u32 packet_id)
+ovpn_tls_auth_update_replay (ovpn_tls_auth_t *ctx, u32 packet_id, u32 net_time)
 {
   u32 diff;
 
@@ -180,34 +231,43 @@ ovpn_tls_auth_update_replay (ovpn_tls_auth_t *ctx, u32 packet_id)
     }
 
   ctx->replay_bitmap |= (1ULL << diff);
+
+  /* Update time floor if this timestamp is newer */
+  if (ctx->time_backtrack > 0 && net_time > ctx->replay_time_floor)
+    ctx->replay_time_floor = net_time - ctx->time_backtrack;
 }
 
 /*
  * TLS-Crypt context
  *
  * TLS-Crypt provides both authentication and encryption of control channel
- * packets. It uses a pre-shared key (2048 bits total) that contains:
- *   - 256 bits: HMAC key for server->client direction
- *   - 256 bits: HMAC key for client->server direction
- *   - 256 bits: AES-256-CTR key for server->client direction
- *   - 256 bits: AES-256-CTR key for client->server direction
+ * packets. OpenVPN static key files are 2048 bits (256 bytes) total, but
+ * TLS-Crypt only uses the first 1024 bits (128 bytes) organized as:
+ *   - 256 bits (32 bytes): HMAC key for client->server direction
+ *   - 256 bits (32 bytes): AES-256-CTR key for client->server direction
+ *   - 256 bits (32 bytes): HMAC key for server->client direction
+ *   - 256 bits (32 bytes): AES-256-CTR key for server->client direction
+ *
+ * The remaining 128 bytes of the static key file are unused by TLS-Crypt.
  *
  * TLS-Crypt packet format (wrapped):
- * +--------+----------+---------+------------------+---------+
- * | opcode | session  | HMAC    |  encrypted       |         |
- * | +keyid |    id    | (256b)  |  payload         |  ...    |
- * +--------+----------+---------+------------------+---------+
- *  1 byte    8 bytes   32 bytes    variable
+ * +--------+----------+---------+----------+------------------+
+ * | opcode | session  | HMAC    | packet_id|  encrypted       |
+ * | +keyid |    id    | (256b)  | +net_time|  payload         |
+ * +--------+----------+---------+----------+------------------+
+ *  1 byte    8 bytes   32 bytes   8 bytes     variable
  *
- * The HMAC is computed over: packet_id || net_time || opcode+keyid || session_id || encrypted_payload
- * The encryption covers: packet_id || net_time || opcode+keyid || session_id || ack_array || packet_id || tls_payload
+ * The HMAC is computed over: packet_id || net_time || opcode+keyid ||
+ *                            session_id || encrypted_payload
+ * The encryption covers the original control packet content after session_id
  *
  * For tls-crypt, the wrapped packet structure is:
- *   [HMAC-256][IV/packet_id][encrypted control packet]
+ *   [opcode+keyid][session_id][HMAC-256][packet_id][net_time][encrypted payload]
  *
- * Where encrypted control packet = AES-256-CTR encrypted original control packet
+ * Where encrypted payload = AES-256-CTR encrypted original control packet
  */
-#define OVPN_TLS_CRYPT_KEY_SIZE	    256 /* Total key file size (2048 bits) */
+#define OVPN_TLS_CRYPT_KEY_FILE_SIZE 256 /* OpenVPN static key file (2048 bits) */
+#define OVPN_TLS_CRYPT_KEY_SIZE	     128 /* Used portion for TLS-Crypt (1024 bits) */
 #define OVPN_TLS_CRYPT_CIPHER_SIZE  32	/* AES-256 key size */
 #define OVPN_TLS_CRYPT_HMAC_SIZE    32	/* SHA-256 HMAC output size */
 #define OVPN_TLS_CRYPT_IV_SIZE	    16	/* AES-256-CTR IV size */
@@ -246,6 +306,10 @@ typedef struct ovpn_tls_crypt_t_
   /* Replay protection for receiving (sliding window) */
   u64 replay_bitmap;
   u32 replay_packet_id_floor;
+
+  /* Time-based replay protection (control channel uses long-form packet_id) */
+  u32 replay_time_floor; /* Oldest acceptable timestamp (unix seconds) */
+  u32 time_backtrack;	 /* Max seconds a packet can be older than latest */
 } ovpn_tls_crypt_t;
 
 /*
@@ -262,6 +326,132 @@ typedef CLIB_PACKED (struct {
 #define OVPN_TLS_CRYPT_OVERHEAD                                               \
   (OVPN_TLS_CRYPT_HMAC_SIZE + OVPN_TLS_CRYPT_PACKET_ID_SIZE +                 \
    OVPN_TLS_CRYPT_NET_TIME_SIZE)
+
+/*
+ * TLS-Crypt-V2 support
+ *
+ * TLS-Crypt-V2 adds client-specific keys. Each client has a unique key (Kc)
+ * that is wrapped with the server's key and sent in P_CONTROL_HARD_RESET_CLIENT_V3.
+ *
+ * Server Key Format (from OpenVPN static key file, 256 bytes total):
+ *   - Ke = first 256 bits of key 1 (AES-256-CTR encryption key)
+ *   - Ka = first 256 bits of key 2 (HMAC-SHA256 authentication key)
+ *
+ * Wrapped Client Key (WKc) Format:
+ *   [Tag (32 bytes)] [Encrypted(Kc || metadata)] [Length (2 bytes)]
+ *
+ * Where:
+ *   - Tag = HMAC-SHA256(Ka, Kc || metadata)
+ *   - IV = first 128 bits (16 bytes) of Tag
+ *   - Encrypted data = AES-256-CTR(Ke, IV, Kc || metadata)
+ *   - Kc = 2048 bits (256 bytes) client key
+ *   - metadata = optional client metadata
+ *   - Length = total length of Tag + Encrypted data (big-endian)
+ *
+ * P_CONTROL_HARD_RESET_CLIENT_V3 packet:
+ *   [tls-crypt wrapped HARD_RESET using Kc] [WKc (cleartext)]
+ *
+ * P_CONTROL_WKC_V1:
+ *   Used to resend WKc in stateless server mode (HMAC cookies)
+ */
+
+/* TLS-Crypt-V2 constants */
+#define OVPN_TLS_CRYPT_V2_CLIENT_KEY_LEN  256 /* 2048 bits */
+#define OVPN_TLS_CRYPT_V2_SERVER_KEY_LEN  256 /* 4 x 512-bit keys */
+#define OVPN_TLS_CRYPT_V2_TAG_SIZE	  32  /* HMAC-SHA256 output */
+#define OVPN_TLS_CRYPT_V2_MAX_WKC_LEN	  1024
+#define OVPN_TLS_CRYPT_V2_MAX_METADATA_LEN                                    \
+  (OVPN_TLS_CRYPT_V2_MAX_WKC_LEN - OVPN_TLS_CRYPT_V2_CLIENT_KEY_LEN -         \
+   OVPN_TLS_CRYPT_V2_TAG_SIZE - 2)
+#define OVPN_TLS_CRYPT_V2_MIN_WKC_LEN                                         \
+  (OVPN_TLS_CRYPT_V2_TAG_SIZE + OVPN_TLS_CRYPT_V2_CLIENT_KEY_LEN + 2)
+
+/*
+ * TLS-Crypt-V2 server key structure
+ * Extracted from OpenVPN static key file (first 64 bytes used)
+ */
+typedef struct ovpn_tls_crypt_v2_server_key_t_
+{
+  u8 encrypt_key[32]; /* Ke: AES-256-CTR key (first 256 bits of key 1) */
+  u8 auth_key[32];    /* Ka: HMAC-SHA256 key (first 256 bits of key 2) */
+} ovpn_tls_crypt_v2_server_key_t;
+
+/*
+ * TLS-Crypt-V2 context for server
+ */
+typedef struct ovpn_tls_crypt_v2_t_
+{
+  u8 enabled;
+  ovpn_tls_crypt_v2_server_key_t server_key;
+} ovpn_tls_crypt_v2_t;
+
+/*
+ * Unwrapped client key result
+ */
+typedef struct ovpn_tls_crypt_v2_client_key_t_
+{
+  u8 key[OVPN_TLS_CRYPT_V2_CLIENT_KEY_LEN]; /* 256-byte client key (Kc) */
+  u8 *metadata;				    /* Optional metadata (allocated) */
+  u32 metadata_len;
+} ovpn_tls_crypt_v2_client_key_t;
+
+/*
+ * Parse TLS-Crypt-V2 server key from raw key data
+ * The key data should be the binary content of an OpenVPN static key file
+ * Returns 0 on success, <0 on error
+ */
+int ovpn_tls_crypt_v2_parse_server_key (const u8 *key_data, u32 key_len,
+					ovpn_tls_crypt_v2_t *ctx);
+
+/*
+ * Unwrap a client key (WKc) using the server key
+ *
+ * @param ctx       TLS-Crypt-V2 context with server key
+ * @param wkc       Wrapped client key blob
+ * @param wkc_len   Length of WKc blob
+ * @param client_key Output: unwrapped client key
+ *
+ * Returns 0 on success, <0 on error:
+ *   -1: Invalid parameters
+ *   -2: WKc too short
+ *   -3: WKc too long
+ *   -4: Authentication failed (HMAC mismatch)
+ *   -5: Decryption failed
+ */
+int ovpn_tls_crypt_v2_unwrap_client_key (const ovpn_tls_crypt_v2_t *ctx,
+					 const u8 *wkc, u32 wkc_len,
+					 ovpn_tls_crypt_v2_client_key_t *client_key);
+
+/*
+ * Free resources in client key structure
+ */
+void ovpn_tls_crypt_v2_client_key_free (ovpn_tls_crypt_v2_client_key_t *client_key);
+
+/*
+ * Convert unwrapped client key to TLS-Crypt context
+ * This creates a per-client TLS-Crypt context from the unwrapped Kc
+ */
+int ovpn_tls_crypt_v2_client_key_to_tls_crypt (
+  const ovpn_tls_crypt_v2_client_key_t *client_key, ovpn_tls_crypt_t *tls_crypt,
+  u8 is_server);
+
+/*
+ * Extract WKc from P_CONTROL_HARD_RESET_CLIENT_V3 packet
+ *
+ * The WKc is appended after the tls-crypt wrapped packet.
+ * Format: [tls-crypt wrapped packet] [WKc]
+ *
+ * @param packet      Full packet data (after opcode byte)
+ * @param packet_len  Total packet length
+ * @param wkc_out     Output: pointer to WKc within packet
+ * @param wkc_len_out Output: length of WKc
+ * @param wrapped_len_out Output: length of tls-crypt wrapped portion
+ *
+ * Returns 0 on success, <0 on error
+ */
+int ovpn_tls_crypt_v2_extract_wkc (const u8 *packet, u32 packet_len,
+				   const u8 **wkc_out, u32 *wkc_len_out,
+				   u32 *wrapped_len_out);
 
 /*
  * Initialize pending connection database
@@ -414,17 +604,42 @@ int ovpn_tls_crypt_unwrap (ovpn_tls_crypt_t *ctx, const u8 *wrapped,
 			   u32 wrapped_len, u8 *plaintext, u32 plaintext_buf_len);
 
 /*
- * Check if a packet_id has been seen (replay detection)
- * Returns: 1 if packet_id is valid (not a replay), 0 if replay detected
+ * Check if a packet_id has been seen (replay detection) with time validation
+ *
+ * Control channel uses long-form packet_id (packet_id + net_time).
+ * Both sequence number and timestamp are validated for replay protection.
+ *
+ * @param ctx       TLS-Crypt context
+ * @param packet_id Packet sequence number from wrapper
+ * @param net_time  Timestamp from wrapper (unix seconds, network byte order converted)
+ * @param now       Current time (unix seconds)
+ * @return 1 if packet is valid, 0 if replay detected
  */
 always_inline int
-ovpn_tls_crypt_check_replay (const ovpn_tls_crypt_t *ctx, u32 packet_id)
+ovpn_tls_crypt_check_replay (const ovpn_tls_crypt_t *ctx, u32 packet_id,
+			     u32 net_time, u32 now)
 {
   u32 diff;
 
   /* packet_id 0 is never valid */
   if (packet_id == 0)
     return 0;
+
+  /* Check timestamp if time_backtrack is enabled (non-zero) */
+  if (ctx->time_backtrack > 0)
+    {
+      /* Reject if timestamp is too old */
+      if (net_time < ctx->replay_time_floor)
+	return 0;
+
+      /* Reject if timestamp is too far in the past relative to now */
+      if (now > net_time && (now - net_time) > ctx->time_backtrack)
+	return 0;
+
+      /* Reject if timestamp is too far in the future (clock skew protection) */
+      if (net_time > now && (net_time - now) > ctx->time_backtrack)
+	return 0;
+    }
 
   /* Too old - before our window */
   if (packet_id < ctx->replay_packet_id_floor)
@@ -445,9 +660,14 @@ ovpn_tls_crypt_check_replay (const ovpn_tls_crypt_t *ctx, u32 packet_id)
 
 /*
  * Update replay window after successful packet verification
+ *
+ * @param ctx       TLS-Crypt context
+ * @param packet_id Packet sequence number
+ * @param net_time  Timestamp from packet (unix seconds)
  */
 always_inline void
-ovpn_tls_crypt_update_replay (ovpn_tls_crypt_t *ctx, u32 packet_id)
+ovpn_tls_crypt_update_replay (ovpn_tls_crypt_t *ctx, u32 packet_id,
+			      u32 net_time)
 {
   u32 diff;
 
@@ -470,6 +690,10 @@ ovpn_tls_crypt_update_replay (ovpn_tls_crypt_t *ctx, u32 packet_id)
 
   /* Mark as seen */
   ctx->replay_bitmap |= (1ULL << diff);
+
+  /* Update time floor if this timestamp is newer */
+  if (ctx->time_backtrack > 0 && net_time > ctx->replay_time_floor)
+    ctx->replay_time_floor = net_time - ctx->time_backtrack;
 }
 
 /*

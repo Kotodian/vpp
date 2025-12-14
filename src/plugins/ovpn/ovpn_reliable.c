@@ -155,10 +155,12 @@ ovpn_reliable_copy_acks_to_mru (ovpn_reliable_ack_t *ack,
 				ovpn_reliable_ack_t *ack_mru, int n)
 {
   ASSERT (ack->len >= n);
+  /* Forward iteration: each new ACK pushes to front (MRU order) */
   for (int i = 0; i < n; i++)
     {
       u32 id = ack->packet_id[i];
 
+      /* Handle special case when ack_mru is empty */
       if (ack_mru->len == 0)
 	{
 	  ack_mru->len = 1;
@@ -166,12 +168,14 @@ ovpn_reliable_copy_acks_to_mru (ovpn_reliable_ack_t *ack,
 	}
 
       u8 idfound = 0;
+
+      /* Move all existing entries one to the right */
       u32 move = id;
 
       for (int j = 0; j < ack_mru->len; j++)
 	{
 	  u32 tmp = ack_mru->packet_id[j];
-	  ack_mru->packet_id[j] = id;
+	  ack_mru->packet_id[j] = move;
 	  move = tmp;
 
 	  if (move == id)
@@ -216,14 +220,14 @@ ovpn_reliable_ack_write (ovpn_reliable_ack_t *ack,
   for (i = 0; i < total_acks; i++)
     {
       u32 pid = ack_mru->packet_id[i];
-      u32 net_pid = clib_host_to_net_u32 (pid);
-      ovpn_buf_write_u32 (&sub, net_pid);
+      /* ovpn_buf_write_u32 already handles host-to-network conversion */
+      ovpn_buf_write_u32 (&sub, pid);
     }
 
   if (total_acks)
     {
       ASSERT (ovpn_session_id_defined (sid));
-      ASSERT (ovpn_session_id_write_prepend (sid, &sub));
+      ASSERT (ovpn_session_id_write (sid, &sub));
     }
 
   if (n)
@@ -505,6 +509,18 @@ ovpn_reliable_schedule_now (vlib_main_t *vm, ovpn_reliable_t *rel)
 	  e->timeout = rel->initial_timeout;
 	}
     }
+}
+
+u8
+ovpn_reliable_empty (ovpn_reliable_t *rel)
+{
+  int i;
+  for (i = 0; i < rel->size; i++)
+    {
+      if (rel->array[i].active)
+	return 0;
+    }
+  return 1;
 }
 
 /* in how many seconds should we wake up to check for timeout */

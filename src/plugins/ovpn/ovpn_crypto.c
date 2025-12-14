@@ -119,7 +119,7 @@ ovpn_crypto_get_dec_op (ovpn_cipher_alg_t alg)
 int
 ovpn_crypto_context_init (ovpn_crypto_context_t *ctx,
 			  ovpn_cipher_alg_t cipher_alg,
-			  const ovpn_key_material_t *keys)
+			  const ovpn_key_material_t *keys, u32 replay_window)
 {
   vnet_crypto_alg_t vnet_alg;
   u8 key_len;
@@ -162,7 +162,29 @@ ovpn_crypto_context_init (ovpn_crypto_context_t *ctx,
   /* Initialize counters */
   ctx->packet_id_send = 1;
   ctx->replay_bitmap = 0;
+  ctx->replay_bitmap_ext = NULL;
   ctx->replay_packet_id_floor = 0;
+
+  /* Configure replay window size */
+  if (replay_window == 0)
+    replay_window = OVPN_REPLAY_WINDOW_SIZE_DEFAULT;
+  else if (replay_window < OVPN_REPLAY_WINDOW_SIZE_MIN)
+    replay_window = OVPN_REPLAY_WINDOW_SIZE_MIN;
+  else if (replay_window > OVPN_REPLAY_WINDOW_SIZE_MAX)
+    replay_window = OVPN_REPLAY_WINDOW_SIZE_MAX;
+
+  /* Round up to multiple of 64 for bitmap alignment */
+  replay_window = (replay_window + 63) & ~63;
+  ctx->replay_window_size = replay_window;
+
+  /* Allocate extended bitmap for windows larger than 64 */
+  if (replay_window > 64)
+    {
+      u32 n_words = replay_window / 64;
+      vec_validate_aligned (ctx->replay_bitmap_ext, n_words - 1,
+			    CLIB_CACHE_LINE_BYTES);
+      clib_memset (ctx->replay_bitmap_ext, 0, n_words * sizeof (u64));
+    }
 
   ctx->is_valid = 1;
 
@@ -177,6 +199,10 @@ ovpn_crypto_context_free (ovpn_crypto_context_t *ctx)
 
   vnet_crypto_key_del (vlib_get_main (), ctx->encrypt_key_index);
   vnet_crypto_key_del (vlib_get_main (), ctx->decrypt_key_index);
+
+  /* Free extended replay bitmap if allocated */
+  if (ctx->replay_bitmap_ext)
+    vec_free (ctx->replay_bitmap_ext);
 
   clib_memset (ctx, 0, sizeof (*ctx));
 }
@@ -203,13 +229,68 @@ ovpn_crypto_set_static_key (ovpn_crypto_context_t *ctx,
 			OVPN_IMPLICIT_IV_LEN);
     }
 
-  return ovpn_crypto_context_init (ctx, cipher_alg, &keys);
+  return ovpn_crypto_context_init (ctx, cipher_alg, &keys,
+				   0 /* use default replay window */);
+}
+
+/*
+ * Helper: Check bit in extended bitmap
+ */
+static_always_inline int
+ovpn_replay_bitmap_ext_check (const u64 *bitmap, u32 bit_pos)
+{
+  u32 word_idx = bit_pos / 64;
+  u32 bit_idx = bit_pos % 64;
+  return (bitmap[word_idx] & (1ULL << bit_idx)) != 0;
+}
+
+/*
+ * Helper: Set bit in extended bitmap
+ */
+static_always_inline void
+ovpn_replay_bitmap_ext_set (u64 *bitmap, u32 bit_pos)
+{
+  u32 word_idx = bit_pos / 64;
+  u32 bit_idx = bit_pos % 64;
+  bitmap[word_idx] |= (1ULL << bit_idx);
+}
+
+/*
+ * Helper: Shift extended bitmap right by n bits
+ */
+static_always_inline void
+ovpn_replay_bitmap_ext_shift (u64 *bitmap, u32 n_words, u32 shift)
+{
+  if (shift >= n_words * 64)
+    {
+      clib_memset (bitmap, 0, n_words * sizeof (u64));
+      return;
+    }
+
+  u32 word_shift = shift / 64;
+  u32 bit_shift = shift % 64;
+
+  if (word_shift > 0)
+    {
+      for (u32 i = 0; i < n_words - word_shift; i++)
+	bitmap[i] = bitmap[i + word_shift];
+      for (u32 i = n_words - word_shift; i < n_words; i++)
+	bitmap[i] = 0;
+    }
+
+  if (bit_shift > 0)
+    {
+      for (u32 i = 0; i < n_words - 1; i++)
+	bitmap[i] = (bitmap[i] >> bit_shift) | (bitmap[i + 1] << (64 - bit_shift));
+      bitmap[n_words - 1] >>= bit_shift;
+    }
 }
 
 int
 ovpn_crypto_check_replay (ovpn_crypto_context_t *ctx, u32 packet_id)
 {
   u32 diff;
+  u32 window_size = ctx->replay_window_size;
 
   if (packet_id == 0)
     return 0; /* packet_id 0 is never valid */
@@ -219,12 +300,20 @@ ovpn_crypto_check_replay (ovpn_crypto_context_t *ctx, u32 packet_id)
 
   diff = packet_id - ctx->replay_packet_id_floor;
 
-  if (diff >= OVPN_REPLAY_WINDOW_SIZE)
+  if (diff >= window_size)
     return 1; /* Ahead of window, OK */
 
-  /* Check bitmap */
-  if (ctx->replay_bitmap & (1ULL << diff))
-    return 0; /* Already seen */
+  /* Check bitmap - use fast path for small windows */
+  if (window_size <= 64)
+    {
+      if (ctx->replay_bitmap & (1ULL << diff))
+	return 0; /* Already seen */
+    }
+  else
+    {
+      if (ovpn_replay_bitmap_ext_check (ctx->replay_bitmap_ext, diff))
+	return 0; /* Already seen */
+    }
 
   return 1;
 }
@@ -233,26 +322,40 @@ void
 ovpn_crypto_update_replay (ovpn_crypto_context_t *ctx, u32 packet_id)
 {
   u32 diff;
+  u32 window_size = ctx->replay_window_size;
 
   if (packet_id < ctx->replay_packet_id_floor)
     return;
 
   diff = packet_id - ctx->replay_packet_id_floor;
 
-  if (diff >= OVPN_REPLAY_WINDOW_SIZE)
+  if (diff >= window_size)
     {
       /* Advance window */
-      u32 shift = diff - OVPN_REPLAY_WINDOW_SIZE + 1;
-      if (shift >= 64)
-	ctx->replay_bitmap = 0;
+      u32 shift = diff - window_size + 1;
+
+      if (window_size <= 64)
+	{
+	  if (shift >= 64)
+	    ctx->replay_bitmap = 0;
+	  else
+	    ctx->replay_bitmap >>= shift;
+	}
       else
-	ctx->replay_bitmap >>= shift;
+	{
+	  u32 n_words = window_size / 64;
+	  ovpn_replay_bitmap_ext_shift (ctx->replay_bitmap_ext, n_words, shift);
+	}
+
       ctx->replay_packet_id_floor += shift;
       diff = packet_id - ctx->replay_packet_id_floor;
     }
 
   /* Mark as seen */
-  ctx->replay_bitmap |= (1ULL << diff);
+  if (window_size <= 64)
+    ctx->replay_bitmap |= (1ULL << diff);
+  else
+    ovpn_replay_bitmap_ext_set (ctx->replay_bitmap_ext, diff);
 }
 
 /*

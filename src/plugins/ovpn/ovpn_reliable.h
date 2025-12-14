@@ -51,9 +51,9 @@ typedef struct ovpn_reliable_ack_t_
   u32 packet_id[OVPN_RELIABLE_ACK_SIZE];
 } ovpn_reliable_ack_t;
 
-/* The size of the ACK header */
+/* The size of the ACK header: 1 byte count + session ID (if n>0) + packet IDs */
 #define OVPN_ACK_SIZE(n)                                                      \
-  (sizeof (u8) * ((n) ? OVPN_SID_SIZE : 0) + sizeof (u32) * (n))
+  (sizeof (u8) + ((n) ? OVPN_SID_SIZE : 0) + sizeof (u32) * (n))
 
 typedef struct ovpn_reliable_entry_t_
 {

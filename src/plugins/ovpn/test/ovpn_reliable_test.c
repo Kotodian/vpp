@@ -142,7 +142,11 @@ ovpn_test_ack_parse_write (vlib_main_t *vm)
   OVPN_TEST (rv == 0, "ACK write should succeed");
 
   /* Prepare buffer for reading */
-  ovpn_buf_set_read (&buf, OVPN_BPTR (pbuf), OVPN_BLEN (pbuf));
+  clib_memset (&buf, 0, sizeof (buf));
+  buf.data = OVPN_BPTR (pbuf);
+  buf.offset = 0;
+  buf.len = OVPN_BLEN (pbuf);
+  buf.capacity = OVPN_BLEN (pbuf);
 
   /* Parse ACKs from buffer */
   rv = ovpn_reliable_ack_parse (&buf, &ack_read, &sid_read);
@@ -153,10 +157,12 @@ ovpn_test_ack_parse_write (vlib_main_t *vm)
   OVPN_TEST (ovpn_session_id_equal (&sid, &sid_read),
 	     "Session IDs should match");
 
-  /* Verify packet IDs */
-  OVPN_TEST (ack_read.packet_id[0] == 10, "First ACK should be 10");
+  /* Verify packet IDs - MRU order (most recently added first) */
+  vlib_cli_output (vm, "ACKs read: %u, %u, %u\n", ack_read.packet_id[0],
+		   ack_read.packet_id[1], ack_read.packet_id[2]);
+  OVPN_TEST (ack_read.packet_id[0] == 12, "First ACK should be 12 (MRU)");
   OVPN_TEST (ack_read.packet_id[1] == 11, "Second ACK should be 11");
-  OVPN_TEST (ack_read.packet_id[2] == 12, "Third ACK should be 12");
+  OVPN_TEST (ack_read.packet_id[2] == 10, "Third ACK should be 10");
 
   /* Free buffer */
   ovpn_buf_free (pbuf);

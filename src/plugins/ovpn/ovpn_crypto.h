@@ -44,8 +44,10 @@ typedef enum
 /* Tag size for AEAD */
 #define OVPN_TAG_SIZE 16
 
-/* Replay protection window */
-#define OVPN_REPLAY_WINDOW_SIZE 64
+/* Replay protection window constants */
+#define OVPN_REPLAY_WINDOW_SIZE_DEFAULT 64
+#define OVPN_REPLAY_WINDOW_SIZE_MIN	64
+#define OVPN_REPLAY_WINDOW_SIZE_MAX	65536
 
 /*
  * Crypto key material derived from TLS handshake
@@ -82,9 +84,14 @@ typedef struct ovpn_crypto_context_t_
   /* Packet ID for replay protection */
   u32 packet_id_send;
 
-  /* Replay window for received packets */
+  /* Replay window for received packets
+   * For window_size <= 64: use replay_bitmap directly
+   * For window_size > 64: use replay_bitmap_ext (dynamically allocated)
+   */
   u64 replay_bitmap;
+  u64 *replay_bitmap_ext; /* Extended bitmap for larger windows */
   u32 replay_packet_id_floor;
+  u32 replay_window_size; /* Configured window size (64-65536) */
 
   /* Key is valid and ready for use */
   u8 is_valid;
@@ -121,10 +128,15 @@ clib_error_t *ovpn_crypto_init (vlib_main_t *vm);
 
 /*
  * Create crypto context from key material
+ * @param ctx           Crypto context to initialize
+ * @param cipher_alg    Cipher algorithm to use
+ * @param keys          Key material from TLS handshake
+ * @param replay_window Replay protection window size (64-65536, 0 for default)
  */
 int ovpn_crypto_context_init (ovpn_crypto_context_t *ctx,
 			      ovpn_cipher_alg_t cipher_alg,
-			      const ovpn_key_material_t *keys);
+			      const ovpn_key_material_t *keys,
+			      u32 replay_window);
 
 /*
  * Destroy crypto context

@@ -218,6 +218,15 @@ typedef struct ovpn_peer_t_
   /* Thread index for input processing (first thread that sees this peer) */
   u32 input_thread_index;
 
+  /*
+   * NAT/Float support: pending address update
+   * Data plane sets these when it detects address change after successful decrypt.
+   * Control plane applies the update with worker barrier.
+   */
+  volatile u8 pending_addr_update;
+  ip_address_t pending_remote_addr;
+  u16 pending_remote_port;
+
 } ovpn_peer_t;
 
 /*
@@ -264,6 +273,14 @@ typedef struct ovpn_peer_db_t_
    * Provides lock-free concurrent access for data plane crypto lookups.
    */
   clib_bihash_8_8_t key_hash;
+
+  /*
+   * Bihash for lock-free lookup by session ID.
+   * Key: 8-byte session ID
+   * Value: peer_id
+   * Used for NAT/float support when address lookup fails.
+   */
+  clib_bihash_8_8_t session_hash;
 
   /* Next peer_id to allocate */
   u32 next_peer_id;
@@ -423,11 +440,50 @@ ovpn_peer_t *ovpn_peer_lookup_by_virtual_ip (ovpn_peer_db_t *db,
 					     const ip_address_t *addr);
 
 /*
+ * Lookup peer by session ID (for NAT/float support)
+ * Used when address-based lookup fails due to NAT rebinding
+ */
+ovpn_peer_t *ovpn_peer_lookup_by_session_id (ovpn_peer_db_t *db,
+					     const ovpn_session_id_t *session_id);
+
+/*
+ * Update peer remote address (NAT/float support)
+ * Called when peer's source address changes after successful authentication.
+ * MUST be called with worker barrier held.
+ * Returns 0 on success, <0 on error.
+ */
+int ovpn_peer_update_remote (ovpn_peer_db_t *db, ovpn_peer_t *peer,
+			     const ip_address_t *new_addr, u16 new_port);
+
+/*
+ * Queue a pending address update for a peer
+ * Called from data plane when address change is detected after decrypt.
+ * The update is applied later by control plane with barrier.
+ */
+void ovpn_peer_queue_address_update (ovpn_peer_t *peer,
+				     const ip_address_t *new_addr,
+				     u16 new_port);
+
+/*
+ * Apply pending address updates for all peers
+ * Called from control plane timer with worker barrier held.
+ * Returns number of peers updated.
+ */
+int ovpn_peer_db_apply_pending_updates (vlib_main_t *vm, ovpn_peer_db_t *db);
+
+/*
+ * Add peer to session ID hash (called after session ID is set)
+ */
+void ovpn_peer_add_to_session_hash (ovpn_peer_db_t *db, ovpn_peer_t *peer);
+
+/*
  * Set peer crypto key (updates bihash for lock-free lookup)
+ * @param replay_window Replay protection window size (0 for default)
  */
 int ovpn_peer_set_key (vlib_main_t *vm, ovpn_peer_db_t *db, ovpn_peer_t *peer,
 		       u8 key_slot, ovpn_cipher_alg_t cipher_alg,
-		       const ovpn_key_material_t *keys, u8 key_id);
+		       const ovpn_key_material_t *keys, u8 key_id,
+		       u32 replay_window);
 
 /*
  * Get active crypto context for peer

@@ -68,6 +68,9 @@ int ovpn_if_delete (vlib_main_t *vm, u32 sw_if_index);
 int ovpn_if_set_local_addr (u32 sw_if_index, ip_address_t *addr);
 int ovpn_if_set_remote_addr (u32 sw_if_index, ip_address_t *addr);
 
+/* Lookup functions */
+ovpn_if_t *ovpn_if_get_from_sw_if_index (u32 sw_if_index);
+
 /* Format functions */
 format_function_t format_ovpn_if_name;
 format_function_t format_ovpn_if;

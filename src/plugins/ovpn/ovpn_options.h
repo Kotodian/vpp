@@ -71,6 +71,7 @@ typedef struct ovpn_options_t_
 
   /* Optional*/
   u8 *tls_crypt_key;
+  u8 *tls_crypt_v2_key;  /* TLS-Crypt-V2 server key */
   u8 *tls_auth_key;
 } ovpn_options_t;
 

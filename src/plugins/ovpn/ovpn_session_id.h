@@ -45,7 +45,7 @@ ovpn_session_id_defined (const ovpn_session_id_t *sid1)
 always_inline u8
 ovpn_session_id_read (ovpn_session_id_t *sid, ovpn_reli_buffer_t *buf)
 {
-  return ovpn_buf_read (buf, sid->id, OVPN_SID_SIZE) == OVPN_SID_SIZE;
+  return ovpn_buf_read (buf, sid->id, OVPN_SID_SIZE);
 }
 
 always_inline u8

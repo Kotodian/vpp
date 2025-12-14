@@ -107,6 +107,9 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
   u32 packet_ids[VLIB_FRAME_SIZE];
   ovpn_crypto_context_t *crypto_contexts[VLIB_FRAME_SIZE];
   ovpn_peer_t *peers[VLIB_FRAME_SIZE];
+  /* NAT/float: track remote addresses for address change detection */
+  ip_address_t remote_addrs[VLIB_FRAME_SIZE];
+  u16 remote_ports[VLIB_FRAME_SIZE];
   u32 decrypt_count = 0;
 
   from = vlib_frame_vector_args (frame);
@@ -177,6 +180,38 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
 	      ovpn_data_v2_header_t *hdr = (ovpn_data_v2_header_t *) data;
 	      peer_id = ovpn_data_v2_get_peer_id (hdr);
+
+	      /*
+	       * NAT/float: Extract remote address for address change detection.
+	       * This is done even for DATA_V2 to support NAT rebinding.
+	       */
+	      u32 ip_offset = vnet_buffer (b0)->ip.save_rewrite_length;
+	      if (ip_offset > 0 && ip_offset < b0->current_data)
+		{
+		  u8 *ip_hdr = vlib_buffer_get_current (b0) -
+			       (b0->current_data - ip_offset);
+		  u8 version = (ip_hdr[0] >> 4) & 0xf;
+		  u32 buf_idx = b - bufs;
+
+		  if (version == 4)
+		    {
+		      ip4_header_t *ip4 = (ip4_header_t *) ip_hdr;
+		      udp_header_t *udp = (udp_header_t *) (ip4 + 1);
+		      ip_address_set (&remote_addrs[buf_idx], &ip4->src_address,
+				      AF_IP4);
+		      remote_ports[buf_idx] =
+			clib_net_to_host_u16 (udp->src_port);
+		    }
+		  else if (version == 6)
+		    {
+		      ip6_header_t *ip6 = (ip6_header_t *) ip_hdr;
+		      udp_header_t *udp = (udp_header_t *) (ip6 + 1);
+		      ip_address_set (&remote_addrs[buf_idx], &ip6->src_address,
+				      AF_IP6);
+		      remote_ports[buf_idx] =
+			clib_net_to_host_u16 (udp->src_port);
+		    }
+		}
 	    }
 	  else
 	    {
@@ -192,8 +227,9 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	       * The buffer was advanced past UDP, use saved offset to find IP.
 	       */
 	      ip_address_t remote_addr;
-	      u16 remote_port;
+	      u16 remote_port = 0;
 	      u32 ip_offset = vnet_buffer (b0)->ip.save_rewrite_length;
+	      u32 buf_idx = b - bufs;
 
 	      if (ip_offset > 0 && ip_offset < b0->current_data)
 		{
@@ -220,6 +256,10 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		      error = OVPN_INPUT_ERROR_PEER_NOT_FOUND;
 		      goto trace;
 		    }
+
+		  /* Store remote address for NAT/float detection */
+		  ip_address_copy (&remote_addrs[buf_idx], &remote_addr);
+		  remote_ports[buf_idx] = remote_port;
 
 		  /* Lookup peer by remote endpoint */
 		  peer = ovpn_peer_lookup_by_remote (
@@ -386,6 +426,18 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
 	  /* Update replay window */
 	  ovpn_crypto_update_replay (crypto, packet_id);
+
+	  /*
+	   * NAT/float: Check if remote address changed.
+	   * Only queue update after successful decrypt (authentication).
+	   */
+	  if (ip_address_cmp (&peer->remote_addr, &remote_addrs[i]) != 0 ||
+	      peer->remote_port != remote_ports[i])
+	    {
+	      /* Queue address update - will be applied by control plane */
+	      ovpn_peer_queue_address_update (peer, &remote_addrs[i],
+					      remote_ports[i]);
+	    }
 
 	  /* Find last buffer in chain */
 	  lb = b0;
