@@ -95,12 +95,29 @@ typedef struct ovpn_key2_t_
 /**
  * Allocate a new key source structure
  * @return The pointer to the new key source structure
+ * @note The returned pointer may become invalid if another allocation
+ *       causes pool reallocation. Use ovpn_key_source2_get() with the
+ *       stored index to get a fresh pointer when needed.
  */
 ovpn_key_source2_t *ovpn_key_source2_alloc (void);
 
 /**
+ * Get a key source structure by index
+ * @param index The pool index of the key source
+ * @return The pointer to the key source structure
+ */
+ovpn_key_source2_t *ovpn_key_source2_get (u32 index);
+
+/**
+ * Free a key source structure by index
+ * @param index The pool index of the key source to free
+ */
+void ovpn_key_source2_free_index (u32 index);
+
+/**
  * Free a key source structure
  * @param key_src2 The pointer to the key source structure to free
+ * @note Prefer ovpn_key_source2_free_index() when the pointer may be stale
  */
 void ovpn_key_source2_free (ovpn_key_source2_t *key_src2);
 

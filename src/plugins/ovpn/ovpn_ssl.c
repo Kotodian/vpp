@@ -50,6 +50,20 @@ ovpn_key_source2_alloc (void)
   return key_src2;
 }
 
+ovpn_key_source2_t *
+ovpn_key_source2_get (u32 index)
+{
+  return pool_elt_at_index (ovpn_key_source2s, index);
+}
+
+void
+ovpn_key_source2_free_index (u32 index)
+{
+  ovpn_key_source2_t *key_src2 = pool_elt_at_index (ovpn_key_source2s, index);
+  ovpn_secure_zero_memory (key_src2, sizeof (ovpn_key_source2_t));
+  pool_put_index (ovpn_key_source2s, index);
+}
+
 void
 ovpn_key_source2_free (ovpn_key_source2_t *key_src2)
 {

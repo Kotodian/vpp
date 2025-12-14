@@ -228,12 +228,18 @@ ovpn_test_key_method_2_roundtrip (vlib_main_t *vm)
   u8 client_buf[512], server_buf[512];
   char *options_out = NULL;
   int client_len, server_len, rv;
+  u32 client_idx, server_idx;
 
   vlib_cli_output (vm, "=== Test Key Method 2 Round-trip ===\n");
 
-  /* Allocate key sources */
+  /* Allocate key sources - save indices immediately as pool may reallocate */
   ks2_client = ovpn_key_source2_alloc ();
+  client_idx = ks2_client->index;
   ks2_server = ovpn_key_source2_alloc ();
+  server_idx = ks2_server->index;
+
+  /* Refresh client pointer in case pool was reallocated during server alloc */
+  ks2_client = ovpn_key_source2_get (client_idx);
   OVPN_TEST (ks2_client != NULL && ks2_server != NULL,
 	     "Key source allocation should succeed");
 
@@ -307,9 +313,9 @@ ovpn_test_key_method_2_roundtrip (vlib_main_t *vm)
   if (options_out)
     clib_mem_free (options_out);
 
-  /* Clean up */
-  ovpn_key_source2_free (ks2_client);
-  ovpn_key_source2_free (ks2_server);
+  /* Clean up using index-based free to avoid stale pointer issues */
+  ovpn_key_source2_free_index (client_idx);
+  ovpn_key_source2_free_index (server_idx);
 
   vlib_cli_output (vm, "Key Method 2 round-trip test PASSED\n");
   return 0;
