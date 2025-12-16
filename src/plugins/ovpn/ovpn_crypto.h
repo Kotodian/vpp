@@ -29,20 +29,36 @@ typedef enum
   OVPN_CIPHER_ALG_AES_128_GCM,
   OVPN_CIPHER_ALG_AES_256_GCM,
   OVPN_CIPHER_ALG_CHACHA20_POLY1305,
+  /* CBC ciphers (for static key mode) */
+  OVPN_CIPHER_ALG_AES_256_CBC,
 } ovpn_cipher_alg_t;
 
+/* Check if cipher is AEAD */
+#define OVPN_CIPHER_IS_AEAD(alg)                                              \
+  ((alg) == OVPN_CIPHER_ALG_AES_128_GCM ||                                    \
+   (alg) == OVPN_CIPHER_ALG_AES_256_GCM ||                                    \
+   (alg) == OVPN_CIPHER_ALG_CHACHA20_POLY1305)
+
 /* Key sizes in bytes */
-#define OVPN_KEY_SIZE_128 16
-#define OVPN_KEY_SIZE_256 32
-#define OVPN_KEY_SIZE_MAX 32
+#define OVPN_KEY_SIZE_128	  16
+#define OVPN_KEY_SIZE_256	  32
+#define OVPN_KEY_SIZE_MAX	  32
+#define OVPN_DATA_HMAC_KEY_SIZE 32 /* SHA-256 key size for data channel */
 
 /* IV/Nonce sizes */
 #define OVPN_IV_SIZE	     16
 #define OVPN_NONCE_SIZE	     12
 #define OVPN_IMPLICIT_IV_LEN 8
 
-/* Tag size for AEAD */
-#define OVPN_TAG_SIZE 16
+/* Tag/HMAC sizes */
+#define OVPN_TAG_SIZE	   16	/* AEAD tag */
+#define OVPN_HMAC_SIZE	   32	/* SHA-256 output */
+#define OVPN_HMAC_SIZE_MIN 16	/* Minimum HMAC size for compatibility */
+#define OVPN_CBC_HMAC_SIZE 32	/* SHA256 full output for CBC+HMAC mode */
+
+/* CBC mode minimum packet size: opcode(1) + HMAC(32) + IV(16) + packet_id(4) */
+#define OVPN_DATA_V1_CBC_MIN_SIZE                                             \
+  (OVPN_OP_SIZE + OVPN_CBC_HMAC_SIZE + OVPN_IV_SIZE + 4)
 
 /* Replay protection window constants */
 #define OVPN_REPLAY_WINDOW_SIZE_DEFAULT 64
@@ -59,7 +75,11 @@ typedef struct ovpn_key_material_t_
   u8 decrypt_key[OVPN_KEY_SIZE_MAX];
   u8 encrypt_implicit_iv[OVPN_IMPLICIT_IV_LEN];
   u8 decrypt_implicit_iv[OVPN_IMPLICIT_IV_LEN];
+  /* HMAC keys for CBC cipher mode */
+  u8 encrypt_hmac_key[OVPN_DATA_HMAC_KEY_SIZE];
+  u8 decrypt_hmac_key[OVPN_DATA_HMAC_KEY_SIZE];
   u8 key_len;
+  u8 hmac_key_len;
 } ovpn_key_material_t;
 
 /*
@@ -72,12 +92,19 @@ typedef struct ovpn_crypto_context_t_
   vnet_crypto_key_index_t encrypt_key_index;
   vnet_crypto_key_index_t decrypt_key_index;
 
+  /* HMAC key indices (for CBC cipher mode) */
+  vnet_crypto_key_index_t encrypt_hmac_key_index;
+  vnet_crypto_key_index_t decrypt_hmac_key_index;
+
   /* Crypto algorithm info */
   ovpn_cipher_alg_t cipher_alg;
   vnet_crypto_op_id_t encrypt_op_id;
   vnet_crypto_op_id_t decrypt_op_id;
 
-  /* Implicit IV for nonce construction */
+  /* HMAC operation ID (for CBC cipher mode) */
+  vnet_crypto_op_id_t hmac_op_id;
+
+  /* Implicit IV for nonce construction (AEAD only) */
   u8 encrypt_implicit_iv[OVPN_IMPLICIT_IV_LEN];
   u8 decrypt_implicit_iv[OVPN_IMPLICIT_IV_LEN];
 
@@ -95,6 +122,7 @@ typedef struct ovpn_crypto_context_t_
 
   /* Key is valid and ready for use */
   u8 is_valid;
+  u8 is_aead; /* 1 for AEAD ciphers, 0 for CBC+HMAC */
 } ovpn_crypto_context_t;
 
 /*
@@ -214,6 +242,7 @@ ovpn_crypto_key_size (ovpn_cipher_alg_t alg)
       return OVPN_KEY_SIZE_128;
     case OVPN_CIPHER_ALG_AES_256_GCM:
     case OVPN_CIPHER_ALG_CHACHA20_POLY1305:
+    case OVPN_CIPHER_ALG_AES_256_CBC:
       return OVPN_KEY_SIZE_256;
     default:
       return 0;
@@ -227,6 +256,21 @@ ovpn_crypto_key_size (ovpn_cipher_alg_t alg)
 int ovpn_crypto_set_static_key (ovpn_crypto_context_t *ctx,
 				ovpn_cipher_alg_t cipher_alg, const u8 *key,
 				u8 key_len, const u8 *implicit_iv);
+
+/*
+ * Set up static key crypto context for a peer from OpenVPN static.key file.
+ *
+ * @param ctx Crypto context to initialize
+ * @param cipher_alg Cipher algorithm (must be AEAD)
+ * @param static_key 256-byte static key from parsed file
+ * @param direction 0=normal (server), 1=inverse (client)
+ * @param replay_window Replay protection window size
+ * @return 0 on success, <0 on error
+ */
+int ovpn_setup_static_key_crypto (ovpn_crypto_context_t *ctx,
+				  ovpn_cipher_alg_t cipher_alg,
+				  const u8 *static_key, u8 direction,
+				  u32 replay_window);
 
 /*
  * Get per-thread crypto data
@@ -282,6 +326,34 @@ ovpn_crypto_reset_ptd (ovpn_per_thread_crypto_t *ptd)
   vec_reset_length (ptd->chunks);
   vec_reset_length (ptd->ivs);
 }
+
+/*
+ * CBC+HMAC mode decrypt for single packet (static key mode).
+ * Packet format: [opcode:1][HMAC:32][IV:16][encrypted(packet_id:4 + payload)]
+ *
+ * @param vm vlib_main_t
+ * @param ctx crypto context (must be CBC mode)
+ * @param b buffer containing packet (starting at opcode)
+ * @param packet_id_out output: extracted packet_id
+ * @return 0 on success, <0 on error
+ */
+int ovpn_crypto_cbc_decrypt (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
+			     vlib_buffer_t *b, u32 *packet_id_out);
+
+/*
+ * CBC+HMAC mode decrypt for static key mode packets WITHOUT opcode byte.
+ * Packet format: [HMAC:32][IV:16][encrypted(packet_id:4 + payload)]
+ * Note: Static key mode uses "short form" (no timestamp).
+ *
+ * @param vm vlib_main_t
+ * @param ctx crypto context (must be CBC mode)
+ * @param b buffer containing packet (starting at HMAC, no opcode)
+ * @param packet_id_out output: extracted packet_id
+ * @return 0 on success, <0 on error
+ */
+int ovpn_crypto_cbc_decrypt_no_opcode (vlib_main_t *vm,
+				       ovpn_crypto_context_t *ctx,
+				       vlib_buffer_t *b, u32 *packet_id_out);
 
 #endif /* __included_ovpn_crypto_h__ */
 

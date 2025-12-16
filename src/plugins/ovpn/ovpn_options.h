@@ -73,7 +73,30 @@ typedef struct ovpn_options_t_
   u8 *tls_crypt_key;
   u8 *tls_crypt_v2_key;  /* TLS-Crypt-V2 server key */
   u8 *tls_auth_key;
+
+  /* Static key mode (--secret) */
+  u8 *static_key;	     /* Raw static key data (256 bytes) */
+  u8 static_key_direction;   /* 0 = normal, 1 = inverse */
+  u8 static_key_mode;	     /* 1 if using static key mode */
 } ovpn_options_t;
+
+/* Static key size: 256 bytes (2048 bits) */
+#define OVPN_STATIC_KEY_SIZE 256
+
+/*
+ * Parse OpenVPN static key file format.
+ *
+ * OpenVPN static.key format:
+ * -----BEGIN OpenVPN Static key V1-----
+ * <16 lines of 32 hex characters each = 256 bytes>
+ * -----END OpenVPN Static key V1-----
+ *
+ * @param key_data Raw file contents
+ * @param key_len Length of key_data
+ * @param key_out Output buffer (must be at least OVPN_STATIC_KEY_SIZE bytes)
+ * @return 0 on success, <0 on error
+ */
+int ovpn_parse_static_key (const u8 *key_data, u32 key_len, u8 *key_out);
 
 bool string_defined_equal (const char *s1, const char *s2);
 void ovpn_options_init (ovpn_options_t *opts);
@@ -122,6 +145,32 @@ int ovpn_options_string_build_server (char *buf, u32 buf_len,
  * Get cipher name string from cipher algorithm enum
  */
 const char *ovpn_cipher_alg_to_name (u8 cipher_alg);
+
+/**
+ * Parse client's ifconfig option from options string
+ *
+ * Clients can specify their desired virtual IP using:
+ *   "ifconfig <ip> <netmask>" (IPv4)
+ *   "ifconfig-ipv6 <ip>/<prefix> <remote>" (IPv6)
+ *
+ * @param options_string Client's options string from Key Method 2
+ * @param virtual_ip Output: parsed virtual IP address
+ * @return 0 on success (IP extracted), <0 if not found or invalid
+ */
+int ovpn_options_parse_client_ifconfig (const char *options_string,
+					ip_address_t *virtual_ip);
+
+/**
+ * Check if an IP address is within the configured pool range
+ *
+ * @param ip IP address to check
+ * @param pool_start Start of IP pool
+ * @param pool_end End of IP pool
+ * @return 1 if IP is within range, 0 otherwise
+ */
+int ovpn_options_ip_in_pool (const ip_address_t *ip,
+			     const ip_address_t *pool_start,
+			     const ip_address_t *pool_end);
 
 #endif /* __included_ovpn_options_h__ */
 

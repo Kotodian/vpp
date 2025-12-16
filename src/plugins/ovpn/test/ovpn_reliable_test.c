@@ -157,12 +157,13 @@ ovpn_test_ack_parse_write (vlib_main_t *vm)
   OVPN_TEST (ovpn_session_id_equal (&sid, &sid_read),
 	     "Session IDs should match");
 
-  /* Verify packet IDs - MRU order (most recently added first) */
+  /* Verify packet IDs - with backward iteration, ack[0] ends up at MRU front */
   vlib_cli_output (vm, "ACKs read: %u, %u, %u\n", ack_read.packet_id[0],
 		   ack_read.packet_id[1], ack_read.packet_id[2]);
-  OVPN_TEST (ack_read.packet_id[0] == 12, "First ACK should be 12 (MRU)");
+  OVPN_TEST (ack_read.packet_id[0] == 10,
+	     "First ACK should be 10 (backward iteration makes ack[0] MRU)");
   OVPN_TEST (ack_read.packet_id[1] == 11, "Second ACK should be 11");
-  OVPN_TEST (ack_read.packet_id[2] == 10, "Third ACK should be 10");
+  OVPN_TEST (ack_read.packet_id[2] == 12, "Third ACK should be 12");
 
   /* Free buffer */
   ovpn_buf_free (pbuf);
@@ -583,12 +584,14 @@ ovpn_test_ack_mru (vlib_main_t *vm)
   ovpn_reliable_ack_acknowledge_packet_id (&ack, 20);
   ovpn_reliable_ack_acknowledge_packet_id (&ack, 30);
 
-  /* Copy to MRU */
+  /* Copy to MRU - backward iteration: ack[0] ends up at front */
   ovpn_reliable_copy_acks_to_mru (&ack, &ack_mru, 2);
 
   OVPN_TEST (ack_mru.len >= 2, "MRU should have at least 2 entries");
-  OVPN_TEST (ack_mru.packet_id[0] == 20 || ack_mru.packet_id[0] == 10,
-	     "MRU should contain copied IDs");
+  OVPN_TEST (ack_mru.packet_id[0] == 10,
+	     "With backward iteration, ack[0]=10 should be at MRU front");
+  OVPN_TEST (ack_mru.packet_id[1] == 20,
+	     "ack[1]=20 should be second in MRU");
 
   /* Copy more - should update MRU */
   ovpn_reliable_copy_acks_to_mru (&ack, &ack_mru, 3);

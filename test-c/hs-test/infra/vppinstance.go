@@ -72,6 +72,8 @@ plugins {
   plugin nsim_plugin.so { enable }
   plugin mactime_plugin.so { enable }
   plugin arping_plugin.so { enable }
+  plugin ovpn_plugin.so { enable }
+  plugin ovpn_unittest_plugin.so { enable }
 }
 
 logging {

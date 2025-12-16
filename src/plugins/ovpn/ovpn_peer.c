@@ -260,6 +260,62 @@ ovpn_peer_lookup_by_virtual_ip (ovpn_peer_db_t *db, const ip_address_t *addr)
 }
 
 /*
+ * Set peer's virtual IP address
+ *
+ * Assigns a virtual IP to the peer and registers it in the lookup hash.
+ * If the IP is already assigned to another peer, returns an error.
+ *
+ * @param db Peer database
+ * @param peer Peer to assign IP to
+ * @param virtual_ip IP address to assign
+ * @return 0 on success, <0 on error:
+ *   -1: invalid parameters
+ *   -2: IP already assigned to another peer
+ */
+int
+ovpn_peer_set_virtual_ip (ovpn_peer_db_t *db, ovpn_peer_t *peer,
+			  const ip_address_t *virtual_ip)
+{
+  u64 vip_key;
+  uword *p;
+
+  if (!db || !peer || !virtual_ip || ip_address_is_zero (virtual_ip))
+    return -1;
+
+  /* Generate hash key for the IP */
+  if (virtual_ip->version == AF_IP4)
+    vip_key = virtual_ip->ip.ip4.as_u32;
+  else
+    vip_key = virtual_ip->ip.ip6.as_u64[0] ^ virtual_ip->ip.ip6.as_u64[1];
+
+  /* Check if IP is already assigned to another peer */
+  p = hash_get (db->peer_index_by_virtual_ip, vip_key);
+  if (p && p[0] != peer->peer_id)
+    return -2; /* IP already in use by another peer */
+
+  /* Remove old virtual IP from hash if this peer had one */
+  if (peer->virtual_ip_set && ip_address_cmp (&peer->virtual_ip, virtual_ip) != 0)
+    {
+      u64 old_key;
+      if (peer->virtual_ip.version == AF_IP4)
+	old_key = peer->virtual_ip.ip.ip4.as_u32;
+      else
+	old_key = peer->virtual_ip.ip.ip6.as_u64[0] ^
+		  peer->virtual_ip.ip.ip6.as_u64[1];
+      hash_unset (db->peer_index_by_virtual_ip, old_key);
+    }
+
+  /* Set the new virtual IP */
+  ip_address_copy (&peer->virtual_ip, virtual_ip);
+  peer->virtual_ip_set = 1;
+
+  /* Register in hash */
+  hash_set (db->peer_index_by_virtual_ip, vip_key, peer->peer_id);
+
+  return 0;
+}
+
+/*
  * Add peer to session ID hash
  */
 void

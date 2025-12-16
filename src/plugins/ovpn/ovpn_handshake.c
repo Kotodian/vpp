@@ -27,6 +27,8 @@
 #include <vnet/ip/ip6_packet.h>
 #include <vnet/ip/ip4_forward.h>
 #include <vnet/ip/ip6_forward.h>
+#include <vnet/ip/ip4.h>
+#include <vnet/ip/ip6.h>
 #include <arpa/inet.h>
 #include <string.h>
 #include <openssl/hmac.h>
@@ -1491,13 +1493,27 @@ ovpn_handshake_send_pending_packets (vlib_main_t *vm,
       udp->dst_port = clib_host_to_net_u16 (pending->remote_port);
       udp->src_port = clib_host_to_net_u16 (local_port ? local_port : 1194);
       udp->length = clib_host_to_net_u16 (udp_hdr_size + payload_len);
-      udp->checksum = 0; /* TODO: compute checksum if needed */
+      udp->checksum = 0;
 
       /* Set buffer length */
       b->current_length = total_hdr_size + payload_len;
 
       /* Set flags for IP output */
       b->flags |= VNET_BUFFER_F_LOCALLY_ORIGINATED;
+
+      /* Compute UDP checksum */
+      if (is_ip6)
+	{
+	  ip6_header_t *ip6 = vlib_buffer_get_current (b);
+	  int bogus = 0;
+	  udp->checksum =
+	    ip6_tcp_udp_icmp_compute_checksum (vm, b, ip6, &bogus);
+	}
+      else
+	{
+	  ip4_header_t *ip4 = vlib_buffer_get_current (b);
+	  udp->checksum = ip4_tcp_udp_compute_checksum (vm, b, ip4);
+	}
 
       /* Enqueue to IP lookup */
       vlib_frame_t *f;
@@ -1720,6 +1736,20 @@ ovpn_handshake_send_peer_packets (vlib_main_t *vm, ovpn_peer_t *peer,
 
       b->current_length = total_hdr_size + total_ctrl_len;
       b->flags |= VNET_BUFFER_F_LOCALLY_ORIGINATED;
+
+      /* Compute UDP checksum */
+      if (is_ip6)
+	{
+	  ip6_header_t *ip6 = vlib_buffer_get_current (b);
+	  int bogus = 0;
+	  udp->checksum =
+	    ip6_tcp_udp_icmp_compute_checksum (vm, b, ip6, &bogus);
+	}
+      else
+	{
+	  ip4_header_t *ip4 = vlib_buffer_get_current (b);
+	  udp->checksum = ip4_tcp_udp_compute_checksum (vm, b, ip4);
+	}
 
       /* Enqueue to IP lookup */
       vlib_frame_t *f;
@@ -2458,6 +2488,41 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 				    if (strcmp (key_deriv, "tls-ekm") == 0)
 				      tls_ctx->use_tls_ekm = 1;
 				    clib_mem_free (key_deriv);
+				  }
+
+				/*
+				 * Parse client's requested virtual IP (ifconfig)
+				 *
+				 * OpenVPN clients can specify their desired virtual IP
+				 * using the ifconfig option in their options string.
+				 * If valid and within pool range, honor the request.
+				 */
+				ip_address_t client_virtual_ip;
+				int ifconfig_rv =
+				  ovpn_options_parse_client_ifconfig (peer_opts,
+								     &client_virtual_ip);
+				if (ifconfig_rv == 0)
+				  {
+				    /*
+				     * Client requested a specific virtual IP
+				     * Validate against pool range if configured
+				     */
+				    int ip_valid = ovpn_options_ip_in_pool (
+				      &client_virtual_ip, &omp->options.pool_start,
+				      &omp->options.pool_end);
+
+				    if (ip_valid)
+				      {
+					/* Try to assign the requested IP */
+					int set_rv = ovpn_peer_set_virtual_ip (
+					  peer_db, peer, &client_virtual_ip);
+					if (set_rv == 0)
+					  {
+					    /* Successfully assigned client's requested IP */
+					  }
+					/* If set_rv < 0, IP is already in use - will
+					 * fall back to pool allocation or no IP */
+				      }
 				  }
 			      }
 

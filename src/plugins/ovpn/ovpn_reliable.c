@@ -155,8 +155,8 @@ ovpn_reliable_copy_acks_to_mru (ovpn_reliable_ack_t *ack,
 				ovpn_reliable_ack_t *ack_mru, int n)
 {
   ASSERT (ack->len >= n);
-  /* Forward iteration: each new ACK pushes to front (MRU order) */
-  for (int i = 0; i < n; i++)
+  /* Backward iteration: ack[0] ends up at MRU front position */
+  for (int i = n - 1; i >= 0; i--)
     {
       u32 id = ack->packet_id[i];
 

@@ -64,6 +64,8 @@ ovpn_crypto_cipher_alg_from_name (const char *name)
     return OVPN_CIPHER_ALG_AES_256_GCM;
   if (strncasecmp (name, "CHACHA20-POLY1305", 17) == 0)
     return OVPN_CIPHER_ALG_CHACHA20_POLY1305;
+  if (strncasecmp (name, "AES-256-CBC", 11) == 0)
+    return OVPN_CIPHER_ALG_AES_256_CBC;
 
   return OVPN_CIPHER_ALG_NONE;
 }
@@ -79,6 +81,8 @@ ovpn_crypto_get_vnet_alg (ovpn_cipher_alg_t alg)
       return VNET_CRYPTO_ALG_AES_256_GCM;
     case OVPN_CIPHER_ALG_CHACHA20_POLY1305:
       return VNET_CRYPTO_ALG_CHACHA20_POLY1305;
+    case OVPN_CIPHER_ALG_AES_256_CBC:
+      return VNET_CRYPTO_ALG_AES_256_CBC;
     default:
       return VNET_CRYPTO_ALG_NONE;
     }
@@ -95,6 +99,8 @@ ovpn_crypto_get_enc_op (ovpn_cipher_alg_t alg)
       return VNET_CRYPTO_OP_AES_256_GCM_ENC;
     case OVPN_CIPHER_ALG_CHACHA20_POLY1305:
       return VNET_CRYPTO_OP_CHACHA20_POLY1305_ENC;
+    case OVPN_CIPHER_ALG_AES_256_CBC:
+      return VNET_CRYPTO_OP_AES_256_CBC_ENC;
     default:
       return VNET_CRYPTO_OP_NONE;
     }
@@ -111,6 +117,8 @@ ovpn_crypto_get_dec_op (ovpn_cipher_alg_t alg)
       return VNET_CRYPTO_OP_AES_256_GCM_DEC;
     case OVPN_CIPHER_ALG_CHACHA20_POLY1305:
       return VNET_CRYPTO_OP_CHACHA20_POLY1305_DEC;
+    case OVPN_CIPHER_ALG_AES_256_CBC:
+      return VNET_CRYPTO_OP_AES_256_CBC_DEC;
     default:
       return VNET_CRYPTO_OP_NONE;
     }
@@ -138,6 +146,7 @@ ovpn_crypto_context_init (ovpn_crypto_context_t *ctx,
     return -1;
 
   ctx->cipher_alg = cipher_alg;
+  ctx->is_aead = OVPN_CIPHER_IS_AEAD (cipher_alg);
 
   /* Add encryption key */
   ctx->encrypt_key_index =
@@ -153,11 +162,30 @@ ovpn_crypto_context_init (ovpn_crypto_context_t *ctx,
   ctx->encrypt_op_id = ovpn_crypto_get_enc_op (cipher_alg);
   ctx->decrypt_op_id = ovpn_crypto_get_dec_op (cipher_alg);
 
-  /* Copy implicit IVs */
-  clib_memcpy_fast (ctx->encrypt_implicit_iv, keys->encrypt_implicit_iv,
-		    OVPN_IMPLICIT_IV_LEN);
-  clib_memcpy_fast (ctx->decrypt_implicit_iv, keys->decrypt_implicit_iv,
-		    OVPN_IMPLICIT_IV_LEN);
+  if (ctx->is_aead)
+    {
+      /* AEAD mode: Copy implicit IVs */
+      clib_memcpy_fast (ctx->encrypt_implicit_iv, keys->encrypt_implicit_iv,
+			OVPN_IMPLICIT_IV_LEN);
+      clib_memcpy_fast (ctx->decrypt_implicit_iv, keys->decrypt_implicit_iv,
+			OVPN_IMPLICIT_IV_LEN);
+    }
+  else
+    {
+      /* CBC mode: Add HMAC keys and set up HMAC operation */
+      if (keys->hmac_key_len == 0)
+	return -1; /* HMAC key required for CBC mode */
+
+      ctx->encrypt_hmac_key_index =
+	vnet_crypto_key_add (vlib_get_main (), VNET_CRYPTO_ALG_HMAC_SHA256,
+			     (u8 *) keys->encrypt_hmac_key, keys->hmac_key_len);
+
+      ctx->decrypt_hmac_key_index =
+	vnet_crypto_key_add (vlib_get_main (), VNET_CRYPTO_ALG_HMAC_SHA256,
+			     (u8 *) keys->decrypt_hmac_key, keys->hmac_key_len);
+
+      ctx->hmac_op_id = VNET_CRYPTO_OP_SHA256_HMAC;
+    }
 
   /* Initialize counters */
   ctx->packet_id_send = 1;
@@ -810,6 +838,250 @@ ovpn_crypto_encrypt (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
 	  VNET_CRYPTO_OP_STATUS_COMPLETED)
 	return -1;
     }
+
+  return 0;
+}
+
+/*
+ * CBC+HMAC mode decrypt for single packet (static key mode).
+ * Packet format: [opcode:1][HMAC:20][IV:16][encrypted(packet_id:4 + payload)]
+ */
+int
+ovpn_crypto_cbc_decrypt (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
+			 vlib_buffer_t *b, u32 *packet_id_out)
+{
+  u8 *data;
+  u32 len;
+  u8 *hmac_received;
+  u8 *iv;
+  u8 *ciphertext;
+  u32 ciphertext_len;
+  u8 hmac_computed[OVPN_HMAC_SIZE];
+  vnet_crypto_op_t hmac_op;
+  vnet_crypto_op_t decrypt_op;
+  u32 packet_id;
+
+  if (!ctx->is_valid || ctx->is_aead)
+    return -1; /* Only for CBC mode */
+
+  data = vlib_buffer_get_current (b);
+  len = b->current_length;
+
+  /* Check minimum length: opcode(1) + HMAC(20) + IV(16) + packet_id(4) */
+  if (len < OVPN_DATA_V1_CBC_MIN_SIZE)
+    return -2;
+
+  /* Parse packet structure */
+  /* data[0] = opcode + key_id */
+  hmac_received = data + 1; /* HMAC starts after opcode */
+  iv = hmac_received + OVPN_CBC_HMAC_SIZE;
+  ciphertext = iv + OVPN_IV_SIZE;
+  ciphertext_len = len - 1 - OVPN_CBC_HMAC_SIZE - OVPN_IV_SIZE;
+
+  /* Ciphertext must be at least packet_id + some data, and multiple of 16 */
+  if (ciphertext_len < 16 || (ciphertext_len % 16) != 0)
+    return -3;
+
+  /*
+   * Step 1: Verify HMAC
+   * HMAC is computed over: IV + ciphertext
+   * Note: For HMAC operations, use integ_src/integ_len (not src/len)
+   */
+  vnet_crypto_op_init (&hmac_op, ctx->hmac_op_id);
+  hmac_op.key_index = ctx->decrypt_hmac_key_index;
+  hmac_op.integ_src = iv; /* HMAC covers IV + ciphertext */
+  hmac_op.integ_len = OVPN_IV_SIZE + ciphertext_len;
+  hmac_op.digest = hmac_computed;
+  hmac_op.digest_len = OVPN_HMAC_SIZE;
+  hmac_op.flags = 0;
+
+  vnet_crypto_process_ops (vm, &hmac_op, 1);
+
+  if (hmac_op.status != VNET_CRYPTO_OP_STATUS_COMPLETED)
+    return -4; /* HMAC computation failed */
+
+  /* Compare HMAC with received */
+  if (clib_memcmp (hmac_computed, hmac_received, OVPN_CBC_HMAC_SIZE) != 0)
+    return -5; /* HMAC verification failed */
+
+  /*
+   * Step 2: Decrypt ciphertext in place
+   */
+  vnet_crypto_op_init (&decrypt_op, ctx->decrypt_op_id);
+  decrypt_op.key_index = ctx->decrypt_key_index;
+  decrypt_op.iv = iv;
+  decrypt_op.src = ciphertext;
+  decrypt_op.dst = ciphertext; /* Decrypt in place */
+  decrypt_op.len = ciphertext_len;
+  decrypt_op.flags = 0;
+
+  vnet_crypto_process_ops (vm, &decrypt_op, 1);
+
+  if (decrypt_op.status != VNET_CRYPTO_OP_STATUS_COMPLETED)
+    return -6; /* Decryption failed */
+
+  /*
+   * Step 3: Extract packet_id from beginning of decrypted data
+   * Decrypted format: [packet_id:4][plaintext payload]
+   */
+  packet_id = clib_net_to_host_u32 (*(u32 *) ciphertext);
+
+  /* Check replay */
+  if (!ovpn_crypto_check_replay (ctx, packet_id))
+    return -7; /* Replay detected */
+
+  /* Update replay window */
+  ovpn_crypto_update_replay (ctx, packet_id);
+
+  if (packet_id_out)
+    *packet_id_out = packet_id;
+
+  /*
+   * Step 4: Advance buffer to plaintext payload
+   * Skip: opcode(1) + HMAC(20) + IV(16) + packet_id(4) = 41 bytes
+   */
+  vlib_buffer_advance (b, 1 + OVPN_CBC_HMAC_SIZE + OVPN_IV_SIZE + 4);
+
+  /* Update buffer length to exclude PKCS7 padding
+   * For now, we don't strip padding - VPP IP input will ignore extra bytes
+   * This is safe because IP header contains the actual length
+   */
+
+  return 0;
+}
+
+/*
+ * CBC+HMAC mode decrypt for static key mode packets WITHOUT opcode byte.
+ * This is the format used by OpenVPN static key mode (short form).
+ * Packet format: [HMAC:32][IV:16][encrypted(packet_id:4 + payload)]
+ *
+ * Note: Static key mode uses "short form" packet IDs (no timestamp).
+ */
+int
+ovpn_crypto_cbc_decrypt_no_opcode (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
+				   vlib_buffer_t *b, u32 *packet_id_out)
+{
+  u8 *data;
+  u32 len;
+  u8 *hmac_received;
+  u8 *iv;
+  u8 *ciphertext;
+  u32 ciphertext_len;
+  u8 hmac_computed[OVPN_HMAC_SIZE];
+  vnet_crypto_op_t hmac_op;
+  vnet_crypto_op_t decrypt_op;
+  u32 packet_id;
+
+  if (!ctx->is_valid || ctx->is_aead)
+    return -1; /* Only for CBC mode */
+
+  data = vlib_buffer_get_current (b);
+  len = b->current_length;
+
+  /* Minimum length: HMAC(32) + IV(16) + encrypted(packet_id:4 + min_payload) */
+  if (len < (OVPN_CBC_HMAC_SIZE + OVPN_IV_SIZE + 16))
+    {
+      clib_warning ("OVPN CBC no-opcode: packet too short, len=%u", len);
+      return -2;
+    }
+
+  /* Parse packet structure - no opcode byte in this format */
+  hmac_received = data;
+  iv = hmac_received + OVPN_CBC_HMAC_SIZE;
+  ciphertext = iv + OVPN_IV_SIZE;
+  ciphertext_len = len - OVPN_CBC_HMAC_SIZE - OVPN_IV_SIZE;
+
+  /* Ciphertext must be at least 16 bytes (one AES block) and multiple of 16 */
+  if (ciphertext_len < 16 || (ciphertext_len % 16) != 0)
+    {
+      clib_warning ("OVPN CBC no-opcode: invalid ciphertext len=%u",
+		    ciphertext_len);
+      return -3;
+    }
+
+  /*
+   * Step 1: Verify HMAC
+   * HMAC is computed over: IV + ciphertext
+   * Use integ_src/integ_len for HMAC operations (different union from src/len)
+   */
+  vnet_crypto_op_init (&hmac_op, ctx->hmac_op_id);
+  hmac_op.key_index = ctx->decrypt_hmac_key_index;
+  hmac_op.integ_src = iv; /* HMAC covers IV + ciphertext */
+  hmac_op.integ_len = OVPN_IV_SIZE + ciphertext_len;
+  hmac_op.digest = hmac_computed;
+  hmac_op.digest_len = OVPN_CBC_HMAC_SIZE;
+  hmac_op.iv = 0;
+  hmac_op.flags = 0;
+
+  vnet_crypto_process_ops (vm, &hmac_op, 1);
+
+  if (hmac_op.status != VNET_CRYPTO_OP_STATUS_COMPLETED)
+    {
+      clib_warning ("OVPN CBC no-opcode: HMAC computation failed, status=%d",
+		    hmac_op.status);
+      return -4;
+    }
+
+  /* Compare HMAC */
+  if (clib_memcmp (hmac_computed, hmac_received, OVPN_CBC_HMAC_SIZE) != 0)
+    {
+      clib_warning (
+	"OVPN CBC no-opcode: HMAC mismatch, received=%02x%02x%02x%02x..., "
+	"computed=%02x%02x%02x%02x...",
+	hmac_received[0], hmac_received[1], hmac_received[2], hmac_received[3],
+	hmac_computed[0], hmac_computed[1], hmac_computed[2], hmac_computed[3]);
+      return -5;
+    }
+
+  /*
+   * Step 2: Decrypt ciphertext in place
+   */
+  vnet_crypto_op_init (&decrypt_op, ctx->decrypt_op_id);
+  decrypt_op.key_index = ctx->decrypt_key_index;
+  decrypt_op.iv = iv;
+  decrypt_op.src = ciphertext;
+  decrypt_op.dst = ciphertext; /* Decrypt in place */
+  decrypt_op.len = ciphertext_len;
+  decrypt_op.flags = 0;
+
+  vnet_crypto_process_ops (vm, &decrypt_op, 1);
+
+  if (decrypt_op.status != VNET_CRYPTO_OP_STATUS_COMPLETED)
+    {
+      clib_warning ("OVPN CBC no-opcode: decryption failed");
+      return -6;
+    }
+
+  /*
+   * Step 3: Extract packet_id from beginning of decrypted data
+   * Decrypted format (short form): [packet_id:4][plaintext payload]
+   * Note: No timestamp in short form (static key mode)
+   */
+  packet_id = clib_net_to_host_u32 (*(u32 *) ciphertext);
+
+  /* Check replay */
+  if (!ovpn_crypto_check_replay (ctx, packet_id))
+    {
+      clib_warning ("OVPN CBC no-opcode: replay detected, packet_id=%u",
+		    packet_id);
+      return -7;
+    }
+
+  /* Update replay window */
+  ovpn_crypto_update_replay (ctx, packet_id);
+
+  if (packet_id_out)
+    *packet_id_out = packet_id;
+
+  /*
+   * Step 4: Advance buffer to plaintext payload
+   * Skip: HMAC(32) + IV(16) + packet_id(4) = 52 bytes
+   * Note: No timestamp in short form
+   */
+  vlib_buffer_advance (b, OVPN_CBC_HMAC_SIZE + OVPN_IV_SIZE + 4);
+
+  clib_warning ("OVPN CBC no-opcode: success, packet_id=%u, payload_len=%u",
+		packet_id, b->current_length);
 
   return 0;
 }

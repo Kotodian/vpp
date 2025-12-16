@@ -272,9 +272,10 @@ ovpn_if_create (vlib_main_t *vm __attribute__ ((unused)), u8 *name, u8 is_tun,
   /* Rename hardware interface to use custom name */
   if (oif->name && vec_len (oif->name) > 0)
     {
-      vnet_hw_interface_t *hi = vnet_get_hw_interface (vnm, hw_if_index);
-      vec_free (hi->name);
-      hi->name = vec_dup (oif->name);
+      /* Add null terminator for vnet_rename_interface */
+      vec_add1 (oif->name, 0);
+      vnet_rename_interface (vnm, hw_if_index, (char *) oif->name);
+      vec_dec_len (oif->name, 1);
     }
 
   /* Set MTU on interface */

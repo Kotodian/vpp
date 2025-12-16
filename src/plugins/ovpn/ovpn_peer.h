@@ -440,6 +440,22 @@ ovpn_peer_t *ovpn_peer_lookup_by_virtual_ip (ovpn_peer_db_t *db,
 					     const ip_address_t *addr);
 
 /*
+ * Set peer's virtual IP address
+ *
+ * Assigns a virtual IP to the peer and registers it in the lookup hash.
+ * If the IP is already assigned to another peer, returns an error.
+ *
+ * @param db Peer database
+ * @param peer Peer to assign IP to
+ * @param virtual_ip IP address to assign
+ * @return 0 on success, <0 on error:
+ *   -1: invalid parameters
+ *   -2: IP already assigned to another peer
+ */
+int ovpn_peer_set_virtual_ip (ovpn_peer_db_t *db, ovpn_peer_t *peer,
+			      const ip_address_t *virtual_ip);
+
+/*
  * Lookup peer by session ID (for NAT/float support)
  * Used when address-based lookup fails due to NAT rebinding
  */

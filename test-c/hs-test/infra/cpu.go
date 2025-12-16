@@ -47,7 +47,7 @@ func (c *CpuAllocatorT) Allocate(nCpus int, offset int) (*CpuContext, error) {
 		if c.suite.SkipIfNotEnoguhCpus {
 			c.suite.Skip("skipping: " + msg)
 		}
-		err := fmt.Errorf(msg)
+		err := fmt.Errorf("%s", msg)
 		return nil, err
 	}
 

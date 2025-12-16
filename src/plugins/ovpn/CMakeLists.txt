@@ -33,6 +33,8 @@ add_vpp_plugin(ovpn
   ovpn_peer.c
   ovpn_handoff.c
   ovpn_handshake.c
+  ovpn_input.c
+  ovpn_output.c
 
   INSTALL_HEADERS
   ovpn.h

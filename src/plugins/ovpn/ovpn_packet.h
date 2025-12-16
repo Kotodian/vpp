@@ -82,7 +82,8 @@ typedef enum
 always_inline u8
 ovpn_opcode_is_valid (u8 opcode)
 {
-  return opcode >= OVPN_OP_CONTROL_SOFT_RESET_V1 &&
+  /* Include deprecated opcodes 1-2 for compatibility */
+  return opcode >= OVPN_OP_CONTROL_HARD_RESET_CLIENT_V1 &&
 	 opcode <= OVPN_OP_CONTROL_WKC_V1;
 }
 

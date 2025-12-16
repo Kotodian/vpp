@@ -19,6 +19,8 @@
 #include <vnet/vnet.h>
 #include <vnet/ip/ip4_packet.h>
 #include <vnet/ip/ip6_packet.h>
+#include <vnet/ip/ip4.h>
+#include <vnet/ip/ip6.h>
 #include <vnet/udp/udp_packet.h>
 #include <vnet/adj/adj.h>
 #include <ovpn/ovpn.h>
@@ -299,18 +301,26 @@ ovpn_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      ip4->checksum = ip_csum_fold (sum);
 	      ip4->length = new_len;
 
-	      /* Update UDP length */
+	      /* Update UDP length and compute checksum */
 	      udp->length =
 		clib_host_to_net_u16 (outer_len - sizeof (ip4_header_t));
+	      udp->checksum = 0;
+	      udp->checksum = ip4_tcp_udp_compute_checksum (vm, b0, ip4);
 	    }
 	  else
 	    {
 	      ip6_header_t *ip6 = vlib_buffer_get_current (b0);
 	      udp_header_t *udp = (udp_header_t *) (ip6 + 1);
+	      int bogus = 0;
 
 	      ip6->payload_length =
 		clib_host_to_net_u16 (outer_len - sizeof (ip6_header_t));
 	      udp->length = ip6->payload_length;
+
+	      /* IPv6 UDP checksum is mandatory */
+	      udp->checksum = 0;
+	      udp->checksum =
+		ip6_tcp_udp_icmp_compute_checksum (vm, b0, ip6, &bogus);
 	    }
 
 	  /* Update peer statistics */

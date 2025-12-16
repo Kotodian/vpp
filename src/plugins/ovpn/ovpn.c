@@ -236,530 +236,6 @@ ovpn_cleanup_picotls_context (ovpn_main_t *omp)
 }
 
 static clib_error_t *
-ovpn_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
-			vlib_cli_command_t *cmd __attribute__ ((unused)))
-{
-  ovpn_main_t *omp = &ovpn_main;
-  unformat_input_t _line_input, *line_input = &_line_input;
-  clib_error_t *error = NULL;
-  u32 port = 1194;
-  u8 *dev_name = 0;
-  u8 *ca_cert = 0;
-  u8 *server_cert = 0;
-  u8 *server_key = 0;
-  u8 *dh_params = 0;
-  u8 *cipher = 0;
-  u8 *auth = 0;
-  u8 *tls_crypt_key = 0;
-  u8 *tls_crypt_v2_key = 0;
-  u8 *tls_auth_key = 0;
-  ip_address_t pool_start, pool_end;
-  fib_prefix_t server_addr;
-  /* OpenVPN defaults from upstream */
-  u32 max_clients = 1024;
-  u32 keepalive_ping = 10;
-  u32 keepalive_timeout = 120;
-  u32 handshake_timeout = 60;       /* hand-window default */
-  u32 renegotiate_seconds = 3600;   /* reneg-sec default */
-  u64 renegotiate_bytes = 0;	    /* reneg-bytes (0=disabled) */
-  u64 renegotiate_packets = 0;	    /* reneg-pkts (0=disabled) */
-  u32 tls_timeout = 2;		    /* tls-timeout default */
-  u8 replay_protection = 1;
-  u32 replay_window = 64;
-  u32 replay_time = 15;
-  u32 transition_window = 3600;	    /* transition-window default */
-  u16 mtu = 1420; /* Default MTU */
-  u8 is_tun = 1;  /* Default to TUN mode (L3) */
-  u8 enable = 0;
-  u8 disable = 0;
-
-  clib_memset (&pool_start, 0, sizeof (pool_start));
-  clib_memset (&pool_end, 0, sizeof (pool_end));
-  clib_memset (&server_addr, 0, sizeof (server_addr));
-
-  /* Save initial enabled state to determine if cleanup is needed on error */
-  u8 was_enabled = omp->is_enabled;
-
-  /* Get a line of input. */
-  if (!unformat_user (input, unformat_line_input, line_input))
-    return clib_error_return (0, "expected enable or disable");
-
-  while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
-    {
-      if (unformat (line_input, "enable"))
-	{
-	  enable = 1;
-	}
-      else if (unformat (line_input, "disable"))
-	{
-	  disable = 1;
-	}
-      else if (unformat (line_input, "port %u", &port))
-	;
-      else if (unformat (line_input, "dev %s", &dev_name))
-	;
-      else if (unformat (line_input, "ca %s", &ca_cert))
-	;
-      else if (unformat (line_input, "cert %s", &server_cert))
-	;
-      else if (unformat (line_input, "key %s", &server_key))
-	;
-      else if (unformat (line_input, "dh %s", &dh_params))
-	;
-      else if (unformat (line_input, "cipher %s", &cipher))
-	;
-      else if (unformat (line_input, "auth %s", &auth))
-	;
-      else if (unformat (line_input, "tls-crypt %s", &tls_crypt_key))
-	;
-      else if (unformat (line_input, "tls-crypt-v2 %s", &tls_crypt_v2_key))
-	;
-      else if (unformat (line_input, "tls-auth %s", &tls_auth_key))
-	;
-      else if (unformat (line_input, "server %U/%d", unformat_ip4_address,
-			 &server_addr.fp_addr.ip4, &server_addr.fp_len))
-	{
-	  server_addr.fp_proto = FIB_PROTOCOL_IP4;
-	}
-      else if (unformat (line_input, "server %U/%d", unformat_ip6_address,
-			 &server_addr.fp_addr.ip6, &server_addr.fp_len))
-	{
-	  server_addr.fp_proto = FIB_PROTOCOL_IP6;
-	}
-      else if (unformat (line_input, "ifconfig-pool %U %U",
-			 unformat_ip4_address, &pool_start.ip.ip4,
-			 unformat_ip4_address, &pool_end.ip.ip4))
-	{
-	  pool_start.version = AF_IP4;
-	  pool_end.version = AF_IP4;
-	}
-      else if (unformat (line_input, "ifconfig-pool %U %U",
-			 unformat_ip6_address, &pool_start.ip.ip6,
-			 unformat_ip6_address, &pool_end.ip.ip6))
-	{
-	  pool_start.version = AF_IP6;
-	  pool_end.version = AF_IP6;
-	}
-      else if (unformat (line_input, "max-clients %u", &max_clients))
-	;
-      else if (unformat (line_input, "keepalive %u %u", &keepalive_ping,
-			 &keepalive_timeout))
-	;
-      else if (unformat (line_input, "hand-window %u", &handshake_timeout))
-	;
-      else if (unformat (line_input, "reneg-sec %u", &renegotiate_seconds))
-	;
-      else if (unformat (line_input, "reneg-bytes %lu", &renegotiate_bytes))
-	;
-      else if (unformat (line_input, "reneg-pkts %lu", &renegotiate_packets))
-	;
-      else if (unformat (line_input, "tls-timeout %u", &tls_timeout))
-	;
-      else if (unformat (line_input, "replay-protection %u",
-			 &replay_protection))
-	;
-      else if (unformat (line_input, "replay-window %u %u", &replay_window,
-			 &replay_time))
-	;
-      else if (unformat (line_input, "replay-window %u", &replay_window))
-	;
-      else if (unformat (line_input, "transition-window %u",
-			 &transition_window))
-	;
-      else if (unformat (line_input, "tun-mtu %u", &mtu))
-	;
-      else if (unformat (line_input, "dev-type tun"))
-	{
-	  is_tun = 1;
-	}
-      else if (unformat (line_input, "dev-type tap"))
-	{
-	  is_tun = 0;
-	}
-      else
-	{
-	  error = clib_error_return (0, "unknown input `%U'",
-				     format_unformat_error, line_input);
-	  goto done;
-	}
-    }
-
-  if (enable == disable)
-    {
-      error = clib_error_return (0, "must specify either enable or disable");
-      goto done;
-    }
-
-  if (enable && omp->is_enabled)
-    {
-      error = clib_error_return (0, "OpenVPN is already enabled");
-      goto done;
-    }
-
-  if (disable)
-    {
-      /* Cleanup picotls context */
-      ovpn_cleanup_picotls_context (omp);
-
-      /* Unregister UDP port */
-      if (omp->is_enabled && omp->options.listen_port)
-	{
-	  udp_unregister_dst_port (vm, omp->options.listen_port, UDP_IP4);
-	  udp_unregister_dst_port (vm, omp->options.listen_port, UDP_IP6);
-	  omp->is_enabled = 0;
-	}
-
-      /* Free peer database only if it was initialized */
-      if (omp->multi_context.peer_db.sw_if_index != ~0)
-	{
-	  ovpn_peer_db_free (&omp->multi_context.peer_db);
-	}
-      /* Free pending database only if peer database was initialized
-       * (they are initialized together) */
-      if (omp->multi_context.peer_db.sw_if_index != ~0)
-	{
-	  ovpn_pending_db_free (&omp->multi_context.pending_db);
-	}
-
-      vlib_cli_output (vm, "OpenVPN disabled");
-      ovpn_free_options (&omp->options);
-      goto done;
-    }
-
-  /* Enable OpenVPN with options */
-  omp->options.listen_port = (u16) port;
-  omp->options.proto = IP_PROTOCOL_UDP;
-  omp->options.mtu = mtu;
-  omp->options.is_tun = is_tun;
-
-  if (dev_name)
-    {
-      omp->options.dev_name = (char *) dev_name;
-      dev_name = 0; /* Ownership transferred */
-    }
-
-  if (server_addr.fp_proto != 0)
-    omp->options.server_addr = server_addr;
-
-  /* Read certificate and key files */
-  if (ca_cert)
-    {
-      error =
-	ovpn_read_file_contents ((char *) ca_cert, &omp->options.ca_cert);
-      if (error)
-	{
-	  error = clib_error_return (0, "failed to read CA certificate: %U",
-				     format_clib_error, error);
-	  goto done;
-	}
-      vlib_cli_output (vm, "Loaded CA certificate from %s (%u bytes)", ca_cert,
-		       vec_len (omp->options.ca_cert));
-      vec_free (ca_cert);
-      ca_cert = 0;
-    }
-
-  if (server_cert)
-    {
-      error = ovpn_read_file_contents ((char *) server_cert,
-				       &omp->options.server_cert);
-      if (error)
-	{
-	  error =
-	    clib_error_return (0, "failed to read server certificate: %U",
-			       format_clib_error, error);
-	  goto done;
-	}
-      vlib_cli_output (vm, "Loaded server certificate from %s (%u bytes)",
-		       server_cert, vec_len (omp->options.server_cert));
-      vec_free (server_cert);
-      server_cert = 0;
-    }
-
-  if (server_key)
-    {
-      error = ovpn_read_file_contents ((char *) server_key,
-				       &omp->options.server_key);
-      if (error)
-	{
-	  error = clib_error_return (0, "failed to read server key: %U",
-				     format_clib_error, error);
-	  goto done;
-	}
-      vlib_cli_output (vm, "Loaded server key from %s (%u bytes)", server_key,
-		       vec_len (omp->options.server_key));
-      vec_free (server_key);
-      server_key = 0;
-    }
-
-  if (dh_params)
-    {
-      error =
-	ovpn_read_file_contents ((char *) dh_params, &omp->options.dh_params);
-      if (error)
-	{
-	  error = clib_error_return (0, "failed to read DH parameters: %U",
-				     format_clib_error, error);
-	  goto done;
-	}
-      vlib_cli_output (vm, "Loaded DH parameters from %s (%u bytes)",
-		       dh_params, vec_len (omp->options.dh_params));
-      vec_free (dh_params);
-      dh_params = 0;
-    }
-
-  if (tls_crypt_key)
-    {
-      error = ovpn_read_file_contents ((char *) tls_crypt_key,
-				       &omp->options.tls_crypt_key);
-      if (error)
-	{
-	  error = clib_error_return (0, "failed to read TLS-Crypt key: %U",
-				     format_clib_error, error);
-	  goto done;
-	}
-      vlib_cli_output (vm, "Loaded TLS-Crypt key from %s (%u bytes)",
-		       tls_crypt_key, vec_len (omp->options.tls_crypt_key));
-      vec_free (tls_crypt_key);
-      tls_crypt_key = 0;
-
-      /* Parse and initialize TLS-Crypt context */
-      int rv = ovpn_tls_crypt_parse_key (omp->options.tls_crypt_key,
-					 vec_len (omp->options.tls_crypt_key),
-					 &omp->tls_crypt, 1 /* is_server */);
-      if (rv < 0)
-	{
-	  error =
-	    clib_error_return (0, "failed to parse TLS-Crypt key: %d", rv);
-	  goto done;
-	}
-      vlib_cli_output (vm, "TLS-Crypt initialized successfully");
-    }
-
-  if (tls_crypt_v2_key)
-    {
-      /* TLS-Crypt-V2 requires a separate server key */
-      if (tls_crypt_key)
-	{
-	  error = clib_error_return (
-	    0, "cannot use both tls-crypt-key and tls-crypt-v2-key");
-	  goto done;
-	}
-
-      error = ovpn_read_file_contents ((char *) tls_crypt_v2_key,
-				       &omp->options.tls_crypt_v2_key);
-      if (error)
-	{
-	  error = clib_error_return (0, "failed to read TLS-Crypt-V2 key: %U",
-				     format_clib_error, error);
-	  goto done;
-	}
-      vlib_cli_output (vm, "Loaded TLS-Crypt-V2 server key from %s (%u bytes)",
-		       tls_crypt_v2_key,
-		       vec_len (omp->options.tls_crypt_v2_key));
-      vec_free (tls_crypt_v2_key);
-      tls_crypt_v2_key = 0;
-
-      /* Parse and initialize TLS-Crypt-V2 context */
-      int rv = ovpn_tls_crypt_v2_parse_server_key (
-	omp->options.tls_crypt_v2_key,
-	vec_len (omp->options.tls_crypt_v2_key), &omp->tls_crypt_v2);
-      if (rv < 0)
-	{
-	  error =
-	    clib_error_return (0, "failed to parse TLS-Crypt-V2 key: %d", rv);
-	  goto done;
-	}
-      vlib_cli_output (vm, "TLS-Crypt-V2 server initialized successfully");
-    }
-
-  if (cipher)
-    {
-      omp->cipher_alg = ovpn_crypto_cipher_alg_from_name ((char *) cipher);
-      if (omp->cipher_alg == OVPN_CIPHER_ALG_NONE)
-	{
-	  error = clib_error_return (0, "unsupported cipher: %s", cipher);
-	  goto done;
-	}
-      omp->options.cipher_name = cipher;
-      cipher = 0; /* Ownership transferred */
-    }
-  else
-    {
-      /* Default to AES-256-GCM if no cipher specified */
-      omp->cipher_alg = OVPN_CIPHER_ALG_AES_256_GCM;
-    }
-
-  vlib_cli_output (
-    vm, "Using cipher algorithm: %s",
-    omp->cipher_alg == OVPN_CIPHER_ALG_AES_128_GCM ? "AES-128-GCM" :
-    omp->cipher_alg == OVPN_CIPHER_ALG_AES_256_GCM ? "AES-256-GCM" :
-    omp->cipher_alg == OVPN_CIPHER_ALG_CHACHA20_POLY1305 ?
-						     "CHACHA20-POLY1305" :
-						     "NONE");
-  if (auth)
-    {
-      omp->options.auth_name = auth;
-      auth = 0; /* Ownership transferred */
-    }
-
-  if (tls_auth_key)
-    {
-      error = ovpn_read_file_contents ((char *) tls_auth_key,
-				       &omp->options.tls_auth_key);
-      if (error)
-	{
-	  error = clib_error_return (0, "failed to read TLS-Auth key: %U",
-				     format_clib_error, error);
-	  goto done;
-	}
-      vlib_cli_output (vm, "Loaded TLS-Auth key from %s (%u bytes)",
-		       tls_auth_key, vec_len (omp->options.tls_auth_key));
-      vec_free (tls_auth_key);
-      tls_auth_key = 0;
-    }
-
-  if (pool_start.version != 0)
-    omp->options.pool_start = pool_start;
-  if (pool_end.version != 0)
-    omp->options.pool_end = pool_end;
-
-  omp->options.max_clients = max_clients;
-  omp->options.keepalive_ping = keepalive_ping;
-  omp->options.keepalive_timeout = keepalive_timeout;
-  omp->options.handshake_window = handshake_timeout;
-  omp->options.renegotiate_seconds = renegotiate_seconds;
-  omp->options.renegotiate_bytes = renegotiate_bytes;
-  omp->options.renegotiate_packets = renegotiate_packets;
-  omp->options.tls_timeout = tls_timeout;
-  omp->options.replay_protection = replay_protection;
-  omp->options.replay_window = replay_window;
-  omp->options.replay_time = replay_time;
-  omp->options.transition_window = transition_window;
-
-  /*
-   * Initialize time_backtrack for control channel replay protection
-   * This is used with long-form packet_id (packet_id + net_time) in TLS-Auth/TLS-Crypt
-   */
-  if (omp->tls_crypt.enabled && replay_protection)
-    {
-      omp->tls_crypt.time_backtrack = replay_time;
-      omp->tls_crypt.replay_time_floor = 0;
-    }
-  if (omp->tls_auth.enabled && replay_protection)
-    {
-      omp->tls_auth.time_backtrack = replay_time;
-      omp->tls_auth.replay_time_floor = 0;
-    }
-
-  /* Initialize picotls context */
-  error = ovpn_init_picotls_context (omp);
-  if (error)
-    {
-      error = clib_error_return (0, "failed to initialize picotls: %U",
-				 format_clib_error, error);
-      goto done;
-    }
-  vlib_cli_output (vm, "Initialized picotls context");
-
-  /* Create OpenVPN interface if dev_name is specified */
-  if (dev_name && !omp->is_enabled)
-    {
-      u32 sw_if_index = ~0;
-      /* Convert char* to u8* vector for interface name */
-      u8 *if_name = format (0, "%s", dev_name);
-      int rv = ovpn_if_create (vm, if_name, is_tun, mtu, &sw_if_index);
-      vec_free (if_name);
-
-      if (rv < 0)
-	{
-	  error = clib_error_return (0, "failed to create OpenVPN interface");
-	  goto done;
-	}
-
-      /* Store sw_if_index in options */
-      omp->options.sw_if_index = sw_if_index;
-      vlib_cli_output (
-	vm,
-	"Created OpenVPN interface %s (sw_if_index %u, mode %s, "
-	"mtu %u)",
-	dev_name, sw_if_index, is_tun ? "TUN" : "TAP", mtu);
-
-      /* Set IP address if server_addr is specified */
-      if (server_addr.fp_proto != 0)
-	{
-	  if (server_addr.fp_proto == FIB_PROTOCOL_IP4)
-	    {
-	      /* Add IPv4 address to interface */
-	      ip4_add_del_interface_address (
-		vm, sw_if_index, &server_addr.fp_addr.ip4, server_addr.fp_len,
-		0 /* is_del */);
-
-	      vlib_cli_output (vm, "Set interface address: %U/%d",
-			       format_ip4_address, &server_addr.fp_addr.ip4,
-			       server_addr.fp_len);
-	    }
-	  else if (server_addr.fp_proto == FIB_PROTOCOL_IP6)
-	    {
-	      /* Add IPv6 address to interface */
-	      ip6_add_del_interface_address (
-		vm, sw_if_index, &server_addr.fp_addr.ip6, server_addr.fp_len,
-		0 /* is_del */);
-
-	      vlib_cli_output (vm, "Set interface address: %U/%d",
-			       format_ip6_address, &server_addr.fp_addr.ip6,
-			       server_addr.fp_len);
-	    }
-	}
-    }
-
-  /* Register UDP port for both IPv4 and IPv6 */
-  if (!omp->is_enabled)
-    {
-      /* Register UDP port with input nodes */
-      udp_register_dst_port (vm, (u16) port, omp->ovpn4_input_node_index,
-			     UDP_IP4);
-      udp_register_dst_port (vm, (u16) port, omp->ovpn6_input_node_index,
-			     UDP_IP6);
-
-      /* Initialize peer and pending databases for this interface */
-      if (omp->options.sw_if_index != ~0)
-	{
-	  ovpn_peer_db_init (&omp->multi_context.peer_db,
-			     omp->options.sw_if_index);
-	  ovpn_pending_db_init (&omp->multi_context.pending_db);
-	}
-
-      omp->is_enabled = 1;
-      vlib_cli_output (vm, "Registered UDP port %u (IPv4/IPv6)", port);
-    }
-
-  vlib_cli_output (vm, "OpenVPN enabled on port %u", port);
-
-done:
-  /* Clean up loaded resources if enable failed and wasn't enabled before */
-  if (error && !was_enabled)
-    {
-      ovpn_free_options (&omp->options);
-      ovpn_cleanup_picotls_context (omp);
-    }
-
-  /* Free any remaining local strings that weren't transferred */
-  vec_free (dev_name);
-  vec_free (ca_cert);
-  vec_free (server_cert);
-  vec_free (server_key);
-  vec_free (dh_params);
-  vec_free (cipher);
-  vec_free (auth);
-  vec_free (tls_crypt_key);
-  vec_free (tls_crypt_v2_key);
-  vec_free (tls_auth_key);
-
-  unformat_free (line_input);
-  return error;
-}
-
-static clib_error_t *
 ovpn_show_command_fn (vlib_main_t *vm,
 		      unformat_input_t *input __attribute__ ((unused)),
 		      vlib_cli_command_t *cmd __attribute__ ((unused)))
@@ -770,11 +246,17 @@ ovpn_show_command_fn (vlib_main_t *vm,
   vlib_cli_output (vm, "OpenVPN Configuration:");
   vlib_cli_output (vm, "  Status: %s",
 		   omp->is_enabled ? "Enabled" : "Disabled");
+  vlib_cli_output (vm, "  Mode: %s",
+		   opt->static_key_mode ? "Static Key" : "TLS");
   vlib_cli_output (vm, "  Listen Port: %u", opt->listen_port);
   vlib_cli_output (vm, "  Protocol: %s",
 		   opt->proto == IP_PROTOCOL_UDP ? "UDP" : "Unknown");
-  vlib_cli_output (vm, "  Picotls Context: %s",
-		   omp->ptls_ctx ? "Initialized" : "Not initialized");
+  if (opt->static_key_mode)
+    vlib_cli_output (vm, "  Static Key Direction: %u",
+		     opt->static_key_direction);
+  else
+    vlib_cli_output (vm, "  Picotls Context: %s",
+		     omp->ptls_ctx ? "Initialized" : "Not initialized");
 
   if (opt->dev_name)
     {
@@ -806,11 +288,11 @@ ovpn_show_command_fn (vlib_main_t *vm,
     vlib_cli_output (vm, "  Cipher: %s", opt->cipher_name);
   vlib_cli_output (
     vm, "  Cipher Algorithm: %s",
-    omp->cipher_alg == OVPN_CIPHER_ALG_AES_128_GCM ? "AES-128-GCM" :
-    omp->cipher_alg == OVPN_CIPHER_ALG_AES_256_GCM ? "AES-256-GCM" :
-    omp->cipher_alg == OVPN_CIPHER_ALG_CHACHA20_POLY1305 ?
-						     "CHACHA20-POLY1305" :
-						     "NONE");
+    omp->cipher_alg == OVPN_CIPHER_ALG_AES_128_GCM	? "AES-128-GCM" :
+    omp->cipher_alg == OVPN_CIPHER_ALG_AES_256_GCM	? "AES-256-GCM" :
+    omp->cipher_alg == OVPN_CIPHER_ALG_CHACHA20_POLY1305 ? "CHACHA20-POLY1305" :
+    omp->cipher_alg == OVPN_CIPHER_ALG_AES_256_CBC	? "AES-256-CBC" :
+							  "NONE");
   if (opt->tls_crypt_key)
     vlib_cli_output (vm, "  TLS-Crypt Key: loaded (%u bytes)",
 		     vec_len (opt->tls_crypt_key));
@@ -856,38 +338,6 @@ ovpn_show_command_fn (vlib_main_t *vm,
 }
 
 /*?
- * Enable or disable OpenVPN server
- *
- * @cliexpar
- * @cliexstart{ovpn}
- * ovpn enable port 1194 dev tun0 dev-type tun tun-mtu 1420 server 10.8.0.1/24
-ifconfig-pool 10.8.0.10 10.8.0.250
- * @cliexend
- * @cliexstart{ovpn}
- * ovpn enable port 1194 dev tap0 dev-type tap tun-mtu 1500 ca /path/to/ca.crt
-cert /path/to/server.crt key /path/to/server.key
- * @cliexend
- * @cliexstart{ovpn}
- * ovpn disable
- * @cliexend
- ?*/
-VLIB_CLI_COMMAND (ovpn_enable_command, static) = {
-  .path = "ovpn",
-  .short_help = "ovpn [enable|disable] [port <port>] [dev <name>] "
-		"[dev-type tun|tap] [tun-mtu <size>] "
-		"[ca <path>] [cert <path>] [key <path>] "
-		"[dh <path>] [cipher <name>] [auth <name>] "
-		"[tls-crypt <path>] [tls-crypt-v2 <path>] [tls-auth <path>] "
-		"[server <ip>/<len>] "
-		"[ifconfig-pool <start-ip> <end-ip>] [max-clients <n>] "
-		"[keepalive <ping> <timeout>] "
-		"[hand-window <sec>] [tls-timeout <sec>] "
-		"[reneg-sec <sec>] [reneg-bytes <n>] [reneg-pkts <n>] "
-		"[replay-window <n> [<t>]] [transition-window <sec>]",
-  .function = ovpn_enable_command_fn,
-};
-
-/*?
  * Show OpenVPN configuration
  *
  * @cliexpar
@@ -906,6 +356,437 @@ extern vlib_node_registration_t ovpn4_input_node;
 extern vlib_node_registration_t ovpn6_input_node;
 extern vlib_node_registration_t ovpn4_output_node;
 extern vlib_node_registration_t ovpn6_output_node;
+
+/*
+ * CLI: ovpn create local <ip> port <port> [options...]
+ * Creates an OpenVPN interface with full configuration options.
+ */
+static clib_error_t *
+ovpn_create_command_fn (vlib_main_t *vm, unformat_input_t *input,
+			vlib_cli_command_t *cmd)
+{
+  ovpn_main_t *omp = &ovpn_main;
+  unformat_input_t _line_input, *line_input = &_line_input;
+  clib_error_t *error = NULL;
+  ip_address_t local_addr = { 0 };
+  u32 port = 1194;
+  u8 *dev_name = 0;
+  u8 *ca_cert = 0;
+  u8 *server_cert = 0;
+  u8 *server_key = 0;
+  u8 *dh_params = 0;
+  u8 *cipher = 0;
+  u8 *auth = 0;
+  u8 *tls_crypt_key = 0;
+  u8 *tls_crypt_v2_key = 0;
+  u8 *tls_auth_key = 0;
+  u8 *secret_key = 0;
+  ip_address_t pool_start, pool_end;
+  fib_prefix_t server_addr;
+  int got_local = 0;
+  /* OpenVPN defaults */
+  u32 max_clients = 1024;
+  u32 keepalive_ping = 10;
+  u32 keepalive_timeout = 120;
+  u32 handshake_timeout = 60;
+  u32 renegotiate_seconds = 3600;
+  u32 tls_timeout = 2;
+  u8 replay_protection = 1;
+  u32 replay_window = 64;
+  u32 replay_time = 15;
+  u32 transition_window = 3600;
+  u16 mtu = 1500;
+  u8 is_tun = 1;
+
+  clib_memset (&pool_start, 0, sizeof (pool_start));
+  clib_memset (&pool_end, 0, sizeof (pool_end));
+  clib_memset (&server_addr, 0, sizeof (server_addr));
+
+  if (!unformat_user (input, unformat_line_input, line_input))
+    return clib_error_return (0, "expected arguments");
+
+  while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (line_input, "local %U", unformat_ip_address, &local_addr))
+	got_local = 1;
+      else if (unformat (line_input, "port %u", &port))
+	;
+      else if (unformat (line_input, "dev %s", &dev_name))
+	;
+      else if (unformat (line_input, "ca %s", &ca_cert))
+	;
+      else if (unformat (line_input, "cert %s", &server_cert))
+	;
+      else if (unformat (line_input, "key %s", &server_key))
+	;
+      else if (unformat (line_input, "dh %s", &dh_params))
+	;
+      else if (unformat (line_input, "cipher %s", &cipher))
+	;
+      else if (unformat (line_input, "auth %s", &auth))
+	;
+      else if (unformat (line_input, "tls-crypt %s", &tls_crypt_key))
+	;
+      else if (unformat (line_input, "tls-crypt-v2 %s", &tls_crypt_v2_key))
+	;
+      else if (unformat (line_input, "tls-auth %s", &tls_auth_key))
+	;
+      else if (unformat (line_input, "secret %s", &secret_key))
+	;
+      else if (unformat (line_input, "server %U/%d", unformat_ip4_address,
+			 &server_addr.fp_addr.ip4, &server_addr.fp_len))
+	server_addr.fp_proto = FIB_PROTOCOL_IP4;
+      else if (unformat (line_input, "server %U/%d", unformat_ip6_address,
+			 &server_addr.fp_addr.ip6, &server_addr.fp_len))
+	server_addr.fp_proto = FIB_PROTOCOL_IP6;
+      else if (unformat (line_input, "ifconfig-pool %U %U",
+			 unformat_ip4_address, &pool_start.ip.ip4,
+			 unformat_ip4_address, &pool_end.ip.ip4))
+	{
+	  pool_start.version = AF_IP4;
+	  pool_end.version = AF_IP4;
+	}
+      else if (unformat (line_input, "max-clients %u", &max_clients))
+	;
+      else if (unformat (line_input, "keepalive %u %u", &keepalive_ping,
+			 &keepalive_timeout))
+	;
+      else if (unformat (line_input, "hand-window %u", &handshake_timeout))
+	;
+      else if (unformat (line_input, "reneg-sec %u", &renegotiate_seconds))
+	;
+      else if (unformat (line_input, "tls-timeout %u", &tls_timeout))
+	;
+      else if (unformat (line_input, "replay-window %u %u", &replay_window,
+			 &replay_time))
+	;
+      else if (unformat (line_input, "replay-window %u", &replay_window))
+	;
+      else if (unformat (line_input, "tun-mtu %u", &mtu))
+	;
+      else if (unformat (line_input, "dev-type tun"))
+	is_tun = 1;
+      else if (unformat (line_input, "dev-type tap"))
+	is_tun = 0;
+      else
+	{
+	  error = clib_error_return (0, "unknown input `%U'",
+				     format_unformat_error, line_input);
+	  goto done;
+	}
+    }
+
+  if (!got_local)
+    {
+      error = clib_error_return (0, "local address required");
+      goto done;
+    }
+
+  if (omp->is_enabled)
+    {
+      error = clib_error_return (0, "OpenVPN already enabled");
+      goto done;
+    }
+
+  /* Configure options */
+  omp->options.listen_port = (u16) port;
+  omp->options.proto = IP_PROTOCOL_UDP;
+  omp->options.mtu = mtu;
+  omp->options.is_tun = is_tun;
+
+  /* Store local address */
+  if (ip_addr_version (&local_addr) == AF_IP6)
+    {
+      server_addr.fp_proto = FIB_PROTOCOL_IP6;
+      server_addr.fp_len = 128;
+      clib_memcpy (&server_addr.fp_addr.ip6, &local_addr.ip.ip6,
+		   sizeof (ip6_address_t));
+    }
+  else
+    {
+      server_addr.fp_proto = FIB_PROTOCOL_IP4;
+      server_addr.fp_len = 32;
+      server_addr.fp_addr.ip4.as_u32 = local_addr.ip.ip4.as_u32;
+    }
+  omp->options.server_addr = server_addr;
+
+  /* Set device name */
+  if (dev_name)
+    {
+      omp->options.dev_name = (char *) dev_name;
+      dev_name = 0;
+    }
+  else
+    omp->options.dev_name = (char *) format (0, "ovpn0%c", 0);
+
+  /* Load TLS-Crypt key if specified */
+  if (tls_crypt_key)
+    {
+      error = ovpn_read_file_contents ((char *) tls_crypt_key,
+				       &omp->options.tls_crypt_key);
+      if (error)
+	{
+	  error = clib_error_return (0, "failed to read TLS-Crypt key: %U",
+				     format_clib_error, error);
+	  goto done;
+	}
+      int rv = ovpn_tls_crypt_parse_key (omp->options.tls_crypt_key,
+					 vec_len (omp->options.tls_crypt_key),
+					 &omp->tls_crypt, 1);
+      if (rv < 0)
+	{
+	  error = clib_error_return (0, "failed to parse TLS-Crypt key: %d", rv);
+	  goto done;
+	}
+      vlib_cli_output (vm, "TLS-Crypt initialized");
+    }
+
+  /* Load TLS-Auth key if specified */
+  if (tls_auth_key)
+    {
+      error = ovpn_read_file_contents ((char *) tls_auth_key,
+				       &omp->options.tls_auth_key);
+      if (error)
+	{
+	  error = clib_error_return (0, "failed to read TLS-Auth key: %U",
+				     format_clib_error, error);
+	  goto done;
+	}
+      vlib_cli_output (vm, "Loaded TLS-Auth key (%u bytes)",
+		       vec_len (omp->options.tls_auth_key));
+    }
+
+  /* Load certificates if specified */
+  if (ca_cert)
+    {
+      error = ovpn_read_file_contents ((char *) ca_cert, &omp->options.ca_cert);
+      if (error)
+	goto done;
+    }
+  if (server_cert)
+    {
+      error = ovpn_read_file_contents ((char *) server_cert,
+				       &omp->options.server_cert);
+      if (error)
+	goto done;
+    }
+  if (server_key)
+    {
+      error = ovpn_read_file_contents ((char *) server_key,
+				       &omp->options.server_key);
+      if (error)
+	goto done;
+    }
+
+  /* Set cipher */
+  if (cipher)
+    {
+      omp->cipher_alg = ovpn_crypto_cipher_alg_from_name ((char *) cipher);
+      if (omp->cipher_alg == OVPN_CIPHER_ALG_NONE)
+	{
+	  error = clib_error_return (0, "unsupported cipher: %s", cipher);
+	  goto done;
+	}
+    }
+  else
+    omp->cipher_alg = OVPN_CIPHER_ALG_AES_256_GCM;
+
+  /* Set other options */
+  omp->options.max_clients = max_clients;
+  omp->options.keepalive_ping = keepalive_ping;
+  omp->options.keepalive_timeout = keepalive_timeout;
+  omp->options.handshake_window = handshake_timeout;
+  omp->options.renegotiate_seconds = renegotiate_seconds;
+  omp->options.tls_timeout = tls_timeout;
+  omp->options.replay_protection = replay_protection;
+  omp->options.replay_window = replay_window;
+  omp->options.replay_time = replay_time;
+  omp->options.transition_window = transition_window;
+  if (pool_start.version != 0)
+    omp->options.pool_start = pool_start;
+  if (pool_end.version != 0)
+    omp->options.pool_end = pool_end;
+
+  /* Initialize replay protection for TLS */
+  if (omp->tls_crypt.enabled && replay_protection)
+    {
+      omp->tls_crypt.time_backtrack = replay_time;
+      omp->tls_crypt.replay_time_floor = 0;
+    }
+
+  /* Load static key if specified (--secret option) */
+  if (secret_key)
+    {
+      u8 *key_contents = NULL;
+      error = ovpn_read_file_contents ((char *) secret_key, &key_contents);
+      if (error)
+	{
+	  error = clib_error_return (0, "failed to read static key file: %U",
+				     format_clib_error, error);
+	  goto done;
+	}
+
+      /* Allocate storage for parsed key */
+      omp->options.static_key = clib_mem_alloc (OVPN_STATIC_KEY_SIZE);
+      if (!omp->options.static_key)
+	{
+	  vec_free (key_contents);
+	  error = clib_error_return (0, "failed to allocate static key memory");
+	  goto done;
+	}
+
+      /* Parse the static key file */
+      int rv = ovpn_parse_static_key (key_contents, vec_len (key_contents),
+				      omp->options.static_key);
+      vec_free (key_contents);
+      if (rv < 0)
+	{
+	  clib_mem_free (omp->options.static_key);
+	  omp->options.static_key = NULL;
+	  error = clib_error_return (0, "failed to parse static key: %d", rv);
+	  goto done;
+	}
+
+      omp->options.static_key_mode = 1;
+      omp->options.static_key_direction = 0; /* Server mode = direction 0 */
+
+      /* For static key mode, use AES-256-CBC as default (not AEAD)
+       * unless explicitly overridden by cipher option */
+      if (!cipher)
+	omp->cipher_alg = OVPN_CIPHER_ALG_AES_256_CBC;
+
+      vlib_cli_output (vm, "Static key loaded (direction %u, cipher %s)",
+		       omp->options.static_key_direction,
+		       omp->cipher_alg == OVPN_CIPHER_ALG_AES_256_CBC ?
+			 "AES-256-CBC" :
+			 "specified");
+    }
+
+  /* Initialize picotls context (only needed for TLS mode) */
+  if (!omp->options.static_key_mode)
+    {
+      error = ovpn_init_picotls_context (omp);
+      if (error)
+	{
+	  error = clib_error_return (0, "failed to initialize picotls: %U",
+				     format_clib_error, error);
+	  goto done;
+	}
+    }
+
+  /* Create the OpenVPN interface */
+  u32 sw_if_index = ~0;
+  int rv = ovpn_if_create (vm, (u8 *) omp->options.dev_name, is_tun, mtu,
+			   &sw_if_index);
+  if (rv != 0)
+    {
+      error = clib_error_return (0, "failed to create ovpn interface");
+      goto done;
+    }
+  omp->options.sw_if_index = sw_if_index;
+
+  /* Register UDP port */
+  udp_register_dst_port (vm, port, ovpn4_input_node.index, UDP_IP4);
+  udp_register_dst_port (vm, port, ovpn6_input_node.index, UDP_IP6);
+
+  /* Initialize peer database */
+  ovpn_peer_db_init (&omp->multi_context.peer_db, sw_if_index);
+  ovpn_pending_db_init (&omp->multi_context.pending_db);
+
+  omp->is_enabled = 1;
+  vlib_cli_output (vm, "OpenVPN interface %s created on port %u",
+		   omp->options.dev_name, port);
+
+done:
+  vec_free (dev_name);
+  vec_free (ca_cert);
+  vec_free (server_cert);
+  vec_free (server_key);
+  vec_free (dh_params);
+  vec_free (cipher);
+  vec_free (auth);
+  vec_free (tls_crypt_key);
+  vec_free (tls_crypt_v2_key);
+  vec_free (tls_auth_key);
+  vec_free (secret_key);
+  unformat_free (line_input);
+  return error;
+}
+
+VLIB_CLI_COMMAND (ovpn_create_command, static) = {
+  .path = "ovpn create",
+  .short_help = "ovpn create local <ip> port <port> [dev <name>] "
+		"[secret <keyfile>] "
+		"[tls-crypt <key>] [tls-auth <key>] [ca <cert>] [cert <cert>] "
+		"[key <key>] [cipher <name>] [server <ip>/<len>]",
+  .function = ovpn_create_command_fn,
+};
+
+/*
+ * CLI: ovpn delete interface <name>
+ * Deletes an OpenVPN interface.
+ */
+static clib_error_t *
+ovpn_delete_command_fn (vlib_main_t *vm, unformat_input_t *input,
+			vlib_cli_command_t *cmd)
+{
+  ovpn_main_t *omp = &ovpn_main;
+  unformat_input_t _line_input, *line_input = &_line_input;
+  u32 sw_if_index = ~0;
+  clib_error_t *error = NULL;
+
+  if (!unformat_user (input, unformat_line_input, line_input))
+    return clib_error_return (0, "expected interface name");
+
+  if (unformat (line_input, "interface %U", unformat_vnet_sw_interface,
+		vnet_get_main (), &sw_if_index))
+    ;
+  else
+    {
+      error = clib_error_return (0, "unknown input `%U'",
+				 format_unformat_error, line_input);
+      goto done;
+    }
+
+  if (!omp->is_enabled || omp->options.sw_if_index != sw_if_index)
+    {
+      error = clib_error_return (0, "interface not found or not an OpenVPN interface");
+      goto done;
+    }
+
+  /* Unregister UDP port */
+  udp_unregister_dst_port (vm, omp->options.listen_port, UDP_IP4);
+  udp_unregister_dst_port (vm, omp->options.listen_port, UDP_IP6);
+
+  /* Delete the interface */
+  ovpn_if_delete (vm, sw_if_index);
+
+  /* Cleanup databases */
+  ovpn_peer_db_free (&omp->multi_context.peer_db);
+  ovpn_pending_db_free (&omp->multi_context.pending_db);
+
+  /* Cleanup picotls context */
+  ovpn_cleanup_picotls_context (omp);
+
+  /* Free options */
+  ovpn_free_options (&omp->options);
+
+  /* Reset state */
+  omp->options.sw_if_index = ~0;
+  omp->is_enabled = 0;
+
+  vlib_cli_output (vm, "OpenVPN interface deleted");
+
+done:
+  unformat_free (line_input);
+  return error;
+}
+
+VLIB_CLI_COMMAND (ovpn_delete_command, static) = {
+  .path = "ovpn delete",
+  .short_help = "ovpn delete interface <interface>",
+  .function = ovpn_delete_command_fn,
+};
 
 /*
  * Plugin initialization
