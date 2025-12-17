@@ -285,23 +285,32 @@ ovpn_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
 	  /*
 	   * After encryption, buffer structure is:
-	   *   current_data points to encrypted packet (opcode)
+	   *   current_data points to encrypted packet (HMAC)
 	   *   current_length = encrypted packet size
 	   *
 	   * We need to:
 	   * 1. Make room for outer headers by moving encrypted data forward
 	   * 2. Copy outer headers to the beginning
+	   *
+	   * Note: The memmove from encrypted_start to final_start + outer_hdr_len
+	   * may be a no-op since they end up at the same address, but the
+	   * memcpy of the outer header is essential.
 	   */
-	  u8 *encrypted_start = vlib_buffer_get_current (b0);
 	  u32 encrypted_len = b0->current_length;
+
+	  clib_warning (
+	    "OVPN output: before retreat: current_data=%u current_length=%u",
+	    b0->current_data, encrypted_len);
 
 	  /* Retreat to make room for outer headers */
 	  vlib_buffer_advance (b0, -(i32) outer_hdr_len);
 
-	  /* Move encrypted data forward to its final position */
+	  clib_warning (
+	    "OVPN output: after retreat: current_data=%u new_space=%u",
+	    b0->current_data, outer_hdr_len);
+
+	  /* Get final position and copy outer headers */
 	  u8 *final_start = vlib_buffer_get_current (b0);
-	  clib_memmove (final_start + outer_hdr_len, encrypted_start,
-			encrypted_len);
 
 	  /* Copy saved outer headers to the beginning */
 	  clib_memcpy_fast (final_start, saved_outer_hdr, outer_hdr_len);
