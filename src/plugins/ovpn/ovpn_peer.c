@@ -591,6 +591,12 @@ ovpn_peer_build_rewrite (ovpn_peer_t *peer, const ip_address_t *local_addr,
   peer->rewrite = rewrite;
   peer->rewrite_len = vec_len (rewrite);
 
+  clib_warning (
+    "OVPN peer_build_rewrite: peer_id=%u is_ipv6=%u local_port=%u "
+    "remote_port=%u rewrite_len=%u",
+    peer->peer_id, peer->is_ipv6, local_port, peer->remote_port,
+    peer->rewrite_len);
+
   return 0;
 }
 
@@ -1065,6 +1071,13 @@ ovpn_peer_adj_index_del (adj_index_t ai)
 
 /*
  * Stack the peer's adjacency to reach the endpoint
+ *
+ * This function stacks the midchain adjacency on the FIB entry for the
+ * peer's remote address. adj_midchain_delegate_stack handles:
+ * 1. Creating a delegate that tracks the FIB entry for back-walk notifications
+ * 2. Calling adj_nbr_midchain_stack_on_fib_entry which properly handles
+ *    load-balance DPOs by extracting a single bucket and setting up
+ *    adj->sub_type.midchain.adj_dpo for adj-midchain-tx
  */
 void
 ovpn_peer_adj_stack (ovpn_peer_t *peer, adj_index_t ai)
@@ -1079,6 +1092,12 @@ ovpn_peer_adj_stack (ovpn_peer_t *peer, adj_index_t ai)
 
   fib_index = fib_table_find (fib_proto, peer->fib_index);
 
+  clib_warning (
+    "OVPN adj_stack: ai=%u peer_fib_index=%u resolved_fib_index=%u "
+    "remote_addr=%U is_ipv6=%u",
+    ai, peer->fib_index, fib_index, format_ip_address, &peer->remote_addr,
+    peer->is_ipv6);
+
   if (fib_index != ~0)
     {
       fib_prefix_t dst = {
@@ -1091,7 +1110,37 @@ ovpn_peer_adj_stack (ovpn_peer_t *peer, adj_index_t ai)
       else
 	dst.fp_addr.ip4 = peer->remote_addr.ip.ip4;
 
+      clib_warning ("OVPN adj_stack: stacking ai=%u to fib=%u dst=%U/%u", ai,
+		    fib_index, format_ip_address, &peer->remote_addr,
+		    dst.fp_len);
+
+      /*
+       * Use adj_midchain_delegate_stack which:
+       * 1. Creates a delegate for back-walk notifications when route changes
+       * 2. Calls adj_nbr_midchain_stack_on_fib_entry which properly handles
+       *    load-balance DPOs by extracting a single bucket
+       * 3. Sets up adj->sub_type.midchain.adj_dpo for adj-midchain-tx
+       *
+       * Do NOT call adj_nbr_midchain_stack manually after this - it would
+       * overwrite the correctly-set DPO with a raw load-balance DPO that
+       * has dpo_next=0 (error-drop) in the adj-midchain-tx context.
+       */
       adj_midchain_delegate_stack (ai, fib_index, &dst);
+
+      /* Verify the adjacency's DPO is set up correctly */
+      ip_adjacency_t *adj = adj_get (ai);
+      clib_warning (
+	"OVPN adj_stack: after delegate_stack, next_dpo type=%u index=%u "
+	"next=%u",
+	adj->sub_type.midchain.next_dpo.dpoi_type,
+	adj->sub_type.midchain.next_dpo.dpoi_index,
+	adj->sub_type.midchain.next_dpo.dpoi_next_node);
+    }
+  else
+    {
+      clib_warning (
+	"OVPN adj_stack: FAILED to find fib for table_id=%u - no stacking!",
+	peer->fib_index);
     }
 }
 
@@ -1206,8 +1255,17 @@ ovpn_peer_send_ping (vlib_main_t *vm, ovpn_peer_t *peer)
   /* Get key_id from current key slot */
   u8 key_id = peer->keys[peer->current_key_slot].key_id;
 
-  /* Encrypt the ping packet (adds DATA_V2 header and tag) */
-  rv = ovpn_crypto_encrypt (vm, crypto, b, peer->peer_id, key_id);
+  /* Encrypt the ping packet based on cipher mode */
+  if (crypto->is_aead)
+    {
+      /* AEAD mode - adds DATA_V2 header and tag */
+      rv = ovpn_crypto_encrypt (vm, crypto, b, peer->peer_id, key_id);
+    }
+  else
+    {
+      /* CBC+HMAC mode - adds HMAC + IV header */
+      rv = ovpn_crypto_cbc_encrypt (vm, crypto, b);
+    }
   if (rv < 0)
     {
       vlib_buffer_free_one (vm, bi);

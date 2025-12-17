@@ -56,9 +56,9 @@ typedef enum
 #define OVPN_HMAC_SIZE_MIN 16	/* Minimum HMAC size for compatibility */
 #define OVPN_CBC_HMAC_SIZE 32	/* SHA256 full output for CBC+HMAC mode */
 
-/* CBC mode minimum packet size: opcode(1) + HMAC(32) + IV(16) + packet_id(4) */
+/* CBC mode minimum packet size: opcode(1) + HMAC(32) + IV(16) + packet_id(4) + timestamp(4) */
 #define OVPN_DATA_V1_CBC_MIN_SIZE                                             \
-  (OVPN_OP_SIZE + OVPN_CBC_HMAC_SIZE + OVPN_IV_SIZE + 4)
+  (OVPN_OP_SIZE + OVPN_CBC_HMAC_SIZE + OVPN_IV_SIZE + 8)
 
 /* Replay protection window constants */
 #define OVPN_REPLAY_WINDOW_SIZE_DEFAULT 64
@@ -329,7 +329,8 @@ ovpn_crypto_reset_ptd (ovpn_per_thread_crypto_t *ptd)
 
 /*
  * CBC+HMAC mode decrypt for single packet (static key mode).
- * Packet format: [opcode:1][HMAC:32][IV:16][encrypted(packet_id:4 + payload)]
+ * Packet format: [opcode:1][HMAC:32][IV:16][encrypted(packet_id:4 + timestamp:4 + payload)]
+ * Note: Uses "long form" packet IDs with timestamp (default with replay-window).
  *
  * @param vm vlib_main_t
  * @param ctx crypto context (must be CBC mode)
@@ -342,8 +343,8 @@ int ovpn_crypto_cbc_decrypt (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
 
 /*
  * CBC+HMAC mode decrypt for static key mode packets WITHOUT opcode byte.
- * Packet format: [HMAC:32][IV:16][encrypted(packet_id:4 + payload)]
- * Note: Static key mode uses "short form" (no timestamp).
+ * Packet format: [HMAC:32][IV:16][encrypted(packet_id:4 + timestamp:4 + payload)]
+ * Note: Uses "long form" packet IDs with timestamp (default with replay-window).
  *
  * @param vm vlib_main_t
  * @param ctx crypto context (must be CBC mode)
@@ -354,6 +355,19 @@ int ovpn_crypto_cbc_decrypt (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
 int ovpn_crypto_cbc_decrypt_no_opcode (vlib_main_t *vm,
 				       ovpn_crypto_context_t *ctx,
 				       vlib_buffer_t *b, u32 *packet_id_out);
+
+/*
+ * CBC+HMAC mode encrypt for single packet (static key mode).
+ * Packet format: [HMAC:32][IV:16][encrypted(packet_id:4 + timestamp:4 + payload)]
+ * Note: Uses "long form" packet IDs with timestamp (default with replay-window).
+ *
+ * @param vm vlib_main_t
+ * @param ctx crypto context (must be CBC mode)
+ * @param b buffer containing plaintext payload
+ * @return 0 on success, <0 on error
+ */
+int ovpn_crypto_cbc_encrypt (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
+			     vlib_buffer_t *b);
 
 #endif /* __included_ovpn_crypto_h__ */
 

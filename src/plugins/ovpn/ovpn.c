@@ -812,6 +812,10 @@ ovpn_init (vlib_main_t *vm)
   omp->out4_fq_index = vlib_frame_queue_main_init (ovpn4_output_node.index, 0);
   omp->out6_fq_index = vlib_frame_queue_main_init (ovpn6_output_node.index, 0);
 
+  /* Allocate high-priority FIB source for tunnel routes */
+  omp->fib_src_hi = fib_source_allocate ("ovpn-hi", FIB_SOURCE_PRIORITY_HI,
+					 FIB_SOURCE_BH_API);
+
   /* Initialize crypto subsystem */
   error = ovpn_crypto_init (vm);
   if (error)

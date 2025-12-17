@@ -228,6 +228,13 @@ ovpn_crypto_context_free (ovpn_crypto_context_t *ctx)
   vnet_crypto_key_del (vlib_get_main (), ctx->encrypt_key_index);
   vnet_crypto_key_del (vlib_get_main (), ctx->decrypt_key_index);
 
+  /* Free HMAC keys for CBC mode */
+  if (!ctx->is_aead)
+    {
+      vnet_crypto_key_del (vlib_get_main (), ctx->encrypt_hmac_key_index);
+      vnet_crypto_key_del (vlib_get_main (), ctx->decrypt_hmac_key_index);
+    }
+
   /* Free extended replay bitmap if allocated */
   if (ctx->replay_bitmap_ext)
     vec_free (ctx->replay_bitmap_ext);
@@ -844,7 +851,8 @@ ovpn_crypto_encrypt (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
 
 /*
  * CBC+HMAC mode decrypt for single packet (static key mode).
- * Packet format: [opcode:1][HMAC:20][IV:16][encrypted(packet_id:4 + payload)]
+ * Packet format: [opcode:1][HMAC:32][IV:16][encrypted(packet_id:4 + timestamp:4 + payload)]
+ * Note: Uses "long form" packet IDs with timestamp (default with replay-window).
  */
 int
 ovpn_crypto_cbc_decrypt (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
@@ -938,9 +946,11 @@ ovpn_crypto_cbc_decrypt (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
 
   /*
    * Step 4: Advance buffer to plaintext payload
-   * Skip: opcode(1) + HMAC(20) + IV(16) + packet_id(4) = 41 bytes
+   * Skip: opcode(1) + HMAC(32) + IV(16) + packet_id(4) + timestamp(4) = 57 bytes
+   * Note: OpenVPN uses "long form" packet IDs with timestamp when
+   * replay-window is enabled (the default).
    */
-  vlib_buffer_advance (b, 1 + OVPN_CBC_HMAC_SIZE + OVPN_IV_SIZE + 4);
+  vlib_buffer_advance (b, 1 + OVPN_CBC_HMAC_SIZE + OVPN_IV_SIZE + 8);
 
   /* Update buffer length to exclude PKCS7 padding
    * For now, we don't strip padding - VPP IP input will ignore extra bytes
@@ -952,10 +962,10 @@ ovpn_crypto_cbc_decrypt (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
 
 /*
  * CBC+HMAC mode decrypt for static key mode packets WITHOUT opcode byte.
- * This is the format used by OpenVPN static key mode (short form).
- * Packet format: [HMAC:32][IV:16][encrypted(packet_id:4 + payload)]
+ * This is the format used by OpenVPN static key mode.
+ * Packet format: [HMAC:32][IV:16][encrypted(packet_id:4 + timestamp:4 + payload)]
  *
- * Note: Static key mode uses "short form" packet IDs (no timestamp).
+ * Note: Uses "long form" packet IDs with timestamp (default with replay-window).
  */
 int
 ovpn_crypto_cbc_decrypt_no_opcode (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
@@ -1075,10 +1085,11 @@ ovpn_crypto_cbc_decrypt_no_opcode (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
 
   /*
    * Step 4: Advance buffer to plaintext payload
-   * Skip: HMAC(32) + IV(16) + packet_id(4) = 52 bytes
-   * Note: No timestamp in short form
+   * Skip: HMAC(32) + IV(16) + packet_id(4) + timestamp(4) = 56 bytes
+   * Note: OpenVPN uses "long form" packet IDs with timestamp when
+   * replay-window is enabled (the default).
    */
-  vlib_buffer_advance (b, OVPN_CBC_HMAC_SIZE + OVPN_IV_SIZE + 4);
+  vlib_buffer_advance (b, OVPN_CBC_HMAC_SIZE + OVPN_IV_SIZE + 8);
 
   clib_warning ("OVPN CBC no-opcode: success, packet_id=%u, payload_len=%u",
 		packet_id, b->current_length);
@@ -1137,6 +1148,133 @@ ovpn_crypto_decrypt (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
 
   /* Remove tag from chain length */
   vlib_buffer_chain_increase_length (b, lb, -OVPN_TAG_SIZE);
+
+  return 0;
+}
+
+/*
+ * CBC+HMAC mode encrypt for single packet (static key mode).
+ * Packet format: [HMAC:32][IV:16][encrypted(packet_id:4 + timestamp:4 + payload)]
+ * Note: Uses "long form" packet IDs with timestamp (default with replay-window).
+ *
+ * @param vm VPP main
+ * @param ctx Crypto context (must be CBC mode, not AEAD)
+ * @param b Buffer containing plaintext payload
+ * @return 0 on success, <0 on error
+ */
+int
+ovpn_crypto_cbc_encrypt (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
+			 vlib_buffer_t *b)
+{
+  u8 *payload;
+  u32 payload_len;
+  u32 packet_id;
+  u8 iv[OVPN_IV_SIZE];
+  u8 *hmac_slot;
+  u8 *iv_slot;
+  u8 *ciphertext_slot;
+  u32 padded_len;
+  u8 pad_len;
+  vnet_crypto_op_t encrypt_op;
+  vnet_crypto_op_t hmac_op;
+
+  if (!ctx->is_valid || ctx->is_aead)
+    return -1; /* Only for CBC mode */
+
+  /* Get current payload */
+  payload = vlib_buffer_get_current (b);
+  payload_len = b->current_length;
+
+  /* Get next packet ID */
+  packet_id = ovpn_crypto_get_next_packet_id (ctx);
+
+  /* Get current time for long-form packet ID */
+  u32 timestamp = (u32) vlib_time_now (vm);
+
+  /*
+   * Calculate padded length for CBC (PKCS7 padding)
+   * plaintext = packet_id(4) + timestamp(4) + payload (long form)
+   * Must be multiple of 16 (AES block size)
+   */
+  u32 plaintext_len = 8 + payload_len;
+  padded_len = (plaintext_len + 15) & ~15;
+  if (padded_len == plaintext_len)
+    padded_len += 16; /* Always add at least 1 byte of padding */
+  pad_len = padded_len - plaintext_len;
+
+  /*
+   * Ensure enough space in buffer for padding.
+   * Header: HMAC(32) + IV(16) = 48 bytes (prepended later)
+   * Note: Static key mode CBC does NOT include opcode byte!
+   * Padding: up to 16 bytes (appended to payload)
+   */
+  u32 header_size = OVPN_CBC_HMAC_SIZE + OVPN_IV_SIZE;
+
+  if (PREDICT_FALSE (vlib_buffer_space_left_at_end (vm, b) < (i32) pad_len))
+    return -2; /* Not enough space for padding */
+
+  /* First, move payload to make room for header + packet_id + timestamp */
+  u8 *new_data = vlib_buffer_push_uninit (b, header_size + 8);
+
+  /* Copy payload after packet_id + timestamp slots */
+  clib_memmove (new_data + header_size + 8, payload, payload_len);
+
+  /* Set up packet structure pointers */
+  hmac_slot = new_data;
+  iv_slot = hmac_slot + OVPN_CBC_HMAC_SIZE;
+  ciphertext_slot = iv_slot + OVPN_IV_SIZE;
+
+  /* Write packet_id and timestamp at start of plaintext (will be encrypted) */
+  *(u32 *) ciphertext_slot = clib_host_to_net_u32 (packet_id);
+  *(u32 *) (ciphertext_slot + 4) = clib_host_to_net_u32 (timestamp);
+
+  /* Add PKCS7 padding */
+  u8 *plaintext_end = ciphertext_slot + plaintext_len;
+  for (u32 i = 0; i < pad_len; i++)
+    plaintext_end[i] = pad_len;
+
+  /* Update buffer length to include padding */
+  b->current_length = header_size + padded_len;
+
+  /* Generate random IV */
+  u8 *random_iv =
+    clib_random_buffer_get_data (&vm->random_buffer, OVPN_IV_SIZE);
+  clib_memcpy_fast (iv, random_iv, OVPN_IV_SIZE);
+  clib_memcpy_fast (iv_slot, iv, OVPN_IV_SIZE);
+
+  /*
+   * Step 1: Encrypt plaintext (packet_id + payload + padding)
+   * CBC encrypts in-place
+   */
+  vnet_crypto_op_init (&encrypt_op, ctx->encrypt_op_id);
+  encrypt_op.key_index = ctx->encrypt_key_index;
+  encrypt_op.src = ciphertext_slot;
+  encrypt_op.dst = ciphertext_slot;
+  encrypt_op.len = padded_len;
+  encrypt_op.iv = iv;
+  encrypt_op.flags = 0;
+
+  vnet_crypto_process_ops (vm, &encrypt_op, 1);
+
+  if (encrypt_op.status != VNET_CRYPTO_OP_STATUS_COMPLETED)
+    return -3; /* Encryption failed */
+
+  /*
+   * Step 2: Compute HMAC over IV + ciphertext
+   */
+  vnet_crypto_op_init (&hmac_op, ctx->hmac_op_id);
+  hmac_op.key_index = ctx->encrypt_hmac_key_index;
+  hmac_op.integ_src = iv_slot;
+  hmac_op.integ_len = OVPN_IV_SIZE + padded_len;
+  hmac_op.digest = hmac_slot;
+  hmac_op.digest_len = OVPN_CBC_HMAC_SIZE;
+  hmac_op.iv = 0;
+  hmac_op.flags = 0;
+
+  vnet_crypto_process_ops (vm, &hmac_op, 1);
+
+  if (hmac_op.status != VNET_CRYPTO_OP_STATUS_COMPLETED)
+    return -4; /* HMAC computation failed */
 
   return 0;
 }

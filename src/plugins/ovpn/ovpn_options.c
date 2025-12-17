@@ -570,32 +570,45 @@ ovpn_setup_static_key_crypto (ovpn_crypto_context_t *ctx,
   clib_memset (&keys, 0, sizeof (keys));
 
   /*
-   * OpenVPN static key layout (256 bytes = 4 x 64-byte subkeys):
-   * - Subkey 0 (bytes 0-63): Client -> Server cipher key
-   * - Subkey 1 (bytes 64-127): Server -> Client cipher key
-   * - Subkey 2 (bytes 128-191): Client -> Server HMAC key
-   * - Subkey 3 (bytes 192-255): Server -> Client HMAC key
+   * OpenVPN static key layout (256 bytes = 2 x 128-byte key structures):
    *
-   * For direction 0 (server):
-   *   - Encrypt with subkey 1, decrypt with subkey 0
-   *   - HMAC encrypt with subkey 3, HMAC decrypt with subkey 2
-   * For direction 1 (client):
-   *   - Encrypt with subkey 0, decrypt with subkey 1
-   *   - HMAC encrypt with subkey 2, HMAC decrypt with subkey 3
+   *   struct key {
+   *     uint8_t cipher[64];  // cipher key material
+   *     uint8_t hmac[64];    // HMAC key material
+   *   };
+   *   struct key2 {
+   *     struct key keys[2];
+   *   };
+   *
+   * Layout:
+   *   - bytes 0-63:    keys[0].cipher
+   *   - bytes 64-127:  keys[0].hmac
+   *   - bytes 128-191: keys[1].cipher
+   *   - bytes 192-255: keys[1].hmac
+   *
+   * For direction 0 (server / KEY_DIRECTION_NORMAL):
+   *   - Encrypt with keys[0] (cipher @ 0, hmac @ 64)
+   *   - Decrypt with keys[1] (cipher @ 128, hmac @ 192)
+   *
+   * For direction 1 (client / KEY_DIRECTION_INVERSE):
+   *   - Encrypt with keys[1] (cipher @ 128, hmac @ 192)
+   *   - Decrypt with keys[0] (cipher @ 0, hmac @ 64)
    */
   if (direction == 0)
     {
-      cipher_encrypt_offset = 64;  /* Subkey 1 */
-      cipher_decrypt_offset = 0;   /* Subkey 0 */
-      hmac_encrypt_offset = 192;   /* Subkey 3 */
-      hmac_decrypt_offset = 128;   /* Subkey 2 */
+      /* Server: encrypt with keys[0], decrypt with keys[1] */
+      cipher_encrypt_offset = 0;    /* keys[0].cipher */
+      hmac_encrypt_offset = 64;     /* keys[0].hmac */
+      cipher_decrypt_offset = 128;  /* keys[1].cipher */
+      hmac_decrypt_offset = 192;    /* keys[1].hmac */
     }
   else
     {
-      cipher_encrypt_offset = 0;   /* Subkey 0 */
-      cipher_decrypt_offset = 64;  /* Subkey 1 */
-      hmac_encrypt_offset = 128;   /* Subkey 2 */
-      hmac_decrypt_offset = 192;   /* Subkey 3 */
+      /* Client: encrypt with keys[1], decrypt with keys[0] */
+      cipher_encrypt_offset = 128;  /* keys[1].cipher */
+      hmac_encrypt_offset = 192;    /* keys[1].hmac */
+      cipher_decrypt_offset = 0;    /* keys[0].cipher */
+      hmac_decrypt_offset = 64;     /* keys[0].hmac */
     }
 
   /* Set key size based on cipher */

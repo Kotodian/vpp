@@ -176,8 +176,9 @@ func (s *OvpnSuite) CreateOpenVpnClientConfig() {
 		ServerTunnelIP: s.TunnelServerIP(),
 	}
 
-	// Create log directory in container
+	// Create log and config directories in container
 	s.Containers.OpenVpnClient.Exec(false, "mkdir -p /tmp/openvpn")
+	s.Containers.OpenVpnClient.Exec(false, "mkdir -p /etc/openvpn")
 
 	// Copy static key from resources to container
 	staticKey, err := os.ReadFile("./resources/openvpn/static.key")

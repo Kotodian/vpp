@@ -32,6 +32,11 @@ COPY \
    $DIR/ovpn_plugin.so \
    ${VPP_LIB_DIR}/vpp_plugins/
 
+# Copy crypto engines for HMAC and cipher operations
+ENV CRYPTO_DIR=vpp-data/lib/vpp_crypto_engines
+RUN mkdir -p ${VPP_LIB_DIR}/vpp_crypto_engines
+COPY ${CRYPTO_DIR}/*.so ${VPP_LIB_DIR}/vpp_crypto_engines/
+
 COPY vpp-data/bin/vpp /usr/bin/
 COPY vpp-data/bin/vppctl /usr/bin/
 COPY vpp-data/bin/vpp_echo /usr/bin/

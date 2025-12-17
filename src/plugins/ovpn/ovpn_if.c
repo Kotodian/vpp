@@ -18,12 +18,20 @@
 #include <vnet/vnet.h>
 #include <vnet/plugin/plugin.h>
 #include <vnet/ip/ip.h>
+#include <vnet/ip/ip4_packet.h>
+#include <vnet/ip/ip6_packet.h>
+#include <vnet/udp/udp_packet.h>
 #include <vnet/ethernet/ethernet.h>
 #include <vnet/adj/adj_midchain.h>
+#include <vnet/adj/adj_nbr.h>
 #include <vppinfra/error.h>
 #include <vppinfra/hash.h>
 #include <ovpn/ovpn_if.h>
 #include <ovpn/ovpn.h>
+
+/* Extern output node registrations */
+extern vlib_node_registration_t ovpn4_output_node;
+extern vlib_node_registration_t ovpn6_output_node;
 
 ovpn_if_main_t ovpn_if_main;
 
@@ -111,6 +119,57 @@ ovpn_if_admin_up_down (vnet_main_t *vnm, u32 hw_if_index, u32 flags)
 }
 
 /*
+ * Adjacency midchain fixup callback for OpenVPN.
+ * Called by adj-midchain-tx AFTER the rewrite (outer IP+UDP header) is applied.
+ * Updates the IP length, IP checksum, and UDP length fields to match
+ * the actual encrypted payload size.
+ */
+static void
+ovpn_adj_midchain_fixup (vlib_main_t *vm, const struct ip_adjacency_t_ *adj,
+			 vlib_buffer_t *b, const void *data)
+{
+  /* Buffer now starts at outer IP header (rewrite has been applied) */
+  u8 *ip_start = vlib_buffer_get_current (b);
+  u8 ip_version = (ip_start[0] >> 4) & 0xf;
+  u16 total_len = vlib_buffer_length_in_chain (vm, b);
+
+  if (ip_version == 4)
+    {
+      ip4_header_t *ip4 = (ip4_header_t *) ip_start;
+      udp_header_t *udp = (udp_header_t *) (ip4 + 1);
+
+      /* Update IP total length */
+      u16 old_len = ip4->length;
+      u16 new_len = clib_host_to_net_u16 (total_len);
+      ip4->length = new_len;
+
+      /* Incrementally update IP checksum */
+      ip_csum_t sum = ip4->checksum;
+      sum = ip_csum_update (sum, old_len, new_len, ip4_header_t, length);
+      ip4->checksum = ip_csum_fold (sum);
+
+      /* Update UDP length (checksum = 0 is valid for UDP over IPv4) */
+      udp->length = clib_host_to_net_u16 (total_len - sizeof (ip4_header_t));
+      udp->checksum = 0;
+    }
+  else if (ip_version == 6)
+    {
+      ip6_header_t *ip6 = (ip6_header_t *) ip_start;
+      udp_header_t *udp = (udp_header_t *) (ip6 + 1);
+      int bogus = 0;
+
+      /* Update IPv6 payload length */
+      ip6->payload_length =
+	clib_host_to_net_u16 (total_len - sizeof (ip6_header_t));
+      udp->length = ip6->payload_length;
+
+      /* IPv6 UDP checksum is mandatory */
+      udp->checksum = 0;
+      udp->checksum = ip6_tcp_udp_icmp_compute_checksum (vm, b, ip6, &bogus);
+    }
+}
+
+/*
  * Update adjacency callback for OpenVPN interface
  * Converts neighbor adjacencies into midchain adjacencies that
  * will be processed by the OpenVPN output nodes
@@ -121,8 +180,12 @@ ovpn_if_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai)
   ovpn_main_t *omp = &ovpn_main;
   ovpn_peer_t *peer;
   ip_adjacency_t *adj;
+  int peer_count = 0;
 
   adj = adj_get (ai);
+
+  clib_warning ("OVPN update_adj: sw_if_index=%u ai=%u adj_type=%u",
+		sw_if_index, ai, adj->lookup_next_index);
 
   /*
    * Convert any neighbour adjacency that has a next-hop reachable through
@@ -137,6 +200,11 @@ ovpn_if_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai)
    */
   pool_foreach (peer, omp->multi_context.peer_db.peers)
     {
+      peer_count++;
+      clib_warning (
+	"OVPN update_adj: peer_id=%u sw_if=%u state=%u virtual_ip_set=%u",
+	peer->peer_id, peer->sw_if_index, peer->state, peer->virtual_ip_set);
+
       if (peer->sw_if_index != sw_if_index)
 	continue;
       if (peer->state != OVPN_PEER_STATE_ESTABLISHED)
@@ -173,19 +241,85 @@ ovpn_if_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai)
 
       if (match)
 	{
+	  clib_warning ("OVPN update_adj: MATCH! peer_id=%u ai=%u rewrite=%p "
+			"rewrite_len=%u",
+			peer->peer_id, ai, peer->rewrite,
+			peer->rewrite ? vec_len (peer->rewrite) : 0);
+
 	  /* Associate this adjacency with the peer */
 	  ovpn_peer_adj_index_add (peer->peer_id, ai);
 
-	  /* Update the midchain with the peer's rewrite */
-	  adj_nbr_midchain_update_rewrite (ai, NULL, NULL,
+	  /* Update the midchain with the peer's rewrite and fixup callback */
+	  adj_nbr_midchain_update_rewrite (ai, ovpn_adj_midchain_fixup, NULL,
 					   ADJ_FLAG_MIDCHAIN_IP_STACK,
 					   vec_dup (peer->rewrite));
 
-	  /* Stack the adjacency */
+	  /*
+	   * Direct the adjacency to the OpenVPN output node for encryption.
+	   * This ensures packets go through encryption before being sent out.
+	   */
+	  u32 output_node_index =
+	    (adj->ia_nh_proto == FIB_PROTOCOL_IP4) ? ovpn4_output_node.index :
+						    ovpn6_output_node.index;
+	  vlib_node_t *next_node =
+	    vlib_get_node (vlib_get_main (), output_node_index);
+	  clib_warning (
+	    "OVPN update_adj: setting midchain next to node %u (%s) (ovpn4=%u, "
+	    "ovpn6=%u)",
+	    output_node_index, next_node ? (char *) next_node->name : "UNKNOWN",
+	    ovpn4_output_node.index, ovpn6_output_node.index);
+	  adj_nbr_midchain_update_next_node (ai, output_node_index);
+
+	  /* Verify the midchain setup */
+	  adj = adj_get (ai);
+	  vlib_node_t *adj_node =
+	    vlib_get_node (vlib_get_main (), adj->ia_node_index);
+	  clib_warning (
+	    "OVPN update_adj: after midchain update ai=%u "
+	    "lookup_next_index=%u (MIDCHAIN=%d) ia_node_index=%u (%s) "
+	    "rewrite_header.next_index=%u",
+	    ai, adj->lookup_next_index, IP_LOOKUP_NEXT_MIDCHAIN,
+	    adj->ia_node_index, adj_node ? (char *) adj_node->name : "UNKNOWN",
+	    adj->rewrite_header.next_index);
+
+	  /* Stack the adjacency on the path to reach the peer's endpoint */
 	  ovpn_peer_adj_stack (peer, ai);
 	  break;
 	}
     }
+
+  clib_warning ("OVPN update_adj: total peers checked=%d", peer_count);
+}
+
+/*
+ * Callback for adjacency walk - updates each adjacency
+ */
+static adj_walk_rc_t
+ovpn_if_adj_walk_cb (adj_index_t ai, void *ctx)
+{
+  u32 sw_if_index = *(u32 *) ctx;
+  vnet_main_t *vnm = vnet_get_main ();
+
+  clib_warning ("OVPN: adj_walk_cb for ai=%u sw_if_index=%u", ai, sw_if_index);
+  ovpn_if_update_adj (vnm, sw_if_index, ai);
+  return ADJ_WALK_RC_CONTINUE;
+}
+
+/*
+ * Update all adjacencies on interface when peer state changes
+ * Called when a new peer is established to associate adjacencies
+ */
+void
+ovpn_if_update_adj_for_peer (u32 sw_if_index)
+{
+  fib_protocol_t proto;
+
+  clib_warning ("OVPN: Updating adjacencies for sw_if_index %u", sw_if_index);
+
+  FOR_EACH_FIB_IP_PROTOCOL (proto)
+  {
+    adj_nbr_walk (sw_if_index, proto, ovpn_if_adj_walk_cb, &sw_if_index);
+  }
 }
 
 /* Register OpenVPN device class */

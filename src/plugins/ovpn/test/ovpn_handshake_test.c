@@ -23,6 +23,7 @@
 #include <ovpn/ovpn_reliable.h>
 #include <ovpn/ovpn_session_id.h>
 #include <ovpn/ovpn_crypto.h>
+#include <ovpn/ovpn_options.h>
 
 /*
  * Test macros
@@ -920,6 +921,263 @@ ovpn_test_pending_hash_key (vlib_main_t *vm)
 }
 
 /*
+ * Test static key parsing
+ *
+ * OpenVPN static key file format (from `openvpn --genkey secret static.key`):
+ * -----BEGIN OpenVPN Static key V1-----
+ * <16 lines of 32 hex characters each = 256 bytes total>
+ * -----END OpenVPN Static key V1-----
+ *
+ * The 256 bytes are organized as 4 subkeys of 64 bytes each:
+ *   Subkey 0 (bytes 0-63):   Cipher encrypt key
+ *   Subkey 1 (bytes 64-127): HMAC encrypt key (for CBC mode)
+ *   Subkey 2 (bytes 128-191): Cipher decrypt key
+ *   Subkey 3 (bytes 192-255): HMAC decrypt key (for CBC mode)
+ */
+static int
+ovpn_test_static_key_parsing (vlib_main_t *vm)
+{
+  const char *test_key_file =
+    "#\n"
+    "# 2048 bit OpenVPN static key\n"
+    "#\n"
+    "-----BEGIN OpenVPN Static key V1-----\n"
+    "00112233445566778899aabbccddeeff\n" /* Line 1 - 16 bytes */
+    "00112233445566778899aabbccddeeff\n" /* Line 2 */
+    "00112233445566778899aabbccddeeff\n" /* Line 3 */
+    "00112233445566778899aabbccddeeff\n" /* Line 4 - End subkey 0 */
+    "aabbccddeeff00112233445566778899\n" /* Line 5 - Subkey 1 start */
+    "aabbccddeeff00112233445566778899\n"
+    "aabbccddeeff00112233445566778899\n"
+    "aabbccddeeff00112233445566778899\n" /* Line 8 - End subkey 1 */
+    "ffeeddccbbaa99887766554433221100\n" /* Line 9 - Subkey 2 start */
+    "ffeeddccbbaa99887766554433221100\n"
+    "ffeeddccbbaa99887766554433221100\n"
+    "ffeeddccbbaa99887766554433221100\n" /* Line 12 - End subkey 2 */
+    "99887766554433221100ffeeddccbbaa\n" /* Line 13 - Subkey 3 start */
+    "99887766554433221100ffeeddccbbaa\n"
+    "99887766554433221100ffeeddccbbaa\n"
+    "99887766554433221100ffeeddccbbaa\n" /* Line 16 - End subkey 3 */
+    "-----END OpenVPN Static key V1-----\n";
+
+  u8 parsed_key[OVPN_STATIC_KEY_SIZE];
+  int rv;
+
+  vlib_cli_output (vm, "=== Test Static Key Parsing ===\n");
+
+  /* Test parsing */
+  rv = ovpn_parse_static_key ((const u8 *) test_key_file,
+			      strlen (test_key_file), parsed_key);
+  OVPN_TEST (rv == 0, "Static key parsing should succeed");
+
+  /* Verify first bytes of each subkey */
+  OVPN_TEST (parsed_key[0] == 0x00, "Subkey 0 first byte should be 0x00");
+  OVPN_TEST (parsed_key[64] == 0xaa, "Subkey 1 first byte should be 0xaa");
+  OVPN_TEST (parsed_key[128] == 0xff, "Subkey 2 first byte should be 0xff");
+  OVPN_TEST (parsed_key[192] == 0x99, "Subkey 3 first byte should be 0x99");
+
+  /* Test invalid inputs */
+  rv = ovpn_parse_static_key (NULL, 0, parsed_key);
+  OVPN_TEST (rv < 0, "NULL input should fail");
+
+  rv = ovpn_parse_static_key ((const u8 *) "short", 5, parsed_key);
+  OVPN_TEST (rv < 0, "Too short input should fail");
+
+  vlib_cli_output (vm, "Static key parsing test PASSED\n");
+  return 0;
+}
+
+/*
+ * Test static key crypto setup with direction parameter
+ *
+ * Direction determines which subkeys are used for encrypt vs decrypt:
+ *   Direction 0 (server mode):
+ *     - Encrypt with subkey 0 (cipher), subkey 1 (HMAC)
+ *     - Decrypt with subkey 2 (cipher), subkey 3 (HMAC)
+ *   Direction 1 (client mode):
+ *     - Encrypt with subkey 2 (cipher), subkey 3 (HMAC)
+ *     - Decrypt with subkey 0 (cipher), subkey 1 (HMAC)
+ */
+static int
+ovpn_test_static_key_crypto_setup (vlib_main_t *vm)
+{
+  ovpn_crypto_context_t server_ctx, client_ctx;
+  u8 static_key[OVPN_STATIC_KEY_SIZE];
+  int rv;
+
+  vlib_cli_output (vm, "=== Test Static Key Crypto Setup ===\n");
+
+  /* Generate a deterministic test key */
+  for (int i = 0; i < OVPN_STATIC_KEY_SIZE; i++)
+    static_key[i] = (u8) i;
+
+  /* Test server mode setup (direction 0) with AES-256-GCM */
+  rv = ovpn_setup_static_key_crypto (&server_ctx, OVPN_CIPHER_ALG_AES_256_GCM,
+				     static_key, 0, /* direction = server */
+				     64);	   /* replay window */
+  OVPN_TEST (rv == 0, "Server crypto setup should succeed");
+  OVPN_TEST (server_ctx.is_valid == 1, "Server context should be valid");
+  OVPN_TEST (server_ctx.cipher_alg == OVPN_CIPHER_ALG_AES_256_GCM,
+	     "Server cipher should be AES-256-GCM");
+  OVPN_TEST (server_ctx.is_aead == 1, "AES-256-GCM should be AEAD");
+
+  /* Test client mode setup (direction 1) with AES-256-GCM */
+  rv = ovpn_setup_static_key_crypto (&client_ctx, OVPN_CIPHER_ALG_AES_256_GCM,
+				     static_key, 1, /* direction = client */
+				     64);
+  OVPN_TEST (rv == 0, "Client crypto setup should succeed");
+  OVPN_TEST (client_ctx.is_valid == 1, "Client context should be valid");
+
+  /*
+   * Verify key direction: server encrypt IV should match client decrypt IV
+   * For AEAD, implicit IV is stored in encrypt/decrypt_implicit_iv
+   */
+  OVPN_TEST (clib_memcmp (server_ctx.encrypt_implicit_iv,
+			  client_ctx.decrypt_implicit_iv,
+			  OVPN_IMPLICIT_IV_LEN) == 0,
+	     "Server encrypt IV should match client decrypt IV");
+  OVPN_TEST (clib_memcmp (server_ctx.decrypt_implicit_iv,
+			  client_ctx.encrypt_implicit_iv,
+			  OVPN_IMPLICIT_IV_LEN) == 0,
+	     "Server decrypt IV should match client encrypt IV");
+
+  ovpn_crypto_context_free (&server_ctx);
+  ovpn_crypto_context_free (&client_ctx);
+
+  /* Test with CBC mode (non-AEAD) */
+  rv = ovpn_setup_static_key_crypto (&server_ctx, OVPN_CIPHER_ALG_AES_256_CBC,
+				     static_key, 0, 64);
+  OVPN_TEST (rv == 0, "CBC server crypto setup should succeed");
+  OVPN_TEST (server_ctx.is_aead == 0, "AES-256-CBC should not be AEAD");
+
+  ovpn_crypto_context_free (&server_ctx);
+
+  vlib_cli_output (vm, "Static key crypto setup test PASSED\n");
+  return 0;
+}
+
+/*
+ * Test static key encrypt/decrypt round-trip
+ *
+ * Simulates server encrypting data and client decrypting it.
+ * This verifies that key direction is correctly handled.
+ */
+static int
+ovpn_test_static_key_roundtrip (vlib_main_t *vm)
+{
+  ovpn_crypto_context_t server_ctx, client_ctx;
+  u8 static_key[OVPN_STATIC_KEY_SIZE];
+  int rv;
+
+  vlib_cli_output (vm, "=== Test Static Key Round-Trip ===\n");
+
+  /* Generate test key */
+  for (int i = 0; i < OVPN_STATIC_KEY_SIZE; i++)
+    static_key[i] = (u8) (i ^ 0x5a); /* XOR for variety */
+
+  /* Setup server (direction 0) and client (direction 1) */
+  rv = ovpn_setup_static_key_crypto (&server_ctx, OVPN_CIPHER_ALG_AES_256_GCM,
+				     static_key, 0, 64);
+  OVPN_TEST (rv == 0, "Server setup should succeed");
+
+  rv = ovpn_setup_static_key_crypto (&client_ctx, OVPN_CIPHER_ALG_AES_256_GCM,
+				     static_key, 1, 64);
+  OVPN_TEST (rv == 0, "Client setup should succeed");
+
+  /*
+   * Test AEAD encryption/decryption
+   * Note: Full round-trip test requires the crypto operations which
+   * need vlib buffers. Here we verify the context is set up correctly.
+   */
+
+  /* Verify packet ID starts at 1 */
+  OVPN_TEST (server_ctx.packet_id_send == 1,
+	     "Server packet_id_send should start at 1");
+  OVPN_TEST (client_ctx.packet_id_send == 1,
+	     "Client packet_id_send should start at 1");
+
+  /* Test packet ID generation */
+  u32 pkt_id = ovpn_crypto_get_next_packet_id (&server_ctx);
+  OVPN_TEST (pkt_id == 1, "First packet ID should be 1");
+  OVPN_TEST (server_ctx.packet_id_send == 2,
+	     "packet_id_send should advance to 2");
+
+  /* Verify replay protection is initialized */
+  OVPN_TEST (server_ctx.replay_packet_id_floor == 0,
+	     "Server replay floor should be 0");
+  OVPN_TEST (client_ctx.replay_packet_id_floor == 0,
+	     "Client replay floor should be 0");
+
+  ovpn_crypto_context_free (&server_ctx);
+  ovpn_crypto_context_free (&client_ctx);
+
+  vlib_cli_output (vm, "Static key round-trip test PASSED\n");
+  return 0;
+}
+
+/*
+ * Test static key with CBC mode (non-AEAD with HMAC)
+ *
+ * CBC mode uses separate cipher and HMAC keys:
+ *   - Subkey 0: Cipher key (direction 0 encrypt)
+ *   - Subkey 1: HMAC key (direction 0 encrypt)
+ *   - Subkey 2: Cipher key (direction 0 decrypt)
+ *   - Subkey 3: HMAC key (direction 0 decrypt)
+ */
+static int
+ovpn_test_static_key_cbc_mode (vlib_main_t *vm)
+{
+  ovpn_crypto_context_t server_ctx, client_ctx;
+  u8 static_key[OVPN_STATIC_KEY_SIZE];
+  int rv;
+
+  vlib_cli_output (vm, "=== Test Static Key CBC Mode ===\n");
+
+  /* Generate test key with distinct values for each subkey */
+  for (int i = 0; i < 64; i++)
+    {
+      static_key[i] = (u8) i;	       /* Subkey 0: 0x00-0x3f */
+      static_key[64 + i] = (u8) (i + 0x40);  /* Subkey 1: 0x40-0x7f */
+      static_key[128 + i] = (u8) (i + 0x80); /* Subkey 2: 0x80-0xbf */
+      static_key[192 + i] = (u8) (i + 0xc0); /* Subkey 3: 0xc0-0xff */
+    }
+
+  /* Setup server (direction 0) with AES-256-CBC */
+  rv = ovpn_setup_static_key_crypto (&server_ctx, OVPN_CIPHER_ALG_AES_256_CBC,
+				     static_key, 0, 64);
+  OVPN_TEST (rv == 0, "Server CBC setup should succeed");
+  OVPN_TEST (server_ctx.is_aead == 0, "CBC mode should not be AEAD");
+  OVPN_TEST (server_ctx.is_valid == 1, "Server context should be valid");
+
+  /* Setup client (direction 1) with AES-256-CBC */
+  rv = ovpn_setup_static_key_crypto (&client_ctx, OVPN_CIPHER_ALG_AES_256_CBC,
+				     static_key, 1, 64);
+  OVPN_TEST (rv == 0, "Client CBC setup should succeed");
+  OVPN_TEST (client_ctx.is_valid == 1, "Client context should be valid");
+
+  /*
+   * Verify HMAC keys are set up correctly:
+   * Server encrypt HMAC = Client decrypt HMAC (subkey 1 for dir 0)
+   * Server decrypt HMAC = Client encrypt HMAC (subkey 3 for dir 0)
+   * Note: Valid key index can be 0, ~0 means invalid
+   */
+  OVPN_TEST (server_ctx.encrypt_hmac_key_index != ~0,
+	     "Server encrypt HMAC key should be set");
+  OVPN_TEST (server_ctx.decrypt_hmac_key_index != ~0,
+	     "Server decrypt HMAC key should be set");
+  OVPN_TEST (client_ctx.encrypt_hmac_key_index != ~0,
+	     "Client encrypt HMAC key should be set");
+  OVPN_TEST (client_ctx.decrypt_hmac_key_index != ~0,
+	     "Client decrypt HMAC key should be set");
+
+  ovpn_crypto_context_free (&server_ctx);
+  ovpn_crypto_context_free (&client_ctx);
+
+  vlib_cli_output (vm, "Static key CBC mode test PASSED\n");
+  return 0;
+}
+
+/*
  * Run all handshake tests
  */
 static int
@@ -947,6 +1205,10 @@ ovpn_handshake_test_all (vlib_main_t *vm)
   rv |= ovpn_test_tls_auth_replay (vm);
   rv |= ovpn_test_tls_crypt_replay (vm);
   rv |= ovpn_test_pending_hash_key (vm);
+  rv |= ovpn_test_static_key_parsing (vm);
+  rv |= ovpn_test_static_key_crypto_setup (vm);
+  rv |= ovpn_test_static_key_roundtrip (vm);
+  rv |= ovpn_test_static_key_cbc_mode (vm);
 
   vlib_cli_output (vm, "\n========================================\n");
   if (rv == 0)

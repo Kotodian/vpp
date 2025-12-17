@@ -117,6 +117,8 @@ ovpn_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
   u32 thread_index = vm->thread_index;
   ovpn_per_thread_crypto_t *ptd = ovpn_crypto_get_ptd (thread_index);
 
+  clib_warning ("OVPN output: is_ip4=%u n_vectors=%u", is_ip4, frame->n_vectors);
+
   /* Track peers for post-processing */
   ovpn_peer_t *peers[VLIB_FRAME_SIZE];
   u16 inner_lens[VLIB_FRAME_SIZE];
@@ -199,34 +201,192 @@ ovpn_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       u8 key_id = peer->keys[key_slot].key_id;
 
       /*
-       * Prepare encrypt operation (supports chained buffers)
-       * ovpn_crypto_encrypt_prepare will:
-       * 1. Linearize buffer chain if needed
-       * 2. Prepend OpenVPN header (opcode + peer_id + packet_id)
-       * 3. Reserve space for authentication tag
-       * 4. Queue crypto operation for batch processing
+       * Encrypt the packet based on cipher mode
        */
-      u32 buf_idx = b - bufs;
-      rv = ovpn_crypto_encrypt_prepare (vm, ptd, crypto, b0, buf_idx,
-					peer->peer_id, key_id);
-      if (PREDICT_FALSE (rv < 0))
+      if (PREDICT_TRUE (crypto->is_aead))
 	{
-	  if (rv == -3)
-	    error = OVPN_OUTPUT_ERROR_NO_BUFFER_SPACE;
-	  else
-	    error = OVPN_OUTPUT_ERROR_ENCRYPT_FAILED;
-	  goto trace;
+	  /*
+	   * AEAD mode: Prepare encrypt operation (supports chained buffers)
+	   * ovpn_crypto_encrypt_prepare will:
+	   * 1. Linearize buffer chain if needed
+	   * 2. Prepend OpenVPN header (opcode + peer_id + packet_id)
+	   * 3. Reserve space for authentication tag
+	   * 4. Queue crypto operation for batch processing
+	   */
+	  u32 buf_idx = b - bufs;
+	  rv = ovpn_crypto_encrypt_prepare (vm, ptd, crypto, b0, buf_idx,
+					    peer->peer_id, key_id);
+	  if (PREDICT_FALSE (rv < 0))
+	    {
+	      if (rv == -3)
+		error = OVPN_OUTPUT_ERROR_NO_BUFFER_SPACE;
+	      else
+		error = OVPN_OUTPUT_ERROR_ENCRYPT_FAILED;
+	      goto trace;
+	    }
+
+	  /* Store context for post-processing after batch crypto */
+	  peers[buf_idx] = peer;
+	  inner_lens[buf_idx] = inner_len;
+	  encrypt_count++;
+
+	  packet_id = crypto->packet_id_send - 1; /* Was just incremented */
 	}
+      else
+	{
+	  /*
+	   * CBC+HMAC mode: Process immediately (not batched)
+	   *
+	   * When we reach this node, ip4-midchain has already applied the
+	   * rewrite (outer IP+UDP headers). The buffer contains:
+	   * [outer IP:20][outer UDP:8][inner packet]
+	   *
+	   * We need to:
+	   * 1. Save the outer headers (they'll be overwritten by encrypt)
+	   * 2. Advance past outer headers
+	   * 3. Encrypt the inner packet (prepends opcode+hmac+iv)
+	   * 4. Memmove encrypted data to make room for outer headers
+	   * 5. Restore outer headers at the beginning
+	   */
+	  u32 outer_hdr_len =
+	    (is_ip4 ? sizeof (ip4_header_t) : sizeof (ip6_header_t)) +
+	    sizeof (udp_header_t);
 
-      /* Store context for post-processing after batch crypto */
-      peers[buf_idx] = peer;
-      inner_lens[buf_idx] = inner_len;
-      encrypt_count++;
+	  /* Save outer headers before encryption overwrites them */
+	  u8 saved_outer_hdr[48]; /* Max size for IPv6 + UDP */
+	  clib_memcpy_fast (saved_outer_hdr, vlib_buffer_get_current (b0),
+			    outer_hdr_len);
 
-      packet_id = crypto->packet_id_send - 1; /* Was just incremented */
+	  /* Debug: print outer header ports */
+	  if (is_ip4)
+	    {
+	      ip4_header_t *dbg_ip4 = (ip4_header_t *) saved_outer_hdr;
+	      udp_header_t *dbg_udp = (udp_header_t *) (dbg_ip4 + 1);
+	      clib_warning (
+		"OVPN output CBC: outer hdr src=%U:%u dst=%U:%u",
+		format_ip4_address, &dbg_ip4->src_address,
+		clib_net_to_host_u16 (dbg_udp->src_port), format_ip4_address,
+		&dbg_ip4->dst_address, clib_net_to_host_u16 (dbg_udp->dst_port));
+	    }
+
+	  /* Advance past outer headers to inner packet */
+	  vlib_buffer_advance (b0, outer_hdr_len);
+
+	  /* Encrypt the inner packet (this prepends opcode+hmac+iv) */
+	  rv = ovpn_crypto_cbc_encrypt (vm, crypto, b0);
+	  if (PREDICT_FALSE (rv < 0))
+	    {
+	      clib_warning ("OVPN output: CBC encrypt failed, rv=%d", rv);
+	      /* Revert buffer position before dropping */
+	      vlib_buffer_advance (b0, -(i32) outer_hdr_len);
+	      error = OVPN_OUTPUT_ERROR_ENCRYPT_FAILED;
+	      goto trace;
+	    }
+
+	  /*
+	   * After encryption, buffer structure is:
+	   *   current_data points to encrypted packet (opcode)
+	   *   current_length = encrypted packet size
+	   *
+	   * We need to:
+	   * 1. Make room for outer headers by moving encrypted data forward
+	   * 2. Copy outer headers to the beginning
+	   */
+	  u8 *encrypted_start = vlib_buffer_get_current (b0);
+	  u32 encrypted_len = b0->current_length;
+
+	  /* Retreat to make room for outer headers */
+	  vlib_buffer_advance (b0, -(i32) outer_hdr_len);
+
+	  /* Move encrypted data forward to its final position */
+	  u8 *final_start = vlib_buffer_get_current (b0);
+	  clib_memmove (final_start + outer_hdr_len, encrypted_start,
+			encrypted_len);
+
+	  /* Copy saved outer headers to the beginning */
+	  clib_memcpy_fast (final_start, saved_outer_hdr, outer_hdr_len);
+
+	  /* Update buffer length to include outer headers */
+	  b0->current_length = outer_hdr_len + encrypted_len;
+
+	  /*
+	   * Update outer IP/UDP length fields to reflect new packet size.
+	   * The original headers had lengths based on the inner packet,
+	   * but now we have the encrypted payload which is larger.
+	   */
+	  u16 total_len = b0->current_length;
+	  if (is_ip4)
+	    {
+	      ip4_header_t *ip4 = (ip4_header_t *) final_start;
+	      udp_header_t *udp = (udp_header_t *) (ip4 + 1);
+	      ip4->length = clib_host_to_net_u16 (total_len);
+
+	      /* Compute full IP checksum (template had checksum=0) */
+	      ip4->checksum = 0;
+	      ip4->checksum = ip4_header_checksum (ip4);
+
+	      /* Update UDP length */
+	      udp->length =
+		clib_host_to_net_u16 (total_len - sizeof (ip4_header_t));
+	      udp->checksum = 0; /* Clear UDP checksum */
+	    }
+	  else
+	    {
+	      ip6_header_t *ip6 = (ip6_header_t *) final_start;
+	      udp_header_t *udp = (udp_header_t *) (ip6 + 1);
+	      ip6->payload_length =
+		clib_host_to_net_u16 (total_len - sizeof (ip6_header_t));
+	      udp->length =
+		clib_host_to_net_u16 (total_len - sizeof (ip6_header_t));
+	      udp->checksum = 0;
+	    }
+
+	  packet_id = crypto->packet_id_send - 1;
+	  outer_len = vlib_buffer_length_in_chain (vm, b0);
+
+	  /* Debug: print outer IP header details after checksum */
+	  if (is_ip4)
+	    {
+	      ip4_header_t *dbg_ip4 = (ip4_header_t *) final_start;
+	      clib_warning (
+		"OVPN output CBC: outer IP: ver_ihl=0x%02x len=%u id=%u "
+		"ttl=%u proto=%u checksum=0x%04x src=%U dst=%U",
+		dbg_ip4->ip_version_and_header_length,
+		clib_net_to_host_u16 (dbg_ip4->length),
+		clib_net_to_host_u16 (dbg_ip4->fragment_id),
+		dbg_ip4->ttl, dbg_ip4->protocol,
+		clib_net_to_host_u16 (dbg_ip4->checksum),
+		format_ip4_address, &dbg_ip4->src_address,
+		format_ip4_address, &dbg_ip4->dst_address);
+	    }
+
+	  clib_warning (
+	    "OVPN output CBC: encrypted, outer_hdr=%u inner=%u total=%u pkt_id=%u",
+	    outer_hdr_len, inner_len - outer_hdr_len, outer_len, packet_id);
+
+	  /* Update peer stats immediately for CBC */
+	  ovpn_peer_update_tx (peer, vlib_time_now (vm), outer_len);
+	}
 
       /* Mark for pending encryption - will be updated after batch */
       next0 = OVPN_OUTPUT_NEXT_INTERFACE_OUTPUT;
+
+      /* Debug: dump first bytes of packet */
+      {
+	u8 *pkt = vlib_buffer_get_current (b0);
+	clib_warning (
+	  "OVPN output: sending to adj-midchain-tx, adj_index=%u "
+	  "next0=%u total_len=%u current_data=%u",
+	  adj_index, next0, outer_len, b0->current_data);
+	clib_warning (
+	  "OVPN output: pkt bytes: %02x %02x %02x %02x %02x %02x %02x %02x "
+	  "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x "
+	  "%02x %02x %02x %02x %02x %02x %02x %02x",
+	  pkt[0], pkt[1], pkt[2], pkt[3], pkt[4], pkt[5], pkt[6], pkt[7],
+	  pkt[8], pkt[9], pkt[10], pkt[11], pkt[12], pkt[13], pkt[14], pkt[15],
+	  pkt[16], pkt[17], pkt[18], pkt[19], pkt[20], pkt[21], pkt[22],
+	  pkt[23], pkt[24], pkt[25], pkt[26], pkt[27]);
+      }
 
     trace:
       if (PREDICT_FALSE (b0->flags & VLIB_BUFFER_IS_TRACED))

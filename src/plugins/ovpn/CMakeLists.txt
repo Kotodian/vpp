@@ -69,6 +69,7 @@ add_vpp_plugin(ovpn_unittest
   ovpn_crypto.c
   ovpn_handshake.c
   ovpn_peer.c
+  ovpn_options.c
 
   LINK_LIBRARIES ${PICOTLS_LINK_LIBRARIES} ${OPENSSL_LIBRARIES}
 )

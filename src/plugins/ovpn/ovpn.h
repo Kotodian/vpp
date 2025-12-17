@@ -21,6 +21,7 @@
 #include <ovpn/ovpn_ssl.h>
 #include <ovpn/ovpn_crypto.h>
 #include <vnet/ip/ip_types.h>
+#include <vnet/fib/fib_source.h>
 #include <ovpn/ovpn_options.h>
 #include <picotls.h>
 #include <picotls/openssl.h>
@@ -89,6 +90,9 @@ typedef struct ovpn_main_t_
   u32 in6_fq_index;
   u32 out4_fq_index;
   u32 out6_fq_index;
+
+  /* FIB source for high-priority routes */
+  fib_source_t fib_src_hi;
 
   /* Multi-instance context */
   ovpn_multi_context_t multi_context;

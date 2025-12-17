@@ -27,6 +27,73 @@
 #include <ovpn/ovpn_crypto.h>
 #include <ovpn/ovpn_handshake.h>
 #include <ovpn/ovpn_options.h>
+#include <ovpn/ovpn_if.h>
+#include <vnet/ip-neighbor/ip_neighbor.h>
+#include <vnet/adj/adj_nbr.h>
+#include <vnet/fib/fib_table.h>
+#include <vlib/threads.h>
+
+/*
+ * Arguments for deferred peer setup on main thread.
+ * Adjacency creation must run on main thread.
+ */
+typedef struct
+{
+  u32 sw_if_index;
+  ip4_address_t client_ip;
+  u32 peer_id;
+} ovpn_peer_setup_main_thread_args_t;
+
+/*
+ * Callback function to complete peer setup on main thread.
+ * Called via vlib_rpc_call_main_thread.
+ *
+ * Creates a neighbor adjacency for the client's virtual IP.
+ * This triggers ovpn_if_update_adj which converts it to a midchain
+ * adjacency and associates it with the peer.
+ */
+static void
+ovpn_peer_setup_main_thread_fn (ovpn_peer_setup_main_thread_args_t *args)
+{
+  adj_index_t ai;
+  ip46_address_t nh_addr = { 0 };
+
+  /* Create neighbor adjacency for the client's tunnel IP */
+  ip46_address_set_ip4 (&nh_addr, &args->client_ip);
+
+  /*
+   * adj_nbr_add_or_lock will create the adjacency and trigger
+   * ovpn_if_update_adj callback which sets up the midchain
+   */
+  ai = adj_nbr_add_or_lock (FIB_PROTOCOL_IP4, VNET_LINK_IP4, &nh_addr,
+			    args->sw_if_index);
+
+  clib_warning ("OVPN: Created adjacency ai=%u for %U on sw_if_index %u", ai,
+		format_ip4_address, &args->client_ip, args->sw_if_index);
+
+  /*
+   * Add a host route (/32) for the client's virtual IP.
+   * This ensures packets to the client use our neighbor adjacency
+   * rather than the glean adjacency from the connected route.
+   */
+  fib_prefix_t pfx = {
+    .fp_len = 32,
+    .fp_proto = FIB_PROTOCOL_IP4,
+    .fp_addr.ip4 = args->client_ip,
+  };
+
+  u32 fib_index =
+    fib_table_get_index_for_sw_if_index (FIB_PROTOCOL_IP4, args->sw_if_index);
+
+  ovpn_main_t *omp = &ovpn_main;
+  fib_table_entry_path_add (fib_index, &pfx, omp->fib_src_hi,
+			    FIB_ENTRY_FLAG_NONE, DPO_PROTO_IP4, &nh_addr,
+			    args->sw_if_index, ~0, 1, NULL,
+			    FIB_ROUTE_PATH_FLAG_NONE);
+
+  clib_warning ("OVPN: Added host route for %U/32 via ai=%u",
+		format_ip4_address, &args->client_ip, ai);
+}
 
 /*
  * Create a peer for static key mode.
@@ -115,6 +182,55 @@ ovpn_static_key_create_peer (vlib_main_t *vm, ovpn_main_t *omp,
 
   clib_warning ("Static key peer created: id=%u addr=%U port=%u", peer_id,
 		format_ip_address, remote_addr, remote_port);
+
+  /*
+   * For P2P static key mode, set up the peer's virtual IP.
+   * This is the IP the client will use inside the tunnel.
+   * For P2P, we assume server is .1 and client is .2 in the tunnel subnet.
+   *
+   * The neighbor and adjacency setup MUST be done on the main thread,
+   * so we defer it via vlib_rpc_call_main_thread.
+   */
+  if (!peer->is_ipv6)
+    {
+      /* Get server's tunnel IP from interface address */
+      ip4_address_t client_ip;
+      ip4_address_t server_ip;
+      ip_interface_address_t *ia;
+      int found_addr = 0;
+
+      foreach_ip_interface_address (
+	&ip4_main.lookup_main, ia, peer->sw_if_index, 1,
+	({
+	  ip4_address_t *a =
+	    ip_interface_address_get_address (&ip4_main.lookup_main, ia);
+	  clib_memcpy (&server_ip, a, sizeof (ip4_address_t));
+	  found_addr = 1;
+	}));
+
+      if (found_addr)
+	{
+	  /* Derive client IP: server_ip + 1 for P2P mode */
+	  client_ip.as_u32 =
+	    clib_host_to_net_u32 (clib_net_to_host_u32 (server_ip.as_u32) + 1);
+
+	  /* Set peer's virtual IP */
+	  ip_address_set (&peer->virtual_ip, &client_ip, AF_IP4);
+	  peer->virtual_ip_set = 1;
+
+	  clib_warning ("OVPN: Set peer virtual_ip to %U", format_ip4_address,
+			&client_ip);
+
+	  /* Defer neighbor/adjacency setup to main thread */
+	  ovpn_peer_setup_main_thread_args_t args = {
+	    .sw_if_index = peer->sw_if_index,
+	    .client_ip = client_ip,
+	    .peer_id = peer_id,
+	  };
+	  vlib_rpc_call_main_thread (ovpn_peer_setup_main_thread_fn,
+				    (u8 *) &args, sizeof (args));
+	}
+    }
 
   return peer;
 }
@@ -267,39 +383,62 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		"OVPN: Static key mode data packet (no opcode), len=%u", len);
 
 	      /* Extract remote address from outer IP header for peer lookup.
-	       * After UDP processing, buffer points to the OpenVPN payload.
-	       * Go back through UDP header (8 bytes) to find the outer headers.
-	       * Check IPv4 first (more common), then IPv6.
+	       * Use vnet_buffer()->ip.save_rewrite_length which VPP sets
+	       * to the offset where the IP header starts in the buffer.
 	       */
 	      ip_address_t remote_addr = { 0 };
 	      u16 remote_port = 0;
 
-	      /* Try IPv4 first - go back by sizeof(ip4_header_t) +
-	       * sizeof(udp_header_t) */
-	      u8 *ip4_start = vlib_buffer_get_current (b0) -
-			      (sizeof (ip4_header_t) + sizeof (udp_header_t));
-	      u8 version = (ip4_start[0] >> 4) & 0xf;
+	      /*
+	       * Find the IP header using save_rewrite_length.
+	       * This field is set by the VPP input nodes to indicate
+	       * the original position of the IP header before buffer
+	       * advancement.
+	       */
+	      u32 ip_offset = vnet_buffer (b0)->ip.save_rewrite_length;
+	      u8 *ip_hdr = NULL;
+
+	      if (ip_offset > 0 && ip_offset <= b0->current_data)
+		{
+		  /* Calculate IP header position from saved offset */
+		  ip_hdr = (u8 *) vlib_buffer_get_current (b0) -
+			   (b0->current_data - ip_offset);
+		}
+	      else
+		{
+		  /* Fallback: buffer should point to payload, go back by
+		   * IP + UDP header size */
+		  ip_hdr = (u8 *) vlib_buffer_get_current (b0) -
+			   (sizeof (ip4_header_t) + sizeof (udp_header_t));
+		}
+
+	      u8 version = (ip_hdr[0] >> 4) & 0xf;
 
 	      if (version == 4)
 		{
-		  ip4_header_t *ip4 = (ip4_header_t *) ip4_start;
+		  ip4_header_t *ip4 = (ip4_header_t *) ip_hdr;
 		  udp_header_t *udp = (udp_header_t *) (ip4 + 1);
 		  ip_address_set (&remote_addr, &ip4->src_address, AF_IP4);
+		  remote_port = clib_net_to_host_u16 (udp->src_port);
+		  clib_warning (
+		    "OVPN static key: extracted remote %U:%u from IP header "
+		    "(ip_offset=%u current_data=%u)",
+		    format_ip4_address, &ip4->src_address, remote_port, ip_offset,
+		    b0->current_data);
+		}
+	      else if (version == 6)
+		{
+		  ip6_header_t *ip6 = (ip6_header_t *) ip_hdr;
+		  udp_header_t *udp = (udp_header_t *) (ip6 + 1);
+		  ip_address_set (&remote_addr, &ip6->src_address, AF_IP6);
 		  remote_port = clib_net_to_host_u16 (udp->src_port);
 		}
 	      else
 		{
-		  /* Try IPv6 */
-		  u8 *ip6_start = vlib_buffer_get_current (b0) -
-				  (sizeof (ip6_header_t) + sizeof (udp_header_t));
-		  ip6_header_t *ip6 = (ip6_header_t *) ip6_start;
-		  version = (ip6->ip_version_traffic_class_and_flow_label >> 28) & 0xf;
-		  if (version == 6)
-		    {
-		      udp_header_t *udp = (udp_header_t *) (ip6 + 1);
-		      ip_address_set (&remote_addr, &ip6->src_address, AF_IP6);
-		      remote_port = clib_net_to_host_u16 (udp->src_port);
-		    }
+		  clib_warning (
+		    "OVPN static key: failed to extract remote addr, version=%u "
+		    "ip_offset=%u current_data=%u",
+		    version, ip_offset, b0->current_data);
 		}
 
 	      /* Lookup peer by remote endpoint */
@@ -342,8 +481,37 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		  goto trace;
 		}
 
-	      /* Successfully decrypted - inject into IP stack */
-	      next0 = OVPN_INPUT_NEXT_IP4_INPUT;
+	      /* Successfully decrypted - set up for IP stack */
+	      vnet_buffer (b0)->sw_if_index[VLIB_RX] = peer->sw_if_index;
+
+	      /* Determine inner packet type */
+	      u8 *payload = vlib_buffer_get_current (b0);
+	      if (b0->current_length >= 1)
+		{
+		  u8 ip_version = (payload[0] >> 4);
+		  if (ip_version == 4)
+		    {
+		      next0 = OVPN_INPUT_NEXT_IP4_INPUT;
+		      ip4_header_t *ip4 = (ip4_header_t *) payload;
+		      clib_warning (
+			"OVPN: Decrypted IPv4 packet: src=%U dst=%U proto=%u "
+			"len=%u sw_if=%u next=%u",
+			format_ip4_address, &ip4->src_address,
+			format_ip4_address, &ip4->dst_address, ip4->protocol,
+			b0->current_length, peer->sw_if_index, next0);
+		    }
+		  else if (ip_version == 6)
+		    next0 = OVPN_INPUT_NEXT_IP6_INPUT;
+		  else
+		    {
+		      error = OVPN_INPUT_ERROR_DECRYPT_FAILED;
+		      goto trace;
+		    }
+		}
+
+	      /* Update peer statistics */
+	      ovpn_peer_update_rx (peer, now,
+				   vlib_buffer_length_in_chain (vm, b0));
 
 	      /* Store peer for tracing */
 	      u32 buf_idx = b - bufs;
