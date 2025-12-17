@@ -365,18 +365,23 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       opcode = ovpn_op_get_opcode (op_byte);
       key_id = ovpn_op_get_key_id (op_byte);
 
-      /* Validate opcode */
-      if (PREDICT_FALSE (!ovpn_opcode_is_valid (opcode)))
-	{
-	  /*
-	   * In static key mode with CBC+HMAC, data packets have no opcode!
-	   * Format: [HMAC:32][IV:16][encrypted(packet_id:4 + timestamp:4 +
-	   * payload)] If we're in static key mode with CBC cipher and the packet
-	   * is large enough, treat it as a no-opcode data packet.
-	   */
-	  if (omp->options.static_key_mode &&
-	      !OVPN_CIPHER_IS_AEAD (omp->cipher_alg) &&
-	      len >= (OVPN_CBC_HMAC_SIZE + OVPN_IV_SIZE + 8))
+      /*
+       * IMPORTANT: In static key mode with CBC+HMAC, data packets have NO
+       * opcode! The first byte is part of the HMAC, not an opcode byte.
+       * We MUST check for this case BEFORE validating the opcode, because
+       * the first byte of HMAC can accidentally look like a valid opcode.
+       *
+       * Format: [HMAC:32][IV:16][encrypted(packet_id:4 + timestamp:4 +
+       * payload)]
+       *
+       * Detect static key data packets by:
+       * 1. Static key mode is enabled
+       * 2. Using CBC cipher (not AEAD)
+       * 3. Packet is large enough to contain HMAC + IV + minimum encrypted data
+       */
+      if (omp->options.static_key_mode &&
+	  !OVPN_CIPHER_IS_AEAD (omp->cipher_alg) &&
+	  len >= (OVPN_CBC_HMAC_SIZE + OVPN_IV_SIZE + 16))
 	    {
 	      /* This is a static key mode data packet without opcode */
 	      clib_warning (
@@ -520,6 +525,12 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      goto done;
 	    }
 
+      /*
+       * Not a static key no-opcode packet.
+       * Validate the opcode for normal OpenVPN packet processing.
+       */
+      if (PREDICT_FALSE (!ovpn_opcode_is_valid (opcode)))
+	{
 	  error = OVPN_INPUT_ERROR_INVALID_OPCODE;
 	  goto trace;
 	}
