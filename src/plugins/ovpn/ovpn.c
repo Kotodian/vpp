@@ -84,8 +84,12 @@ static int
 ovpn_load_certificates (ptls_context_t *ctx, u8 *cert_data, u8 *key_data)
 {
   BIO *key_bio = NULL;
+  BIO *cert_bio = NULL;
   EVP_PKEY *pkey = NULL;
+  X509 *x509 = NULL;
   ptls_openssl_sign_certificate_t *sign_cert = NULL;
+  u8 *der_cert = NULL;
+  int der_len = 0;
   int ret = -1;
 
   if (!cert_data || !key_data)
@@ -99,6 +103,31 @@ ovpn_load_certificates (ptls_context_t *ctx, u8 *cert_data, u8 *key_data)
   pkey = PEM_read_bio_PrivateKey (key_bio, NULL, NULL, NULL);
   if (!pkey)
     goto done;
+
+  /* Load certificate from PEM and convert to DER */
+  cert_bio = BIO_new_mem_buf (cert_data, vec_len (cert_data));
+  if (!cert_bio)
+    goto done;
+
+  x509 = PEM_read_bio_X509 (cert_bio, NULL, NULL, NULL);
+  if (!x509)
+    goto done;
+
+  /* Get DER encoding length */
+  der_len = i2d_X509 (x509, NULL);
+  if (der_len <= 0)
+    goto done;
+
+  /* Allocate and convert to DER */
+  der_cert = clib_mem_alloc (der_len);
+  if (!der_cert)
+    goto done;
+
+  {
+    u8 *der_ptr = der_cert;
+    if (i2d_X509 (x509, &der_ptr) != der_len)
+      goto done;
+  }
 
   /* Allocate and setup sign certificate */
   sign_cert =
@@ -120,7 +149,7 @@ ovpn_load_certificates (ptls_context_t *ctx, u8 *cert_data, u8 *key_data)
 
   ctx->sign_certificate = &sign_cert->super;
 
-  /* Setup certificates - just store the raw certificate data */
+  /* Setup certificates - use DER-encoded certificate */
   ptls_iovec_t *certs = clib_mem_alloc (2 * sizeof (ptls_iovec_t));
   if (!certs)
     {
@@ -133,10 +162,11 @@ ovpn_load_certificates (ptls_context_t *ctx, u8 *cert_data, u8 *key_data)
       sign_cert = NULL;
       goto done;
     }
-  certs[0].base = cert_data;
-  certs[0].len = vec_len (cert_data);
+  certs[0].base = der_cert;
+  certs[0].len = der_len;
   certs[1].base = NULL;
   certs[1].len = 0;
+  der_cert = NULL; /* Transfer ownership to ctx */
 
   ctx->certificates.list = certs;
   ctx->certificates.count = 1;
@@ -146,6 +176,12 @@ ovpn_load_certificates (ptls_context_t *ctx, u8 *cert_data, u8 *key_data)
 done:
   if (key_bio)
     BIO_free (key_bio);
+  if (cert_bio)
+    BIO_free (cert_bio);
+  if (x509)
+    X509_free (x509);
+  if (der_cert)
+    clib_mem_free (der_cert);
   /* Note: pkey is only owned by sign_cert if
    * ptls_openssl_init_sign_certificate succeeded AND ctx->sign_certificate is
    * still set. We check ctx->sign_certificate to determine if pkey was
@@ -552,8 +588,15 @@ ovpn_create_command_fn (vlib_main_t *vm, unformat_input_t *input,
 				     format_clib_error, error);
 	  goto done;
 	}
-      vlib_cli_output (vm, "Loaded TLS-Auth key (%u bytes)",
-		       vec_len (omp->options.tls_auth_key));
+      int rv = ovpn_tls_auth_parse_key (omp->options.tls_auth_key,
+					vec_len (omp->options.tls_auth_key),
+					&omp->tls_auth, 1);
+      if (rv < 0)
+	{
+	  error = clib_error_return (0, "failed to parse TLS-Auth key: %d", rv);
+	  goto done;
+	}
+      vlib_cli_output (vm, "TLS-Auth initialized");
     }
 
   /* Load certificates if specified */

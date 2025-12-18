@@ -261,9 +261,12 @@ ovpn_reliable_init (ovpn_reliable_t *rel, int buf_size, int offset,
 
       ovpn_reliable_entry_t *e = &rel->array[i];
       ovpn_reli_buffer_t *buf;
+      u8 init_ok;
       e->buf_index = ovpn_buf_alloc (buf_size);
       buf = ovpn_buf_get (e->buf_index);
-      ASSERT (ovpn_buf_init (buf, offset));
+      init_ok = ovpn_buf_init (buf, offset);
+      ASSERT (init_ok);
+      (void) init_ok;
     }
 }
 
@@ -593,9 +596,12 @@ ovpn_reliable_mark_active_outgoing (ovpn_reliable_t *rel,
       if (buf->index == e->buf_index)
 	{
 	  u32 net_pid;
+	  u8 prepend_ok;
 	  e->packet_id = rel->packet_id++;
 	  net_pid = clib_host_to_net_u32 (e->packet_id);
-	  ASSERT (ovpn_buf_write_prepend (buf, &net_pid, sizeof (net_pid)));
+	  prepend_ok = ovpn_buf_write_prepend (buf, &net_pid, sizeof (net_pid));
+	  ASSERT (prepend_ok);
+	  (void) prepend_ok; /* Silence unused variable warning in release */
 	  e->active = 1;
 	  e->opcode = opcode;
 	  e->next_try = 0;

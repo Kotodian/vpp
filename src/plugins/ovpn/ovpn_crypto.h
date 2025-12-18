@@ -122,7 +122,8 @@ typedef struct ovpn_crypto_context_t_
 
   /* Key is valid and ready for use */
   u8 is_valid;
-  u8 is_aead; /* 1 for AEAD ciphers, 0 for CBC+HMAC */
+  u8 is_aead;	 /* 1 for AEAD ciphers, 0 for CBC+HMAC */
+  u8 use_data_v2; /* 1 for DATA_V2 format with peer_id, 0 for DATA_V1 */
 } ovpn_crypto_context_t;
 
 /*

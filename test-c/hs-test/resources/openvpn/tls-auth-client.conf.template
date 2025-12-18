@@ -5,7 +5,7 @@
 # which requires PUSH_REPLY from server. Instead we configure manually.
 dev tun
 proto udp
-remote 10.10.2.2 1101
+remote {{.ServerAddress}} {{.ServerPort}}
 resolv-retry infinite
 nobind
 persist-key
@@ -33,7 +33,7 @@ tls-client
 # remote-cert-tls server
 
 # Static tunnel configuration (no push/pull)
-ifconfig 10.8.0.2 10.8.0.1
+ifconfig {{.ClientTunnelIP}} {{.ServerTunnelIP}}
 
 # Keepalive
 keepalive 10 60

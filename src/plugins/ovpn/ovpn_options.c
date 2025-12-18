@@ -118,19 +118,40 @@ ovpn_options_parse_client_ifconfig (const char *options_string,
   ifconfig_value = ovpn_options_string_extract_option (options_string, "ifconfig");
   if (ifconfig_value)
     {
-      /* Format: "ifconfig <ip> <netmask>" - extract first IP */
+      /*
+       * Format: "ifconfig <local-ip> <remote-ip>" (TUN mode)
+       *
+       * When the client sends its expected remote options to the server,
+       * the format is: ifconfig <server-ip> <client-ip>
+       * We need to extract the SECOND IP (remote/client IP).
+       */
       char ip_str[INET_ADDRSTRLEN];
       char *space = strchr (ifconfig_value, ' ');
+      const char *client_ip_start;
       size_t ip_len;
 
       if (space)
-	ip_len = space - ifconfig_value;
+	{
+	  /* Skip the first IP (server's local), extract second IP (client's)
+	   */
+	  client_ip_start = space + 1;
+	  /* Find end of second IP (next space or end of string) */
+	  char *end = strchr (client_ip_start, ' ');
+	  if (end)
+	    ip_len = end - client_ip_start;
+	  else
+	    ip_len = strlen (client_ip_start);
+	}
       else
-	ip_len = strlen (ifconfig_value);
+	{
+	  /* Only one IP - use it as fallback */
+	  client_ip_start = ifconfig_value;
+	  ip_len = strlen (ifconfig_value);
+	}
 
       if (ip_len < sizeof (ip_str))
 	{
-	  clib_memcpy_fast (ip_str, ifconfig_value, ip_len);
+	  clib_memcpy_fast (ip_str, client_ip_start, ip_len);
 	  ip_str[ip_len] = '\0';
 
 	  if (inet_pton (AF_INET, ip_str, &virtual_ip->ip.ip4) == 1)

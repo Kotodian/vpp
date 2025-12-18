@@ -371,9 +371,6 @@ ovpn_peer_update_remote (ovpn_peer_db_t *db, ovpn_peer_t *peer,
     return 0; /* No change */
 
   /* Log the address change */
-  clib_warning ("ovpn: peer %u address changed from %U:%u to %U:%u",
-		peer->peer_id, format_ip_address, &peer->remote_addr,
-		peer->remote_port, format_ip_address, new_addr, new_port);
 
   /* Remove old entry from remote_hash */
   ovpn_peer_remote_hash_make_key (&kv, &peer->remote_addr, peer->remote_port);
@@ -591,12 +588,6 @@ ovpn_peer_build_rewrite (ovpn_peer_t *peer, const ip_address_t *local_addr,
   peer->rewrite = rewrite;
   peer->rewrite_len = vec_len (rewrite);
 
-  clib_warning (
-    "OVPN peer_build_rewrite: peer_id=%u is_ipv6=%u local_port=%u "
-    "remote_port=%u rewrite_len=%u",
-    peer->peer_id, peer->is_ipv6, local_port, peer->remote_port,
-    peer->rewrite_len);
-
   return 0;
 }
 
@@ -706,6 +697,15 @@ ovpn_peer_tls_init (ovpn_peer_t *peer, ptls_context_t *ptls_ctx, u8 key_id)
   tls_ctx->key_method_received = 0;
   tls_ctx->use_tls_ekm = 0; /* Default to PRF method for compatibility */
 
+  /* Initialize plaintext read buffer for decrypted application data */
+  tls_ctx->plaintext_read_buf.capacity = 2048;
+  tls_ctx->plaintext_read_buf.data =
+    clib_mem_alloc (tls_ctx->plaintext_read_buf.capacity);
+  if (!tls_ctx->plaintext_read_buf.data)
+    goto error;
+  tls_ctx->plaintext_read_buf.len = 0;
+  tls_ctx->plaintext_read_buf.offset = 0;
+
   tls_ctx->state = OVPN_TLS_STATE_HANDSHAKE;
   peer->tls_ctx = tls_ctx;
 
@@ -724,6 +724,8 @@ error:
       ovpn_reliable_free (tls_ctx->recv_reliable);
       clib_mem_free (tls_ctx->recv_reliable);
     }
+  if (tls_ctx->plaintext_read_buf.data)
+    clib_mem_free (tls_ctx->plaintext_read_buf.data);
   clib_mem_free (tls_ctx);
   return -1;
 }
@@ -762,6 +764,10 @@ ovpn_peer_tls_free (ovpn_peer_t *peer)
       ovpn_reliable_free (tls_ctx->recv_reliable);
       clib_mem_free (tls_ctx->recv_reliable);
     }
+
+  /* Free plaintext read buffer */
+  if (tls_ctx->plaintext_read_buf.data)
+    clib_mem_free (tls_ctx->plaintext_read_buf.data);
 
   clib_mem_free (tls_ctx);
   peer->tls_ctx = NULL;
@@ -818,7 +824,6 @@ ovpn_peer_tls_process (ovpn_peer_t *peer, u8 *data, u32 len)
 	      size_t remaining = len - consumed;
 	      int recv_ret = ptls_receive (tls_ctx->tls, &plaintext,
 					   data + consumed, &remaining);
-
 	      if (recv_ret == 0 && plaintext.off > 0)
 		{
 		  /* Store decrypted data in plaintext read buffer */
@@ -898,6 +903,12 @@ ovpn_peer_tls_process (ovpn_peer_t *peer, u8 *data, u32 len)
 					      OVPN_OP_CONTROL_V1);
 	  ret = sendbuf.off;
 	}
+      else
+	{
+	}
+    }
+  else
+    {
     }
 
   ptls_buffer_dispose (&sendbuf);
@@ -1092,12 +1103,6 @@ ovpn_peer_adj_stack (ovpn_peer_t *peer, adj_index_t ai)
 
   fib_index = fib_table_find (fib_proto, peer->fib_index);
 
-  clib_warning (
-    "OVPN adj_stack: ai=%u peer_fib_index=%u resolved_fib_index=%u "
-    "remote_addr=%U is_ipv6=%u",
-    ai, peer->fib_index, fib_index, format_ip_address, &peer->remote_addr,
-    peer->is_ipv6);
-
   if (fib_index != ~0)
     {
       fib_prefix_t dst = {
@@ -1109,10 +1114,6 @@ ovpn_peer_adj_stack (ovpn_peer_t *peer, adj_index_t ai)
 	dst.fp_addr.ip6 = peer->remote_addr.ip.ip6;
       else
 	dst.fp_addr.ip4 = peer->remote_addr.ip.ip4;
-
-      clib_warning ("OVPN adj_stack: stacking ai=%u to fib=%u dst=%U/%u", ai,
-		    fib_index, format_ip_address, &peer->remote_addr,
-		    dst.fp_len);
 
       /*
        * Use adj_midchain_delegate_stack which:
@@ -1127,20 +1128,9 @@ ovpn_peer_adj_stack (ovpn_peer_t *peer, adj_index_t ai)
        */
       adj_midchain_delegate_stack (ai, fib_index, &dst);
 
-      /* Verify the adjacency's DPO is set up correctly */
-      ip_adjacency_t *adj = adj_get (ai);
-      clib_warning (
-	"OVPN adj_stack: after delegate_stack, next_dpo type=%u index=%u "
-	"next=%u",
-	adj->sub_type.midchain.next_dpo.dpoi_type,
-	adj->sub_type.midchain.next_dpo.dpoi_index,
-	adj->sub_type.midchain.next_dpo.dpoi_next_node);
     }
   else
     {
-      clib_warning (
-	"OVPN adj_stack: FAILED to find fib for table_id=%u - no stacking!",
-	peer->fib_index);
     }
 }
 

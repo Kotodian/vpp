@@ -180,12 +180,8 @@ ovpn_if_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai)
   ovpn_main_t *omp = &ovpn_main;
   ovpn_peer_t *peer;
   ip_adjacency_t *adj;
-  int peer_count = 0;
 
   adj = adj_get (ai);
-
-  clib_warning ("OVPN update_adj: sw_if_index=%u ai=%u adj_type=%u",
-		sw_if_index, ai, adj->lookup_next_index);
 
   /*
    * Convert any neighbour adjacency that has a next-hop reachable through
@@ -200,11 +196,6 @@ ovpn_if_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai)
    */
   pool_foreach (peer, omp->multi_context.peer_db.peers)
     {
-      peer_count++;
-      clib_warning (
-	"OVPN update_adj: peer_id=%u sw_if=%u state=%u virtual_ip_set=%u",
-	peer->peer_id, peer->sw_if_index, peer->state, peer->virtual_ip_set);
-
       if (peer->sw_if_index != sw_if_index)
 	continue;
       if (peer->state != OVPN_PEER_STATE_ESTABLISHED)
@@ -241,10 +232,6 @@ ovpn_if_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai)
 
       if (match)
 	{
-	  clib_warning ("OVPN update_adj: MATCH! peer_id=%u ai=%u rewrite=%p "
-			"rewrite_len=%u",
-			peer->peer_id, ai, peer->rewrite,
-			peer->rewrite ? vec_len (peer->rewrite) : 0);
 
 	  /* Associate this adjacency with the peer */
 	  ovpn_peer_adj_index_add (peer->peer_id, ai);
@@ -261,34 +248,13 @@ ovpn_if_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai)
 	  u32 output_node_index =
 	    (adj->ia_nh_proto == FIB_PROTOCOL_IP4) ? ovpn4_output_node.index :
 						    ovpn6_output_node.index;
-	  vlib_node_t *next_node =
-	    vlib_get_node (vlib_get_main (), output_node_index);
-	  clib_warning (
-	    "OVPN update_adj: setting midchain next to node %u (%s) (ovpn4=%u, "
-	    "ovpn6=%u)",
-	    output_node_index, next_node ? (char *) next_node->name : "UNKNOWN",
-	    ovpn4_output_node.index, ovpn6_output_node.index);
 	  adj_nbr_midchain_update_next_node (ai, output_node_index);
-
-	  /* Verify the midchain setup */
-	  adj = adj_get (ai);
-	  vlib_node_t *adj_node =
-	    vlib_get_node (vlib_get_main (), adj->ia_node_index);
-	  clib_warning (
-	    "OVPN update_adj: after midchain update ai=%u "
-	    "lookup_next_index=%u (MIDCHAIN=%d) ia_node_index=%u (%s) "
-	    "rewrite_header.next_index=%u",
-	    ai, adj->lookup_next_index, IP_LOOKUP_NEXT_MIDCHAIN,
-	    adj->ia_node_index, adj_node ? (char *) adj_node->name : "UNKNOWN",
-	    adj->rewrite_header.next_index);
 
 	  /* Stack the adjacency on the path to reach the peer's endpoint */
 	  ovpn_peer_adj_stack (peer, ai);
 	  break;
 	}
     }
-
-  clib_warning ("OVPN update_adj: total peers checked=%d", peer_count);
 }
 
 /*
@@ -299,8 +265,6 @@ ovpn_if_adj_walk_cb (adj_index_t ai, void *ctx)
 {
   u32 sw_if_index = *(u32 *) ctx;
   vnet_main_t *vnm = vnet_get_main ();
-
-  clib_warning ("OVPN: adj_walk_cb for ai=%u sw_if_index=%u", ai, sw_if_index);
   ovpn_if_update_adj (vnm, sw_if_index, ai);
   return ADJ_WALK_RC_CONTINUE;
 }
@@ -313,8 +277,6 @@ void
 ovpn_if_update_adj_for_peer (u32 sw_if_index)
 {
   fib_protocol_t proto;
-
-  clib_warning ("OVPN: Updating adjacencies for sw_if_index %u", sw_if_index);
 
   FOR_EACH_FIB_IP_PROTOCOL (proto)
   {

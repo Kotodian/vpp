@@ -24,6 +24,17 @@
 #include <picotls.h>
 
 /**
+ * Secure memory zeroing that won't be optimized away by the compiler.
+ * Used for clearing sensitive cryptographic material.
+ */
+always_inline void
+ovpn_secure_zero_memory (void *ptr, size_t size)
+{
+  static void *(*const volatile memset_v) (void *, int, size_t) = &memset;
+  memset_v (ptr, 0, size);
+}
+
+/**
  * Key Method 2 constants
  */
 #define OVPN_KEY_METHOD_2	   2

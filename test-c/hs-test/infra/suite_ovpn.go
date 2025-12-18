@@ -249,6 +249,100 @@ func (s *OvpnSuite) ShowOvpnInterface() string {
 	return vpp.Vppctl("show ovpn interface")
 }
 
+// CopyTlsCertsToVpp copies TLS certificates to the VPP container
+func (s *OvpnSuite) CopyTlsCertsToVpp() {
+	// Copy CA certificate
+	caCert, err := os.ReadFile("./resources/openvpn/tls/ca.crt")
+	s.AssertNil(err, "failed to read ca.crt")
+	s.Containers.Vpp.CreateFile("/tmp/ca.crt", string(caCert))
+
+	// Copy server certificate
+	serverCert, err := os.ReadFile("./resources/openvpn/tls/server.crt")
+	s.AssertNil(err, "failed to read server.crt")
+	s.Containers.Vpp.CreateFile("/tmp/server.crt", string(serverCert))
+
+	// Copy server key
+	serverKey, err := os.ReadFile("./resources/openvpn/tls/server.key")
+	s.AssertNil(err, "failed to read server.key")
+	s.Containers.Vpp.CreateFile("/tmp/server.key", string(serverKey))
+}
+
+// CopyTlsAuthKeyToVpp copies the TLS-Auth key to the VPP container
+func (s *OvpnSuite) CopyTlsAuthKeyToVpp() {
+	taKey, err := os.ReadFile("./resources/openvpn/tls/ta.key")
+	s.AssertNil(err, "failed to read ta.key")
+	s.Containers.Vpp.CreateFile("/tmp/ta.key", string(taKey))
+}
+
+// ConfigureVppOvpnTlsAuth configures VPP OpenVPN with TLS-Auth mode
+func (s *OvpnSuite) ConfigureVppOvpnTlsAuth() {
+	vpp := s.Containers.Vpp.VppInstance
+
+	// Create OpenVPN interface with TLS-Auth
+	// Format: ovpn create local <ip> port <port> ca <cert> cert <cert> key <key> tls-auth <key>
+	cmd := fmt.Sprintf("ovpn create local %s port %s ca /tmp/ca.crt cert /tmp/server.crt key /tmp/server.key tls-auth /tmp/ta.key",
+		s.VppOvpnAddr(), s.Ports.Ovpn)
+	s.Log("VPP command: " + cmd)
+	result := vpp.Vppctl(cmd)
+	s.Log("Result: " + result)
+
+	// Configure tunnel IP address
+	cmd = fmt.Sprintf("set interface ip address ovpn0 %s/24", s.TunnelServerIP())
+	s.Log("VPP command: " + cmd)
+	result = vpp.Vppctl(cmd)
+	s.Log("Result: " + result)
+
+	// Bring up the interface
+	result = vpp.Vppctl("set interface state ovpn0 up")
+	s.Log("Interface state: " + result)
+}
+
+// CreateOpenVpnTlsAuthClientConfig creates the OpenVPN TLS-Auth client configuration
+func (s *OvpnSuite) CreateOpenVpnTlsAuthClientConfig() {
+	values := struct {
+		ServerAddress  string
+		ServerPort     string
+		ClientTunnelIP string
+		ServerTunnelIP string
+	}{
+		ServerAddress:  s.VppOvpnAddr(),
+		ServerPort:     s.Ports.Ovpn,
+		ClientTunnelIP: s.TunnelClientIP(),
+		ServerTunnelIP: s.TunnelServerIP(),
+	}
+
+	// Create log and config directories in container
+	s.Containers.OpenVpnClient.Exec(false, "mkdir -p /tmp/openvpn")
+	s.Containers.OpenVpnClient.Exec(false, "mkdir -p /etc/openvpn")
+
+	// Copy CA certificate
+	caCert, err := os.ReadFile("./resources/openvpn/tls/ca.crt")
+	s.AssertNil(err, "failed to read ca.crt")
+	s.Containers.OpenVpnClient.CreateFile("/etc/openvpn/ca.crt", string(caCert))
+
+	// Copy client certificate
+	clientCert, err := os.ReadFile("./resources/openvpn/tls/client.crt")
+	s.AssertNil(err, "failed to read client.crt")
+	s.Containers.OpenVpnClient.CreateFile("/etc/openvpn/client.crt", string(clientCert))
+
+	// Copy client key
+	clientKey, err := os.ReadFile("./resources/openvpn/tls/client.key")
+	s.AssertNil(err, "failed to read client.key")
+	s.Containers.OpenVpnClient.CreateFile("/etc/openvpn/client.key", string(clientKey))
+
+	// Copy TLS-Auth key
+	taKey, err := os.ReadFile("./resources/openvpn/tls/ta.key")
+	s.AssertNil(err, "failed to read ta.key")
+	s.Containers.OpenVpnClient.CreateFile("/etc/openvpn/ta.key", string(taKey))
+
+	// Create client config from template
+	s.Containers.OpenVpnClient.CreateConfigFromTemplate(
+		"/etc/openvpn/client.conf",
+		"./resources/openvpn/tls-auth-client.conf.template",
+		values,
+	)
+}
+
 var _ = Describe("OvpnSuite", Ordered, ContinueOnFailure, Label("Ovpn"), func() {
 	var s OvpnSuite
 	BeforeAll(func() {

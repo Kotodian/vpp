@@ -120,10 +120,24 @@ typedef struct ovpn_pending_db_t_ ovpn_pending_db_t;
 typedef struct ovpn_tls_auth_t_
 {
   u8 enabled;
-  u8 key[OVPN_HMAC_KEY_SIZE];
-  u8 key_len;
-  /* Key direction: 0 = normal, 1 = inverse */
-  u8 key_direction;
+
+  /*
+   * Separate keys for encrypt (sending) and decrypt (receiving)
+   * OpenVPN static key files have 4 x 64-byte keys, but we only use
+   * the first 32 bytes of each HMAC key for SHA256:
+   *   - Key 0 (bytes 0-31): Direction 0 HMAC key
+   *   - Key 1 (bytes 64-95): Direction 1 HMAC key
+   *
+   * For server mode (key_direction=0):
+   *   - encrypt_key = direction 0 (for server->client)
+   *   - decrypt_key = direction 1 (for client->server)
+   *
+   * For client mode (key_direction=1):
+   *   - encrypt_key = direction 1 (for client->server)
+   *   - decrypt_key = direction 0 (for server->client)
+   */
+  u8 encrypt_key[OVPN_HMAC_SIZE]; /* HMAC key for outgoing packets */
+  u8 decrypt_key[OVPN_HMAC_SIZE]; /* HMAC key for incoming packets */
 
   /* Replay protection for incoming packets (wrapper packet_id) */
   u64 replay_bitmap;
@@ -538,6 +552,10 @@ int ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
  *
  * Output: plaintext starting from session_id (HMAC + packet_id + net_time stripped)
  *
+ * Note: The opcode must be passed separately because OpenVPN includes the opcode
+ * in HMAC calculation even though it appears before the HMAC on the wire.
+ * HMAC covers: [packet_id] [net_time] [opcode] [session_id...payload]
+ *
  * Returns: length of plaintext, or <0 on error:
  *   -1: invalid parameters
  *   -2: packet too short
@@ -549,6 +567,10 @@ int ovpn_tls_auth_unwrap (ovpn_tls_auth_t *ctx, const u8 *wrapped, u32 wrapped_l
 
 /*
  * TLS-Auth wrap: add HMAC and packet_id/net_time for outgoing packets
+ *
+ * The opcode must be passed separately because OpenVPN includes the opcode
+ * in HMAC calculation in a specific order.
+ * HMAC covers: [packet_id] [net_time] [opcode] [session_id...payload]
  *
  * Returns: length of wrapped packet, or <0 on error
  */
@@ -569,6 +591,23 @@ int ovpn_handshake_verify_hmac (const u8 *data, u32 len,
  */
 void ovpn_handshake_generate_hmac (u8 *data, u32 len, u8 *hmac_out,
 				   const ovpn_tls_auth_t *auth);
+
+/*
+ * Parse TLS-Auth key from raw key data
+ * The key data should be the binary content of an OpenVPN static key file
+ *
+ * @param key_data  Raw key file contents (PEM or binary format)
+ * @param key_len   Length of key data
+ * @param ctx       TLS-Auth context to initialize
+ * @param is_server 1 for server mode, 0 for client mode
+ *
+ * Returns 0 on success, <0 on error:
+ *   -1: Invalid parameters
+ *   -2: Invalid key format
+ *   -3: Key too short
+ */
+int ovpn_tls_auth_parse_key (const u8 *key_data, u32 key_len,
+			     ovpn_tls_auth_t *ctx, u8 is_server);
 
 /*
  * Parse TLS-Crypt key from raw key data

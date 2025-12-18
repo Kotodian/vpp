@@ -455,6 +455,7 @@ ovpn_find_last_buffer (vlib_main_t *vm, vlib_buffer_t *b)
 
 /*
  * Prepare encryption operation for a buffer (supports chained buffers)
+ * Supports both DATA_V1 (without peer_id) and DATA_V2 (with peer_id) formats
  */
 int
 ovpn_crypto_encrypt_prepare (vlib_main_t *vm, ovpn_per_thread_crypto_t *ptd,
@@ -463,13 +464,14 @@ ovpn_crypto_encrypt_prepare (vlib_main_t *vm, ovpn_per_thread_crypto_t *ptd,
 {
   vlib_buffer_t *lb;
   vnet_crypto_op_t *op;
-  ovpn_data_v2_header_t *hdr;
   u32 n_bufs;
   u32 packet_id;
   u8 *payload;
   u32 payload_len;
   u8 *tag;
   u8 *iv;
+  u8 *aad;
+  u32 aad_len;
 
   if (!ctx->is_valid)
     return -1;
@@ -496,20 +498,41 @@ ovpn_crypto_encrypt_prepare (vlib_main_t *vm, ovpn_per_thread_crypto_t *ptd,
   /* Calculate payload length from chain before modifying */
   payload_len = vlib_buffer_length_in_chain (vm, b);
 
-  /* Reserve space for header at the beginning */
-  hdr =
-    (ovpn_data_v2_header_t *) vlib_buffer_push_uninit (b, sizeof (*hdr));
-
   /* Get next packet ID */
   packet_id = ovpn_crypto_get_next_packet_id (ctx);
 
-  /* Fill in header */
-  hdr->opcode_keyid = ovpn_op_compose (OVPN_OP_DATA_V2, key_id);
-  ovpn_data_v2_set_peer_id (hdr, peer_id);
-  hdr->packet_id = clib_host_to_net_u32 (packet_id);
-
-  /* Payload starts after header */
-  payload = (u8 *) (hdr + 1);
+  /* Reserve space for header and fill it based on format */
+  if (ctx->use_data_v2)
+    {
+      /* DATA_V2 format: opcode(1) + peer_id(3) + packet_id(4) */
+      ovpn_data_v2_header_t *hdr_v2;
+      hdr_v2 = (ovpn_data_v2_header_t *) vlib_buffer_push_uninit (
+	b, sizeof (*hdr_v2));
+      hdr_v2->opcode_keyid = ovpn_op_compose (OVPN_OP_DATA_V2, key_id);
+      ovpn_data_v2_set_peer_id (hdr_v2, peer_id);
+      hdr_v2->packet_id = clib_host_to_net_u32 (packet_id);
+      aad = (u8 *) hdr_v2;
+      aad_len = sizeof (*hdr_v2);
+      payload = (u8 *) (hdr_v2 + 1);
+    }
+  else
+    {
+      /*
+       * DATA_V1 format: opcode(1) + packet_id(4)
+       * AAD for DATA_V1 is just packet_id (4 bytes), NOT opcode.
+       * This matches OpenVPN's behavior where the opcode is stripped
+       * before setting ad_start for AEAD authentication.
+       */
+      ovpn_data_v1_header_t *hdr_v1;
+      hdr_v1 = (ovpn_data_v1_header_t *) vlib_buffer_push_uninit (
+	b, sizeof (*hdr_v1));
+      hdr_v1->opcode_keyid = ovpn_op_compose (OVPN_OP_DATA_V1, key_id);
+      hdr_v1->packet_id = clib_host_to_net_u32 (packet_id);
+      /* AAD starts at packet_id, not opcode */
+      aad = (u8 *) &hdr_v1->packet_id;
+      aad_len = sizeof (hdr_v1->packet_id);
+      payload = (u8 *) (hdr_v1 + 1);
+    }
 
   /* Reserve space for tag at end of chain */
   vlib_buffer_chain_increase_length (b, lb, OVPN_TAG_SIZE);
@@ -531,9 +554,9 @@ ovpn_crypto_encrypt_prepare (vlib_main_t *vm, ovpn_per_thread_crypto_t *ptd,
 
       op->flags |= VNET_CRYPTO_OP_FLAG_CHAINED_BUFFERS;
       op->chunk_index = vec_len (ptd->chunks);
-      ovpn_crypto_chain_chunks (vm, ptd, b, lb, payload, b->current_length -
-						sizeof (*hdr),
-				&op->n_chunks, -OVPN_TAG_SIZE);
+      ovpn_crypto_chain_chunks (vm, ptd, b, lb, payload,
+				b->current_length - aad_len, &op->n_chunks,
+				-OVPN_TAG_SIZE);
     }
   else
     {
@@ -548,8 +571,8 @@ ovpn_crypto_encrypt_prepare (vlib_main_t *vm, ovpn_per_thread_crypto_t *ptd,
 
   op->key_index = ctx->encrypt_key_index;
   op->iv = iv;
-  op->aad = (u8 *) hdr;
-  op->aad_len = sizeof (*hdr);
+  op->aad = aad;
+  op->aad_len = aad_len;
   op->tag = tag;
   op->tag_len = OVPN_TAG_SIZE;
   op->user_data = bi;
@@ -571,6 +594,7 @@ ovpn_crypto_decrypt_prepare (vlib_main_t *vm, ovpn_per_thread_crypto_t *ptd,
   u32 packet_id;
   u8 *aad;
   u32 aad_len;
+  u32 hdr_len; /* Full header length for buffer advance */
   u8 *src;
   u32 src_len;
   u32 total_len;
@@ -621,28 +645,68 @@ ovpn_crypto_decrypt_prepare (vlib_main_t *vm, ovpn_per_thread_crypto_t *ptd,
 
   /*
    * Buffer should point to start of OpenVPN packet (opcode byte)
-   * Layout: [opcode+keyid:1][peer_id:3][packet_id:4][ciphertext][tag:16]
+   * Layout varies by format:
+   *   DATA_V1: [opcode+keyid:1][packet_id:4][ciphertext][tag:16]
+   *   DATA_V2: [opcode+keyid:1][peer_id:3][packet_id:4][ciphertext][tag:16]
    */
-  if (total_len < OVPN_DATA_V2_MIN_SIZE + OVPN_TAG_SIZE)
-    return -3;
+  u8 *pkt_start = vlib_buffer_get_current (b);
+  u8 opcode = pkt_start[0] >> 3;
 
-  /* AAD is the full header (opcode + peer_id + packet_id) */
-  aad = vlib_buffer_get_current (b);
-  aad_len = sizeof (ovpn_data_v2_header_t);
-
-  /* Extract packet_id */
-  packet_id = clib_net_to_host_u32 (((ovpn_data_v2_header_t *) aad)->packet_id);
+  if (opcode == OVPN_OP_DATA_V2)
+    {
+      /* DATA_V2: AAD is full header (opcode + peer_id + packet_id) = 8 bytes */
+      if (total_len < OVPN_DATA_V2_MIN_SIZE + OVPN_TAG_SIZE)
+	return -3;
+      aad = pkt_start;
+      aad_len = sizeof (ovpn_data_v2_header_t);
+      hdr_len = sizeof (ovpn_data_v2_header_t);
+      packet_id =
+	clib_net_to_host_u32 (((ovpn_data_v2_header_t *) pkt_start)->packet_id);
+    }
+  else if (opcode == OVPN_OP_DATA_V1)
+    {
+      /*
+       * DATA_V1: AAD is just packet_id (4 bytes), NOT opcode.
+       * This matches OpenVPN's behavior where the opcode is stripped
+       * before setting ad_start for AEAD authentication.
+       * But hdr_len is full header for buffer advance.
+       */
+      if (total_len < OVPN_DATA_V1_MIN_SIZE + OVPN_TAG_SIZE)
+	return -3;
+      ovpn_data_v1_header_t *hdr_v1 = (ovpn_data_v1_header_t *) pkt_start;
+      aad = (u8 *) &hdr_v1->packet_id;
+      aad_len = sizeof (hdr_v1->packet_id);
+      hdr_len = sizeof (ovpn_data_v1_header_t);
+      packet_id = clib_net_to_host_u32 (hdr_v1->packet_id);
+    }
+  else
+    {
+      return -5; /* Unknown opcode */
+    }
 
   /* Check replay */
   if (!ovpn_crypto_check_replay (ctx, packet_id))
     return -4; /* Replay detected */
 
-  /* Ciphertext starts after the header */
-  src = aad + aad_len;
-  src_len = total_len - aad_len - OVPN_TAG_SIZE;
-
-  /* Tag is at the end of the last buffer */
-  tag = vlib_buffer_get_tail (lb) - OVPN_TAG_SIZE;
+  /*
+   * Wire format differs between DATA_V1 and DATA_V2:
+   * DATA_V1: [opcode:1][packet_id:4][tag:16][ciphertext:N]
+   * DATA_V2: [opcode:1][peer_id:3][packet_id:4][ciphertext:N][tag:16]
+   */
+  if (opcode == OVPN_OP_DATA_V1)
+    {
+      /* Tag is right after header, ciphertext follows tag */
+      tag = pkt_start + hdr_len;
+      src = pkt_start + hdr_len + OVPN_TAG_SIZE;
+      src_len = total_len - hdr_len - OVPN_TAG_SIZE;
+    }
+  else
+    {
+      /* DATA_V2: ciphertext after header, tag at end */
+      src = pkt_start + hdr_len;
+      src_len = total_len - hdr_len - OVPN_TAG_SIZE;
+      tag = vlib_buffer_get_tail (lb) - OVPN_TAG_SIZE;
+    }
 
   /* Allocate IV storage */
   vec_add2 (ptd->ivs, iv, OVPN_NONCE_SIZE);
@@ -662,8 +726,7 @@ ovpn_crypto_decrypt_prepare (vlib_main_t *vm, ovpn_per_thread_crypto_t *ptd,
 
       /* For decrypt, include tag in chunk calculation for verification */
       ovpn_crypto_chain_chunks (vm, ptd, b, lb, src,
-				b->current_length - aad_len, &op->n_chunks,
-				0);
+				b->current_length - hdr_len, &op->n_chunks, 0);
     }
   else
     {
@@ -846,6 +909,33 @@ ovpn_crypto_encrypt (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
 	return -1;
     }
 
+  /*
+   * For DATA_V1 (non-epoch) format, OpenVPN expects tag BEFORE ciphertext:
+   *   [opcode:1][packet_id:4][tag:16][ciphertext:N]
+   * But crypto produces:
+   *   [opcode:1][packet_id:4][ciphertext:N][tag:16]
+   * We need to reorder the packet.
+   */
+  if (!ctx->use_data_v2)
+    {
+      u8 *pkt = vlib_buffer_get_current (b);
+      u32 pkt_len = b->current_length;
+      u32 hdr_len = sizeof (ovpn_data_v1_header_t);
+      u8 *ciphertext = pkt + hdr_len;
+      u32 ciphertext_len = pkt_len - hdr_len - OVPN_TAG_SIZE;
+      u8 *tag_at_end = pkt + pkt_len - OVPN_TAG_SIZE;
+
+      /* Save tag */
+      u8 tag_tmp[OVPN_TAG_SIZE];
+      clib_memcpy_fast (tag_tmp, tag_at_end, OVPN_TAG_SIZE);
+
+      /* Move ciphertext forward by 16 bytes to make room for tag */
+      memmove (ciphertext + OVPN_TAG_SIZE, ciphertext, ciphertext_len);
+
+      /* Copy tag to right after header */
+      clib_memcpy_fast (ciphertext, tag_tmp, OVPN_TAG_SIZE);
+    }
+
   return 0;
 }
 
@@ -990,10 +1080,7 @@ ovpn_crypto_cbc_decrypt_no_opcode (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
 
   /* Minimum length: HMAC(32) + IV(16) + encrypted(packet_id:4 + min_payload) */
   if (len < (OVPN_CBC_HMAC_SIZE + OVPN_IV_SIZE + 16))
-    {
-      clib_warning ("OVPN CBC no-opcode: packet too short, len=%u", len);
-      return -2;
-    }
+    return -2;
 
   /* Parse packet structure - no opcode byte in this format */
   hmac_received = data;
@@ -1003,11 +1090,7 @@ ovpn_crypto_cbc_decrypt_no_opcode (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
 
   /* Ciphertext must be at least 16 bytes (one AES block) and multiple of 16 */
   if (ciphertext_len < 16 || (ciphertext_len % 16) != 0)
-    {
-      clib_warning ("OVPN CBC no-opcode: invalid ciphertext len=%u",
-		    ciphertext_len);
-      return -3;
-    }
+    return -3;
 
   /*
    * Step 1: Verify HMAC
@@ -1026,22 +1109,11 @@ ovpn_crypto_cbc_decrypt_no_opcode (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
   vnet_crypto_process_ops (vm, &hmac_op, 1);
 
   if (hmac_op.status != VNET_CRYPTO_OP_STATUS_COMPLETED)
-    {
-      clib_warning ("OVPN CBC no-opcode: HMAC computation failed, status=%d",
-		    hmac_op.status);
-      return -4;
-    }
+    return -4;
 
   /* Compare HMAC */
   if (clib_memcmp (hmac_computed, hmac_received, OVPN_CBC_HMAC_SIZE) != 0)
-    {
-      clib_warning (
-	"OVPN CBC no-opcode: HMAC mismatch, received=%02x%02x%02x%02x..., "
-	"computed=%02x%02x%02x%02x...",
-	hmac_received[0], hmac_received[1], hmac_received[2], hmac_received[3],
-	hmac_computed[0], hmac_computed[1], hmac_computed[2], hmac_computed[3]);
-      return -5;
-    }
+    return -5;
 
   /*
    * Step 2: Decrypt ciphertext in place
@@ -1057,10 +1129,7 @@ ovpn_crypto_cbc_decrypt_no_opcode (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
   vnet_crypto_process_ops (vm, &decrypt_op, 1);
 
   if (decrypt_op.status != VNET_CRYPTO_OP_STATUS_COMPLETED)
-    {
-      clib_warning ("OVPN CBC no-opcode: decryption failed");
-      return -6;
-    }
+    return -6;
 
   /*
    * Step 3: Extract packet_id from beginning of decrypted data
@@ -1071,11 +1140,7 @@ ovpn_crypto_cbc_decrypt_no_opcode (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
 
   /* Check replay */
   if (!ovpn_crypto_check_replay (ctx, packet_id))
-    {
-      clib_warning ("OVPN CBC no-opcode: replay detected, packet_id=%u",
-		    packet_id);
-      return -7;
-    }
+    return -7;
 
   /* Update replay window */
   ovpn_crypto_update_replay (ctx, packet_id);
@@ -1091,9 +1156,6 @@ ovpn_crypto_cbc_decrypt_no_opcode (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
    */
   vlib_buffer_advance (b, OVPN_CBC_HMAC_SIZE + OVPN_IV_SIZE + 8);
 
-  clib_warning ("OVPN CBC no-opcode: success, packet_id=%u, payload_len=%u",
-		packet_id, b->current_length);
-
   return 0;
 }
 
@@ -1108,8 +1170,16 @@ ovpn_crypto_decrypt (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
   u32 thread_index = vm->thread_index;
   ovpn_per_thread_crypto_t *ptd = &ovpn_per_thread_crypto[thread_index];
   vlib_buffer_t *lb;
-  u32 aad_len = sizeof (ovpn_data_v2_header_t);
+  u32 hdr_len;
   int rv;
+
+  /* Determine header length from opcode before decrypt modifies buffer */
+  u8 *pkt = vlib_buffer_get_current (b);
+  u8 opcode = pkt[0] >> 3;
+  if (opcode == OVPN_OP_DATA_V2)
+    hdr_len = sizeof (ovpn_data_v2_header_t);
+  else
+    hdr_len = sizeof (ovpn_data_v1_header_t);
 
   ovpn_crypto_reset_ptd (ptd);
 
@@ -1143,11 +1213,19 @@ ovpn_crypto_decrypt (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
   /* Find last buffer */
   lb = ovpn_find_last_buffer (vm, b);
 
-  /* Advance buffer past header to plaintext */
-  vlib_buffer_advance (b, aad_len);
-
-  /* Remove tag from chain length */
-  vlib_buffer_chain_increase_length (b, lb, -OVPN_TAG_SIZE);
+  /*
+   * Advance buffer past header and tag (for DATA_V1) to plaintext.
+   * DATA_V1: [opcode:1][packet_id:4][tag:16][ciphertext/plaintext:N]
+   * DATA_V2: [opcode:1][peer_id:3][packet_id:4][ciphertext/plaintext:N][tag:16]
+   */
+  if (opcode == OVPN_OP_DATA_V1)
+    vlib_buffer_advance (b, hdr_len + OVPN_TAG_SIZE);
+  else
+    {
+      vlib_buffer_advance (b, hdr_len);
+      /* Remove tag from chain length (only for DATA_V2 where tag is at end) */
+      vlib_buffer_chain_increase_length (b, lb, -OVPN_TAG_SIZE);
+    }
 
   return 0;
 }

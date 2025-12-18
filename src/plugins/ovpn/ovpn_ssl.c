@@ -33,13 +33,6 @@ const ovpn_session_id_t x_session_id_zero = { .id = { 0 } };
 
 static ovpn_key_source2_t *ovpn_key_source2s;
 
-always_inline void
-ovpn_secure_zero_memory (void *ptr, size_t size)
-{
-  static void *(*const volatile memset_v) (void *, int, size_t) = &memset;
-  memset_v (ptr, 0, size);
-}
-
 ovpn_key_source2_t *
 ovpn_key_source2_alloc (void)
 {
@@ -324,20 +317,49 @@ ovpn_key_method_2_write (u8 *buf, u32 buf_len, ovpn_key_source2_t *ks2,
   clib_memcpy_fast (buf + offset, local_ks->random2, OVPN_RANDOM_SIZE);
   offset += OVPN_RANDOM_SIZE;
 
-  /* Write options string (null-terminated) */
-  if (options && buf_len > offset)
+  /*
+   * Write options string
+   * Format: 2-byte length (network order) followed by string (null-terminated)
+   * The length includes the null terminator
+   */
+  if (options && buf_len > offset + 2)
     {
-      u32 opt_len = strlen (options);
-      if (offset + opt_len + 1 <= buf_len)
+      u32 opt_len = strlen (options) + 1; /* Include null terminator */
+      if (offset + 2 + opt_len <= buf_len)
 	{
-	  clib_memcpy_fast (buf + offset, options, opt_len + 1);
-	  offset += opt_len + 1;
+	  /* Write 2-byte length in network order */
+	  *(u16 *) (buf + offset) = clib_host_to_net_u16 ((u16) opt_len);
+	  offset += 2;
+	  /* Write string including null terminator */
+	  clib_memcpy_fast (buf + offset, options, opt_len);
+	  offset += opt_len;
 	}
     }
-  else if (buf_len > offset)
+  else if (buf_len > offset + 2)
     {
-      /* Empty options string */
-      buf[offset++] = 0;
+      /* Empty options string - length = 0 */
+      *(u16 *) (buf + offset) = 0;
+      offset += 2;
+    }
+
+  /*
+   * Write empty username field (server doesn't send username)
+   * Format: 2-byte length (0)
+   */
+  if (buf_len > offset + 2)
+    {
+      *(u16 *) (buf + offset) = 0;
+      offset += 2;
+    }
+
+  /*
+   * Write empty password field (server doesn't send password)
+   * Format: 2-byte length (0)
+   */
+  if (buf_len > offset + 2)
+    {
+      *(u16 *) (buf + offset) = 0;
+      offset += 2;
     }
 
   return offset;
@@ -552,6 +574,8 @@ ovpn_derive_data_channel_keys_v2 (ptls_t *tls,
 	  clib_memcpy_fast (keys->decrypt_implicit_iv, key2.keys[1].hmac,
 			    OVPN_IMPLICIT_IV_LEN);
 	}
+
+      /* Debug: Print derived keys (full 32 bytes for comparison with OpenVPN) */
 
       /* Securely clear key2 */
       ovpn_secure_zero_memory (&key2, sizeof (key2));
