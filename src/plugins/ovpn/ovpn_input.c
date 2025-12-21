@@ -82,10 +82,9 @@ ovpn_peer_setup_main_thread_fn (ovpn_peer_setup_main_thread_args_t *args)
     fib_table_get_index_for_sw_if_index (FIB_PROTOCOL_IP4, args->sw_if_index);
 
   ovpn_main_t *omp = &ovpn_main;
-  fib_table_entry_path_add (fib_index, &pfx, omp->fib_src_hi,
-			    FIB_ENTRY_FLAG_NONE, DPO_PROTO_IP4, &nh_addr,
-			    args->sw_if_index, ~0, 1, NULL,
-			    FIB_ROUTE_PATH_FLAG_NONE);
+  fib_table_entry_path_add (
+    fib_index, &pfx, omp->fib_src_hi, FIB_ENTRY_FLAG_NONE, DPO_PROTO_IP4,
+    &nh_addr, args->sw_if_index, ~0, 1, NULL, FIB_ROUTE_PATH_FLAG_NONE);
 }
 
 /*
@@ -145,10 +144,9 @@ ovpn_static_key_create_peer (vlib_main_t *vm, ovpn_instance_t *inst,
   key->created_at = now;
   key->expires_at = 0; /* No expiry for static key */
 
-  rv = ovpn_setup_static_key_crypto (&key->crypto, inst->cipher_alg,
-				     inst->options.static_key,
-				     inst->options.static_key_direction,
-				     inst->options.replay_window);
+  rv = ovpn_setup_static_key_crypto (
+    &key->crypto, inst->cipher_alg, inst->options.static_key,
+    inst->options.static_key_direction, inst->options.replay_window);
   if (rv < 0)
     {
       ovpn_peer_delete (db, peer_id);
@@ -190,8 +188,7 @@ ovpn_static_key_create_peer (vlib_main_t *vm, ovpn_instance_t *inst,
       int found_addr = 0;
 
       foreach_ip_interface_address (
-	&ip4_main.lookup_main, ia, peer->sw_if_index, 1,
-	({
+	&ip4_main.lookup_main, ia, peer->sw_if_index, 1, ({
 	  ip4_address_t *a =
 	    ip_interface_address_get_address (&ip4_main.lookup_main, ia);
 	  clib_memcpy (&server_ip, a, sizeof (ip4_address_t));
@@ -215,7 +212,7 @@ ovpn_static_key_create_peer (vlib_main_t *vm, ovpn_instance_t *inst,
 	    .peer_id = peer_id,
 	  };
 	  vlib_rpc_call_main_thread (ovpn_peer_setup_main_thread_fn,
-				    (u8 *) &args, sizeof (args));
+				     (u8 *) &args, sizeof (args));
 	}
     }
 
@@ -390,173 +387,181 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       instances[buf_idx] = inst;
 
       /*
-       * IMPORTANT: In static key mode with CBC+HMAC, data packets have NO
-       * opcode! The first byte is part of the HMAC, not an opcode byte.
-       * We MUST check for this case BEFORE validating the opcode, because
-       * the first byte of HMAC can accidentally look like a valid opcode.
+       * Legacy static key mode without opcode (P2P mode).
        *
-       * Format: [HMAC:32][IV:16][encrypted(packet_id:4 + timestamp:4 +
+       * IMPORTANT: Modern OpenVPN (2.x+) uses P_DATA_V1 opcode even in
+       * static key mode. Only very old configurations use the no-opcode
+       * format: [HMAC:32][IV:16][encrypted(packet_id:4 + timestamp:4 +
        * payload)]
        *
-       * Detect static key data packets by:
+       * We only use this path if:
        * 1. Static key mode is enabled
        * 2. Using CBC cipher (not AEAD)
-       * 3. Packet is large enough to contain HMAC + IV + minimum encrypted data
+       * 3. First byte does NOT look like a valid data opcode
+       * 4. Packet is large enough for HMAC + IV + minimum encrypted data
+       *
+       * If the first byte is a valid P_DATA_V1 or P_DATA_V2 opcode,
+       * let the normal opcode processing handle it.
        */
+      u8 possible_opcode = (op_byte >> 3);
+      int looks_like_data_opcode = (possible_opcode == OVPN_OP_DATA_V1 ||
+				    possible_opcode == OVPN_OP_DATA_V2);
+
       if (PREDICT_FALSE (inst->options.static_key_mode &&
-			  !OVPN_CIPHER_IS_AEAD (inst->cipher_alg) &&
-			  len >= (OVPN_CBC_HMAC_SIZE + OVPN_IV_SIZE + 16)))
+			 !OVPN_CIPHER_IS_AEAD (inst->cipher_alg) &&
+			 !looks_like_data_opcode &&
+			 len >= (OVPN_CBC_HMAC_SIZE + OVPN_IV_SIZE + 16)))
+	{
+	  /* This is a static key mode data packet without opcode */
+
+	  /* Extract remote address from outer IP header for peer lookup.
+	   * Use vnet_buffer()->ip.save_rewrite_length which VPP sets
+	   * to the offset where the IP header starts in the buffer.
+	   */
+	  ip_address_t remote_addr = { 0 };
+	  u16 remote_port = 0;
+
+	  /*
+	   * Find the IP header using save_rewrite_length.
+	   * This field is set by the VPP input nodes to indicate
+	   * the original position of the IP header before buffer
+	   * advancement.
+	   */
+	  u32 ip_offset = vnet_buffer (b0)->ip.save_rewrite_length;
+	  u8 *ip_hdr = NULL;
+
+	  if (ip_offset > 0 && ip_offset <= b0->current_data)
 	    {
-	      /* This is a static key mode data packet without opcode */
+	      /* Calculate IP header position from saved offset */
+	      ip_hdr = (u8 *) vlib_buffer_get_current (b0) -
+		       (b0->current_data - ip_offset);
+	    }
+	  else
+	    {
+	      /* Fallback: buffer should point to payload, go back by
+	       * IP + UDP header size */
+	      ip_hdr = (u8 *) vlib_buffer_get_current (b0) -
+		       (sizeof (ip4_header_t) + sizeof (udp_header_t));
+	    }
 
-	      /* Extract remote address from outer IP header for peer lookup.
-	       * Use vnet_buffer()->ip.save_rewrite_length which VPP sets
-	       * to the offset where the IP header starts in the buffer.
+	  u8 version = (ip_hdr[0] >> 4) & 0xf;
+
+	  if (version == 4)
+	    {
+	      ip4_header_t *ip4 = (ip4_header_t *) ip_hdr;
+	      udp_header_t *udp = (udp_header_t *) (ip4 + 1);
+	      ip_address_set (&remote_addr, &ip4->src_address, AF_IP4);
+	      remote_port = clib_net_to_host_u16 (udp->src_port);
+	    }
+	  else if (version == 6)
+	    {
+	      ip6_header_t *ip6 = (ip6_header_t *) ip_hdr;
+	      udp_header_t *udp = (udp_header_t *) (ip6 + 1);
+	      ip_address_set (&remote_addr, &ip6->src_address, AF_IP6);
+	      remote_port = clib_net_to_host_u16 (udp->src_port);
+	    }
+
+	  /* Lookup peer by remote endpoint */
+	  peer = ovpn_peer_lookup_by_remote (&inst->multi_context.peer_db,
+					     &remote_addr, remote_port);
+
+	  /* Auto-create peer if not found */
+	  if (PREDICT_FALSE (!peer))
+	    {
+	      peer = ovpn_static_key_create_peer (vm, inst, &remote_addr,
+						  remote_port);
+	    }
+
+	  if (PREDICT_FALSE (!peer || !ovpn_peer_is_established (peer)))
+	    {
+	      error = OVPN_INPUT_ERROR_PEER_NOT_FOUND;
+	      goto trace;
+	    }
+
+	  /* Get crypto context */
+	  crypto = ovpn_peer_get_crypto (peer);
+	  if (PREDICT_FALSE (!crypto || !crypto->is_valid))
+	    {
+	      error = OVPN_INPUT_ERROR_NO_CRYPTO;
+	      goto trace;
+	    }
+
+	  /* Decrypt using CBC mode without opcode
+	   * The buffer starts at HMAC, format:
+	   * [HMAC:32][IV:16][encrypted_data]
+	   */
+	  rv = ovpn_crypto_cbc_decrypt_no_opcode (vm, crypto, b0, &packet_id);
+	  if (rv < 0)
+	    {
+	      /* Map specific return codes to error types:
+	       * -1: Invalid context
+	       * -2: Packet too short
+	       * -3: Bad ciphertext size
+	       * -4: HMAC op failed
+	       * -5: HMAC mismatch
+	       * -6: Decrypt op failed
+	       * -7: Replay
 	       */
-	      ip_address_t remote_addr = { 0 };
-	      u16 remote_port = 0;
-
-	      /*
-	       * Find the IP header using save_rewrite_length.
-	       * This field is set by the VPP input nodes to indicate
-	       * the original position of the IP header before buffer
-	       * advancement.
-	       */
-	      u32 ip_offset = vnet_buffer (b0)->ip.save_rewrite_length;
-	      u8 *ip_hdr = NULL;
-
-	      if (ip_offset > 0 && ip_offset <= b0->current_data)
+	      switch (rv)
 		{
-		  /* Calculate IP header position from saved offset */
-		  ip_hdr = (u8 *) vlib_buffer_get_current (b0) -
-			   (b0->current_data - ip_offset);
+		case -1:
+		  error = OVPN_INPUT_ERROR_NO_CRYPTO; /* Invalid context */
+		  break;
+		case -2:
+		  error = OVPN_INPUT_ERROR_TOO_SHORT;
+		  break;
+		case -3:
+		  error = OVPN_INPUT_ERROR_DECRYPT_FAILED; /* Bad ciphertext */
+		  break;
+		case -4:
+		  error = OVPN_INPUT_ERROR_HMAC_OP_FAILED;
+		  break;
+		case -5:
+		  error = OVPN_INPUT_ERROR_HMAC_MISMATCH;
+		  break;
+		case -6:
+		  error = OVPN_INPUT_ERROR_DECRYPT_OP_FAILED;
+		  break;
+		case -7:
+		  error = OVPN_INPUT_ERROR_REPLAY;
+		  break;
+		default:
+		  error = OVPN_INPUT_ERROR_DECRYPT_FAILED;
+		  break;
 		}
+	      goto trace;
+	    }
+
+	  /* Successfully decrypted - set up for IP stack */
+	  vnet_buffer (b0)->sw_if_index[VLIB_RX] = peer->sw_if_index;
+
+	  /* Determine inner packet type */
+	  u8 *payload = vlib_buffer_get_current (b0);
+
+	  if (b0->current_length >= 1)
+	    {
+	      u8 ip_version = (payload[0] >> 4);
+	      if (ip_version == 4)
+		next0 = OVPN_INPUT_NEXT_IP4_INPUT;
+	      else if (ip_version == 6)
+		next0 = OVPN_INPUT_NEXT_IP6_INPUT;
 	      else
 		{
-		  /* Fallback: buffer should point to payload, go back by
-		   * IP + UDP header size */
-		  ip_hdr = (u8 *) vlib_buffer_get_current (b0) -
-			   (sizeof (ip4_header_t) + sizeof (udp_header_t));
-		}
-
-	      u8 version = (ip_hdr[0] >> 4) & 0xf;
-
-	      if (version == 4)
-		{
-		  ip4_header_t *ip4 = (ip4_header_t *) ip_hdr;
-		  udp_header_t *udp = (udp_header_t *) (ip4 + 1);
-		  ip_address_set (&remote_addr, &ip4->src_address, AF_IP4);
-		  remote_port = clib_net_to_host_u16 (udp->src_port);
-		}
-	      else if (version == 6)
-		{
-		  ip6_header_t *ip6 = (ip6_header_t *) ip_hdr;
-		  udp_header_t *udp = (udp_header_t *) (ip6 + 1);
-		  ip_address_set (&remote_addr, &ip6->src_address, AF_IP6);
-		  remote_port = clib_net_to_host_u16 (udp->src_port);
-		}
-
-	      /* Lookup peer by remote endpoint */
-	      peer = ovpn_peer_lookup_by_remote (&inst->multi_context.peer_db,
-						 &remote_addr, remote_port);
-
-	      /* Auto-create peer if not found */
-	      if (PREDICT_FALSE (!peer))
-		{
-		  peer = ovpn_static_key_create_peer (vm, inst, &remote_addr,
-						      remote_port);
-		}
-
-	      if (PREDICT_FALSE (!peer || !ovpn_peer_is_established (peer)))
-		{
-		  error = OVPN_INPUT_ERROR_PEER_NOT_FOUND;
+		  error = OVPN_INPUT_ERROR_BAD_IP_VERSION;
 		  goto trace;
 		}
-
-	      /* Get crypto context */
-	      crypto = ovpn_peer_get_crypto (peer);
-	      if (PREDICT_FALSE (!crypto || !crypto->is_valid))
-		{
-		  error = OVPN_INPUT_ERROR_NO_CRYPTO;
-		  goto trace;
-		}
-
-	      /* Decrypt using CBC mode without opcode
-	       * The buffer starts at HMAC, format:
-	       * [HMAC:32][IV:16][encrypted_data]
-	       */
-	      rv = ovpn_crypto_cbc_decrypt_no_opcode (vm, crypto, b0, &packet_id);
-	      if (rv < 0)
-		{
-		  /* Map specific return codes to error types:
-		   * -1: Invalid context
-		   * -2: Packet too short
-		   * -3: Bad ciphertext size
-		   * -4: HMAC op failed
-		   * -5: HMAC mismatch
-		   * -6: Decrypt op failed
-		   * -7: Replay
-		   */
-		  switch (rv)
-		    {
-		    case -1:
-		      error = OVPN_INPUT_ERROR_NO_CRYPTO; /* Invalid context */
-		      break;
-		    case -2:
-		      error = OVPN_INPUT_ERROR_TOO_SHORT;
-		      break;
-		    case -3:
-		      error = OVPN_INPUT_ERROR_DECRYPT_FAILED; /* Bad ciphertext */
-		      break;
-		    case -4:
-		      error = OVPN_INPUT_ERROR_HMAC_OP_FAILED;
-		      break;
-		    case -5:
-		      error = OVPN_INPUT_ERROR_HMAC_MISMATCH;
-		      break;
-		    case -6:
-		      error = OVPN_INPUT_ERROR_DECRYPT_OP_FAILED;
-		      break;
-		    case -7:
-		      error = OVPN_INPUT_ERROR_REPLAY;
-		      break;
-		    default:
-		      error = OVPN_INPUT_ERROR_DECRYPT_FAILED;
-		      break;
-		    }
-		  goto trace;
-		}
-
-	      /* Successfully decrypted - set up for IP stack */
-	      vnet_buffer (b0)->sw_if_index[VLIB_RX] = peer->sw_if_index;
-
-	      /* Determine inner packet type */
-	      u8 *payload = vlib_buffer_get_current (b0);
-
-	      if (b0->current_length >= 1)
-		{
-		  u8 ip_version = (payload[0] >> 4);
-		  if (ip_version == 4)
-		    next0 = OVPN_INPUT_NEXT_IP4_INPUT;
-		  else if (ip_version == 6)
-		    next0 = OVPN_INPUT_NEXT_IP6_INPUT;
-		  else
-		    {
-		      error = OVPN_INPUT_ERROR_BAD_IP_VERSION;
-		      goto trace;
-		    }
-		}
-
-	      /* Store peer and rx bytes for batched counter update */
-	      u32 pkt_bytes = vlib_buffer_length_in_chain (vm, b0);
-	      peers[buf_idx] = peer;
-	      rx_bytes[buf_idx] = pkt_bytes;
-
-	      /* Update peer statistics */
-	      ovpn_peer_update_rx (peer, now, pkt_bytes);
-
-	      goto done;
 	    }
+
+	  /* Store peer and rx bytes for batched counter update */
+	  u32 pkt_bytes = vlib_buffer_length_in_chain (vm, b0);
+	  peers[buf_idx] = peer;
+	  rx_bytes[buf_idx] = pkt_bytes;
+
+	  /* Update peer statistics */
+	  ovpn_peer_update_rx (peer, now, pkt_bytes);
+
+	  goto done;
+	}
 
       /*
        * Not a static key no-opcode packet.
@@ -588,8 +593,9 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      peer_id = ovpn_data_v2_get_peer_id (hdr);
 
 	      /*
-	       * NAT/float: Extract remote address for address change detection.
-	       * This is done even for DATA_V2 to support NAT rebinding.
+	       * NAT/float: Extract remote address for address change
+	       * detection. This is done even for DATA_V2 to support NAT
+	       * rebinding.
 	       */
 	      u32 ip_offset = vnet_buffer (b0)->ip.save_rewrite_length;
 	      if (ip_offset > 0 && ip_offset < b0->current_data)
@@ -603,8 +609,8 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		    {
 		      ip4_header_t *ip4 = (ip4_header_t *) ip_hdr;
 		      udp_header_t *udp = (udp_header_t *) (ip4 + 1);
-		      ip_address_set (&remote_addrs[buf_idx], &ip4->src_address,
-				      AF_IP4);
+		      ip_address_set (&remote_addrs[buf_idx],
+				      &ip4->src_address, AF_IP4);
 		      remote_ports[buf_idx] =
 			clib_net_to_host_u16 (udp->src_port);
 		    }
@@ -612,8 +618,8 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		    {
 		      ip6_header_t *ip6 = (ip6_header_t *) ip_hdr;
 		      udp_header_t *udp = (udp_header_t *) (ip6 + 1);
-		      ip_address_set (&remote_addrs[buf_idx], &ip6->src_address,
-				      AF_IP6);
+		      ip_address_set (&remote_addrs[buf_idx],
+				      &ip6->src_address, AF_IP6);
 		      remote_ports[buf_idx] =
 			clib_net_to_host_u16 (udp->src_port);
 		    }
@@ -624,8 +630,10 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      /*
 	       * DATA_V1 - lookup peer by remote endpoint (outer IP:port)
 	       * Minimum size depends on cipher mode:
-	       * - AEAD (GCM): opcode(1) + packet_id(4) + tag(16) = 21 bytes min
-	       * - CBC+HMAC: opcode(1) + HMAC(20) + IV(16) + encrypted_data(16+)
+	       * - AEAD (GCM): opcode(1) + packet_id(4) + tag(16) = 21 bytes
+	       * min
+	       * - CBC+HMAC: opcode(1) + HMAC(20) + IV(16) +
+	       * encrypted_data(16+)
 	       */
 	      u32 min_size = inst->options.static_key_mode &&
 				 !OVPN_CIPHER_IS_AEAD (inst->cipher_alg) ?
@@ -647,9 +655,9 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      u32 buf_idx = b - bufs;
 
 	      /*
-	       * Find the IP header. VPP may or may not set save_rewrite_length.
-	       * If not set (ip_offset=0), we assume standard IP + UDP layout
-	       * and go back by the header sizes.
+	       * Find the IP header. VPP may or may not set
+	       * save_rewrite_length. If not set (ip_offset=0), we assume
+	       * standard IP + UDP layout and go back by the header sizes.
 	       */
 	      u8 *ip_hdr;
 	      if (ip_offset > 0 && ip_offset < b0->current_data)
@@ -659,7 +667,8 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		}
 	      else
 		{
-		  /* Fallback: buffer is at OpenVPN payload, go back by IP+UDP */
+		  /* Fallback: buffer is at OpenVPN payload, go back by IP+UDP
+		   */
 		  ip_hdr = (u8 *) vlib_buffer_get_current (b0) -
 			   (sizeof (ip4_header_t) + sizeof (udp_header_t));
 		}
@@ -691,25 +700,25 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      remote_ports[buf_idx] = remote_port;
 
 	      /* Lookup peer by remote endpoint */
-	      peer = ovpn_peer_lookup_by_remote (
-		&inst->multi_context.peer_db, &remote_addr, remote_port);
+	      peer = ovpn_peer_lookup_by_remote (&inst->multi_context.peer_db,
+						 &remote_addr, remote_port);
 	      if (peer)
 		{
 		  peer_id = peer->peer_id;
 		}
 	      else
 
-	      /*
-	       * Static key mode: auto-create peer on first packet
-	       * This allows clients to connect without handshake
-	       */
-	      if (PREDICT_FALSE (!peer && inst->options.static_key_mode))
-		{
-		  peer = ovpn_static_key_create_peer (vm, inst, &remote_addr,
-						      remote_port);
-		  if (peer)
-		    peer_id = peer->peer_id;
-		}
+		/*
+		 * Static key mode: auto-create peer on first packet
+		 * This allows clients to connect without handshake
+		 */
+		if (PREDICT_FALSE (!peer && inst->options.static_key_mode))
+		  {
+		    peer = ovpn_static_key_create_peer (vm, inst, &remote_addr,
+							remote_port);
+		    if (peer)
+		      peer_id = peer->peer_id;
+		  }
 
 	      if (PREDICT_FALSE (!peer))
 		{
@@ -730,9 +739,8 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	    {
 	      if (remote_addrs[buf_idx].version != 0)
 		{
-		  peer = ovpn_static_key_create_peer (vm, inst,
-						      &remote_addrs[buf_idx],
-						      remote_ports[buf_idx]);
+		  peer = ovpn_static_key_create_peer (
+		    vm, inst, &remote_addrs[buf_idx], remote_ports[buf_idx]);
 		  if (peer)
 		    peer_id = peer->peer_id;
 		}
@@ -774,8 +782,8 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  /*
 	   * Get crypto context for this key_id using bihash (lock-free).
 	   */
-	  crypto = ovpn_peer_get_crypto_by_key_id (&inst->multi_context.peer_db,
-						   peer_id, key_id);
+	  crypto = ovpn_peer_get_crypto_by_key_id (
+	    &inst->multi_context.peer_db, peer_id, key_id);
 	  if (PREDICT_FALSE (!crypto || !crypto->is_valid))
 	    {
 	      error = OVPN_INPUT_ERROR_NO_CRYPTO;
@@ -867,7 +875,8 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      decrypt_count++;
 
 	      /* Mark for pending decryption - will be updated after batch */
-	      next0 = OVPN_INPUT_NEXT_IP4_INPUT; /* Placeholder, will be fixed up */
+	      next0 =
+		OVPN_INPUT_NEXT_IP4_INPUT; /* Placeholder, will be fixed up */
 	    }
 	}
       else if (ovpn_opcode_is_control (opcode))
@@ -981,7 +990,8 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  /*
 	   * Advance buffer past header and tag (for DATA_V1) to plaintext.
 	   * DATA_V1: [opcode:1][packet_id:4][tag:16][ciphertext/plaintext:N]
-	   * DATA_V2: [opcode:1][peer_id:3][packet_id:4][ciphertext/plaintext:N][tag:16]
+	   * DATA_V2:
+	   * [opcode:1][peer_id:3][packet_id:4][ciphertext/plaintext:N][tag:16]
 	   */
 	  data = vlib_buffer_get_current (b0);
 	  u8 opcode = data[0] >> 3;
@@ -989,7 +999,7 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	    {
 	      /* DATA_V1: advance past header + tag */
 	      vlib_buffer_advance (b0, sizeof (ovpn_data_v1_header_t) +
-					   OVPN_TAG_SIZE);
+					 OVPN_TAG_SIZE);
 	    }
 	  else
 	    {

@@ -320,6 +320,29 @@ ovpn_instance_create (vlib_main_t *vm, ip_address_t *local_addr,
   /* Copy options to instance */
   clib_memcpy (&inst->options, options, sizeof (ovpn_options_t));
 
+  /*
+   * Ensure server_addr is set from local_addr.
+   * This is needed for static key mode peer rewrite generation.
+   */
+  if (inst->options.server_addr.fp_addr.ip4.as_u32 == 0 &&
+      ip6_address_is_zero (&inst->options.server_addr.fp_addr.ip6))
+    {
+      if (inst->is_ipv6)
+	{
+	  inst->options.server_addr.fp_proto = FIB_PROTOCOL_IP6;
+	  inst->options.server_addr.fp_len = 128;
+	  clib_memcpy (&inst->options.server_addr.fp_addr.ip6,
+		       &local_addr->ip.ip6, sizeof (ip6_address_t));
+	}
+      else
+	{
+	  inst->options.server_addr.fp_proto = FIB_PROTOCOL_IP4;
+	  inst->options.server_addr.fp_len = 32;
+	  inst->options.server_addr.fp_addr.ip4.as_u32 =
+	    local_addr->ip.ip4.as_u32;
+	}
+    }
+
   /* Generate device name if not provided */
   if (!inst->options.dev_name)
     {
