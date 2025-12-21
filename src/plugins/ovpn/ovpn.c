@@ -25,6 +25,8 @@
 #include <vppinfra/error.h>
 #include <vnet/ip/format.h>
 #include <vnet/fib/fib_types.h>
+#include <vnet/fib/fib_table.h>
+#include <vnet/ip/ip_table.h>
 #include <vppinfra/unix.h>
 #include <vnet/udp/udp_local.h>
 #include <vnet/udp/udp.h>
@@ -37,6 +39,12 @@
 #include <openssl/evp.h>
 
 ovpn_main_t ovpn_main;
+
+/* External node declarations */
+extern vlib_node_registration_t ovpn4_input_node;
+extern vlib_node_registration_t ovpn6_input_node;
+extern vlib_node_registration_t ovpn4_output_node;
+extern vlib_node_registration_t ovpn6_output_node;
 
 /* Picotls key exchange algorithms */
 static ptls_key_exchange_algorithm_t *ovpn_key_exchange[] = {
@@ -211,7 +219,7 @@ ovpn_free_options (ovpn_options_t *opt)
 }
 
 static clib_error_t *
-ovpn_init_picotls_context (ovpn_main_t *omp)
+ovpn_init_picotls_context_for_instance (ovpn_instance_t *inst)
 {
   ptls_context_t *ctx;
 
@@ -231,44 +239,241 @@ ovpn_init_picotls_context (ovpn_main_t *omp)
   ctx->max_early_data_size = 0;
 
   /* Load certificates if provided */
-  if (omp->options.server_cert && omp->options.server_key)
+  if (inst->options.server_cert && inst->options.server_key)
     {
-      if (ovpn_load_certificates (ctx, omp->options.server_cert,
-				  omp->options.server_key) != 0)
+      if (ovpn_load_certificates (ctx, inst->options.server_cert,
+				  inst->options.server_key) != 0)
 	{
 	  clib_mem_free (ctx);
 	  return clib_error_return (0, "failed to load certificates");
 	}
     }
 
-  omp->ptls_ctx = ctx;
+  inst->ptls_ctx = ctx;
   return 0;
 }
 
 static void
-ovpn_cleanup_picotls_context (ovpn_main_t *omp)
+ovpn_cleanup_picotls_context_for_instance (ovpn_instance_t *inst)
 {
   ptls_openssl_sign_certificate_t *sign_cert;
 
-  if (!omp->ptls_ctx)
+  if (!inst->ptls_ctx)
     return;
 
   /* Free sign_certificate structure if it exists */
-  if (omp->ptls_ctx->sign_certificate)
+  if (inst->ptls_ctx->sign_certificate)
     {
       /* ctx->sign_certificate points to sign_cert->super, so we need to
        * get the containing structure */
       sign_cert = (ptls_openssl_sign_certificate_t
-		     *) ((char *) omp->ptls_ctx->sign_certificate -
+		     *) ((char *) inst->ptls_ctx->sign_certificate -
 			 offsetof (ptls_openssl_sign_certificate_t, super));
       clib_mem_free (sign_cert);
     }
 
-  if (omp->ptls_ctx->certificates.list)
-    clib_mem_free ((void *) omp->ptls_ctx->certificates.list);
+  if (inst->ptls_ctx->certificates.list)
+    clib_mem_free ((void *) inst->ptls_ctx->certificates.list);
 
-  clib_mem_free (omp->ptls_ctx);
-  omp->ptls_ctx = NULL;
+  clib_mem_free (inst->ptls_ctx);
+  inst->ptls_ctx = NULL;
+}
+
+/*
+ * Instance management functions
+ */
+
+int
+ovpn_instance_create (vlib_main_t *vm, ip_address_t *local_addr, u16 local_port,
+		      u32 table_id, ovpn_options_t *options,
+		      u32 *instance_id_out, u32 *sw_if_index_out)
+{
+  ovpn_main_t *omp = &ovpn_main;
+  ovpn_instance_t *inst;
+  clib_error_t *error = NULL;
+  u32 sw_if_index = ~0;
+  int rv;
+
+  /* Check if port is already in use */
+  if (vec_len (omp->instance_id_by_port) > local_port &&
+      omp->instance_id_by_port[local_port] != ~0)
+    {
+      return VNET_API_ERROR_VALUE_EXIST;
+    }
+
+  /* Allocate instance from pool */
+  pool_get_zero (omp->instances, inst);
+  inst->instance_id = inst - omp->instances;
+
+  /* Copy local address and port */
+  clib_memcpy (&inst->local_addr, local_addr, sizeof (ip_address_t));
+  inst->local_port = local_port;
+  inst->is_ipv6 = (ip_addr_version (local_addr) == AF_IP6);
+
+  /* Setup per-instance FIB tables */
+  inst->fib_table_id = table_id;
+  inst->fib_index4 =
+    fib_table_find_or_create_and_lock (FIB_PROTOCOL_IP4, table_id,
+				       omp->fib_src_hi);
+  inst->fib_index6 =
+    fib_table_find_or_create_and_lock (FIB_PROTOCOL_IP6, table_id,
+				       omp->fib_src_hi);
+
+  /* Copy options to instance */
+  clib_memcpy (&inst->options, options, sizeof (ovpn_options_t));
+
+  /* Generate device name if not provided */
+  if (!inst->options.dev_name)
+    {
+      inst->options.dev_name =
+	(char *) format (0, "ovpn%u%c", inst->instance_id, 0);
+    }
+
+  /* Parse TLS-Crypt key if provided */
+  if (inst->options.tls_crypt_key)
+    {
+      rv = ovpn_tls_crypt_parse_key (inst->options.tls_crypt_key,
+				     vec_len (inst->options.tls_crypt_key),
+				     &inst->tls_crypt, 1);
+      if (rv < 0)
+	{
+	  pool_put (omp->instances, inst);
+	  return VNET_API_ERROR_INVALID_VALUE;
+	}
+    }
+
+  /* Parse TLS-Auth key if provided */
+  if (inst->options.tls_auth_key)
+    {
+      rv = ovpn_tls_auth_parse_key (inst->options.tls_auth_key,
+				    vec_len (inst->options.tls_auth_key),
+				    &inst->tls_auth, 1);
+      if (rv < 0)
+	{
+	  pool_put (omp->instances, inst);
+	  return VNET_API_ERROR_INVALID_VALUE_2;
+	}
+    }
+
+  /* Set cipher algorithm */
+  if (inst->options.cipher_name)
+    {
+      inst->cipher_alg =
+	ovpn_crypto_cipher_alg_from_name ((char *) inst->options.cipher_name);
+    }
+  else if (inst->options.static_key_mode)
+    {
+      inst->cipher_alg = OVPN_CIPHER_ALG_AES_256_CBC;
+    }
+  else
+    {
+      inst->cipher_alg = OVPN_CIPHER_ALG_AES_256_GCM;
+    }
+
+  /* Initialize replay protection for TLS-Crypt */
+  if (inst->tls_crypt.enabled && inst->options.replay_protection)
+    {
+      inst->tls_crypt.time_backtrack = inst->options.replay_time;
+      inst->tls_crypt.replay_time_floor = 0;
+    }
+
+  /* Initialize picotls context (only for TLS mode) */
+  if (!inst->options.static_key_mode)
+    {
+      error = ovpn_init_picotls_context_for_instance (inst);
+      if (error)
+	{
+	  clib_error_report (error);
+	  pool_put (omp->instances, inst);
+	  return VNET_API_ERROR_INIT_FAILED;
+	}
+    }
+
+  /* Create the OpenVPN interface */
+  rv = ovpn_if_create (vm, (u8 *) inst->options.dev_name, inst->options.is_tun,
+		       inst->options.mtu, &sw_if_index);
+  if (rv != 0)
+    {
+      ovpn_cleanup_picotls_context_for_instance (inst);
+      pool_put (omp->instances, inst);
+      return VNET_API_ERROR_INVALID_INTERFACE;
+    }
+
+  inst->sw_if_index = sw_if_index;
+  inst->options.sw_if_index = sw_if_index;
+
+  /* Bind interface to per-instance FIB tables */
+  ip_table_bind (FIB_PROTOCOL_IP4, sw_if_index, inst->fib_table_id);
+  ip_table_bind (FIB_PROTOCOL_IP6, sw_if_index, inst->fib_table_id);
+
+  /* Register UDP port for this instance */
+  udp_register_dst_port (vm, local_port, ovpn4_input_node.index, UDP_IP4);
+  udp_register_dst_port (vm, local_port, ovpn6_input_node.index, UDP_IP6);
+
+  /* Initialize peer and pending databases for this instance */
+  ovpn_peer_db_init (&inst->multi_context.peer_db, sw_if_index);
+  ovpn_pending_db_init (&inst->multi_context.pending_db);
+
+  /* Setup port-to-instance lookup */
+  vec_validate_init_empty (omp->instance_id_by_port, local_port, ~0);
+  omp->instance_id_by_port[local_port] = inst->instance_id;
+
+  /* Setup sw_if_index-to-instance lookup */
+  hash_set (omp->instance_by_sw_if_index, sw_if_index, inst->instance_id);
+
+  inst->is_active = 1;
+
+  *instance_id_out = inst->instance_id;
+  *sw_if_index_out = sw_if_index;
+
+  return 0;
+}
+
+int
+ovpn_instance_delete (vlib_main_t *vm, u32 sw_if_index)
+{
+  ovpn_main_t *omp = &ovpn_main;
+  ovpn_instance_t *inst;
+
+  inst = ovpn_instance_get_by_sw_if_index (sw_if_index);
+  if (!inst)
+    return VNET_API_ERROR_NO_SUCH_ENTRY;
+
+  /* Unregister UDP port */
+  udp_unregister_dst_port (vm, inst->local_port, UDP_IP4);
+  udp_unregister_dst_port (vm, inst->local_port, UDP_IP6);
+
+  /* Unbind interface from FIB tables before deleting */
+  ip_table_bind (FIB_PROTOCOL_IP4, sw_if_index, 0);
+  ip_table_bind (FIB_PROTOCOL_IP6, sw_if_index, 0);
+
+  /* Delete the interface */
+  ovpn_if_delete (vm, sw_if_index);
+
+  /* Cleanup databases */
+  ovpn_peer_db_free (&inst->multi_context.peer_db);
+  ovpn_pending_db_free (&inst->multi_context.pending_db);
+
+  /* Cleanup picotls context */
+  ovpn_cleanup_picotls_context_for_instance (inst);
+
+  /* Free options */
+  ovpn_free_options (&inst->options);
+
+  /* Unlock FIB tables */
+  fib_table_unlock (inst->fib_index4, FIB_PROTOCOL_IP4, omp->fib_src_hi);
+  fib_table_unlock (inst->fib_index6, FIB_PROTOCOL_IP6, omp->fib_src_hi);
+
+  /* Remove from lookups */
+  if (vec_len (omp->instance_id_by_port) > inst->local_port)
+    omp->instance_id_by_port[inst->local_port] = ~0;
+
+  hash_unset (omp->instance_by_sw_if_index, sw_if_index);
+
+  /* Free instance */
+  pool_put (omp->instances, inst);
+
+  return 0;
 }
 
 static clib_error_t *
@@ -277,98 +482,61 @@ ovpn_show_command_fn (vlib_main_t *vm,
 		      vlib_cli_command_t *cmd __attribute__ ((unused)))
 {
   ovpn_main_t *omp = &ovpn_main;
-  ovpn_options_t *opt = &omp->options;
+  ovpn_instance_t *inst;
 
-  vlib_cli_output (vm, "OpenVPN Configuration:");
-  vlib_cli_output (vm, "  Status: %s",
-		   omp->is_enabled ? "Enabled" : "Disabled");
-  vlib_cli_output (vm, "  Mode: %s",
-		   opt->static_key_mode ? "Static Key" : "TLS");
-  vlib_cli_output (vm, "  Listen Port: %u", opt->listen_port);
-  vlib_cli_output (vm, "  Protocol: %s",
-		   opt->proto == IP_PROTOCOL_UDP ? "UDP" : "Unknown");
-  if (opt->static_key_mode)
-    vlib_cli_output (vm, "  Static Key Direction: %u",
-		     opt->static_key_direction);
-  else
-    vlib_cli_output (vm, "  Picotls Context: %s",
-		     omp->ptls_ctx ? "Initialized" : "Not initialized");
-
-  if (opt->dev_name)
+  if (pool_elts (omp->instances) == 0)
     {
-      vlib_cli_output (vm, "  Device Name: %s", opt->dev_name);
-      vlib_cli_output (vm, "  Device Mode: %s",
-		       opt->is_tun ? "TUN (L3)" : "TAP (L2)");
-      vlib_cli_output (vm, "  MTU: %u", opt->mtu);
-      if (opt->sw_if_index != ~0)
-	vlib_cli_output (vm, "  SW Interface Index: %u", opt->sw_if_index);
+      vlib_cli_output (vm, "No OpenVPN instances configured");
+      return 0;
     }
 
-  if (opt->server_addr.fp_proto != 0)
-    vlib_cli_output (vm, "  Server Address: %U/%d", format_fib_prefix,
-		     &opt->server_addr);
+  vlib_cli_output (vm, "OpenVPN Instances (%u configured):",
+		   pool_elts (omp->instances));
 
-  if (opt->ca_cert)
-    vlib_cli_output (vm, "  CA Certificate: loaded (%u bytes)",
-		     vec_len (opt->ca_cert));
-  if (opt->server_cert)
-    vlib_cli_output (vm, "  Server Certificate: loaded (%u bytes)",
-		     vec_len (opt->server_cert));
-  if (opt->server_key)
-    vlib_cli_output (vm, "  Server Key: loaded (%u bytes)",
-		     vec_len (opt->server_key));
-  if (opt->dh_params)
-    vlib_cli_output (vm, "  DH Parameters: loaded (%u bytes)",
-		     vec_len (opt->dh_params));
-  if (opt->cipher_name)
-    vlib_cli_output (vm, "  Cipher: %s", opt->cipher_name);
-  vlib_cli_output (
-    vm, "  Cipher Algorithm: %s",
-    omp->cipher_alg == OVPN_CIPHER_ALG_AES_128_GCM	? "AES-128-GCM" :
-    omp->cipher_alg == OVPN_CIPHER_ALG_AES_256_GCM	? "AES-256-GCM" :
-    omp->cipher_alg == OVPN_CIPHER_ALG_CHACHA20_POLY1305 ? "CHACHA20-POLY1305" :
-    omp->cipher_alg == OVPN_CIPHER_ALG_AES_256_CBC	? "AES-256-CBC" :
-							  "NONE");
-  if (opt->tls_crypt_key)
-    vlib_cli_output (vm, "  TLS-Crypt Key: loaded (%u bytes)",
-		     vec_len (opt->tls_crypt_key));
-  if (opt->tls_crypt_v2_key)
-    vlib_cli_output (vm, "  TLS-Crypt-V2 Server Key: loaded (%u bytes)",
-		     vec_len (opt->tls_crypt_v2_key));
-  if (omp->tls_crypt_v2.enabled)
-    vlib_cli_output (vm, "  TLS-Crypt-V2: enabled (per-client keys)");
-  if (opt->tls_auth_key)
-    vlib_cli_output (vm, "  TLS-Auth Key: loaded (%u bytes)",
-		     vec_len (opt->tls_auth_key));
+  pool_foreach (inst, omp->instances)
+    {
+      ovpn_options_t *opt = &inst->options;
 
-  if (opt->pool_start.version != 0)
-    vlib_cli_output (vm, "  Pool Start: %U", format_ip_address,
-		     &opt->pool_start);
-  if (opt->pool_end.version != 0)
-    vlib_cli_output (vm, "  Pool End: %U", format_ip_address, &opt->pool_end);
+      vlib_cli_output (vm, "\nInstance %u (interface %s, sw_if_index %u):",
+		       inst->instance_id, inst->options.dev_name,
+		       inst->sw_if_index);
+      vlib_cli_output (vm, "  Status: %s",
+		       inst->is_active ? "Active" : "Inactive");
+      vlib_cli_output (vm, "  Local: %U port %u", format_ip_address,
+		       &inst->local_addr, inst->local_port);
+      vlib_cli_output (vm, "  FIB table: %u (IPv4 index %u, IPv6 index %u)",
+		       inst->fib_table_id, inst->fib_index4, inst->fib_index6);
+      vlib_cli_output (vm, "  Mode: %s",
+		       opt->static_key_mode ? "Static Key" : "TLS");
+      vlib_cli_output (vm, "  Device Type: %s",
+		       opt->is_tun ? "TUN (L3)" : "TAP (L2)");
+      vlib_cli_output (vm, "  MTU: %u", opt->mtu);
 
-  vlib_cli_output (vm, "  Max Clients: %u", opt->max_clients);
-  vlib_cli_output (vm, "  Keepalive Ping: %u seconds", opt->keepalive_ping);
-  vlib_cli_output (vm, "  Keepalive Timeout: %u seconds",
-		   opt->keepalive_timeout);
-  vlib_cli_output (vm, "  Handshake Window: %u seconds",
-		   opt->handshake_window);
-  vlib_cli_output (vm, "  TLS Timeout: %u seconds", opt->tls_timeout);
-  vlib_cli_output (vm, "  Renegotiate Seconds: %u", opt->renegotiate_seconds);
-  if (opt->renegotiate_bytes > 0)
-    vlib_cli_output (vm, "  Renegotiate Bytes: %lu", opt->renegotiate_bytes);
-  else
-    vlib_cli_output (vm, "  Renegotiate Bytes: disabled");
-  if (opt->renegotiate_packets > 0)
-    vlib_cli_output (vm, "  Renegotiate Packets: %lu", opt->renegotiate_packets);
-  else
-    vlib_cli_output (vm, "  Renegotiate Packets: disabled");
-  vlib_cli_output (vm, "  Replay Protection: %s",
-		   opt->replay_protection ? "Enabled" : "Disabled");
-  vlib_cli_output (vm, "  Replay Window: %u", opt->replay_window);
-  vlib_cli_output (vm, "  Replay Time: %u seconds", opt->replay_time);
-  vlib_cli_output (vm, "  Transition Window: %u seconds",
-		   opt->transition_window);
+      if (opt->static_key_mode)
+	vlib_cli_output (vm, "  Static Key Direction: %u",
+			 opt->static_key_direction);
+      else
+	vlib_cli_output (vm, "  Picotls Context: %s",
+			 inst->ptls_ctx ? "Initialized" : "Not initialized");
+
+      vlib_cli_output (
+	vm, "  Cipher Algorithm: %s",
+	inst->cipher_alg == OVPN_CIPHER_ALG_AES_128_GCM	     ? "AES-128-GCM" :
+	inst->cipher_alg == OVPN_CIPHER_ALG_AES_256_GCM	     ? "AES-256-GCM" :
+	inst->cipher_alg == OVPN_CIPHER_ALG_CHACHA20_POLY1305 ? "CHACHA20-POLY1305" :
+	inst->cipher_alg == OVPN_CIPHER_ALG_AES_256_CBC	     ? "AES-256-CBC" :
+							       "NONE");
+
+      if (inst->tls_crypt.enabled)
+	vlib_cli_output (vm, "  TLS-Crypt: enabled");
+      if (inst->tls_auth.enabled)
+	vlib_cli_output (vm, "  TLS-Auth: enabled");
+
+      vlib_cli_output (vm, "  Keepalive: ping %u, timeout %u",
+		       opt->keepalive_ping, opt->keepalive_timeout);
+      vlib_cli_output (vm, "  Peers: %u",
+		       pool_elts (inst->multi_context.peer_db.peers));
+    }
 
   return 0;
 }
@@ -386,12 +554,6 @@ VLIB_CLI_COMMAND (ovpn_show_command, static) = {
   .short_help = "show ovpn",
   .function = ovpn_show_command_fn,
 };
-
-/* External node declarations */
-extern vlib_node_registration_t ovpn4_input_node;
-extern vlib_node_registration_t ovpn6_input_node;
-extern vlib_node_registration_t ovpn4_output_node;
-extern vlib_node_registration_t ovpn6_output_node;
 
 /*
  * CLI: ovpn create local <ip> port <port> [options...]
@@ -433,10 +595,14 @@ ovpn_create_command_fn (vlib_main_t *vm, unformat_input_t *input,
   u32 transition_window = 3600;
   u16 mtu = 1500;
   u8 is_tun = 1;
+  u32 table_id = 0; /* FIB table ID (0 = default) */
+  ovpn_options_t options;
 
   clib_memset (&pool_start, 0, sizeof (pool_start));
   clib_memset (&pool_end, 0, sizeof (pool_end));
   clib_memset (&server_addr, 0, sizeof (server_addr));
+  clib_memset (&options, 0, sizeof (options));
+  options.sw_if_index = ~0;
 
   if (!unformat_user (input, unformat_line_input, line_input))
     return clib_error_return (0, "expected arguments");
@@ -504,6 +670,8 @@ ovpn_create_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	is_tun = 1;
       else if (unformat (line_input, "dev-type tap"))
 	is_tun = 0;
+      else if (unformat (line_input, "table-id %u", &table_id))
+	;
       else
 	{
 	  error = clib_error_return (0, "unknown input `%U'",
@@ -518,19 +686,22 @@ ovpn_create_command_fn (vlib_main_t *vm, unformat_input_t *input,
       goto done;
     }
 
-  if (omp->is_enabled)
+  /* Check if port is already in use */
+  if (vec_len (omp->instance_id_by_port) > port &&
+      omp->instance_id_by_port[port] != ~0)
     {
-      error = clib_error_return (0, "OpenVPN already enabled");
+      error = clib_error_return (0, "Port %u is already in use by instance %u",
+				 port, omp->instance_id_by_port[port]);
       goto done;
     }
 
   /* Configure options */
-  omp->options.listen_port = (u16) port;
-  omp->options.proto = IP_PROTOCOL_UDP;
-  omp->options.mtu = mtu;
-  omp->options.is_tun = is_tun;
+  options.listen_port = (u16) port;
+  options.proto = IP_PROTOCOL_UDP;
+  options.mtu = mtu;
+  options.is_tun = is_tun;
 
-  /* Store local address */
+  /* Store server address */
   if (ip_addr_version (&local_addr) == AF_IP6)
     {
       server_addr.fp_proto = FIB_PROTOCOL_IP6;
@@ -544,118 +715,81 @@ ovpn_create_command_fn (vlib_main_t *vm, unformat_input_t *input,
       server_addr.fp_len = 32;
       server_addr.fp_addr.ip4.as_u32 = local_addr.ip.ip4.as_u32;
     }
-  omp->options.server_addr = server_addr;
+  options.server_addr = server_addr;
 
   /* Set device name */
   if (dev_name)
     {
-      omp->options.dev_name = (char *) dev_name;
+      options.dev_name = (char *) dev_name;
       dev_name = 0;
     }
-  else
-    omp->options.dev_name = (char *) format (0, "ovpn0%c", 0);
 
   /* Load TLS-Crypt key if specified */
   if (tls_crypt_key)
     {
       error = ovpn_read_file_contents ((char *) tls_crypt_key,
-				       &omp->options.tls_crypt_key);
+				       &options.tls_crypt_key);
       if (error)
 	{
 	  error = clib_error_return (0, "failed to read TLS-Crypt key: %U",
 				     format_clib_error, error);
 	  goto done;
 	}
-      int rv = ovpn_tls_crypt_parse_key (omp->options.tls_crypt_key,
-					 vec_len (omp->options.tls_crypt_key),
-					 &omp->tls_crypt, 1);
-      if (rv < 0)
-	{
-	  error = clib_error_return (0, "failed to parse TLS-Crypt key: %d", rv);
-	  goto done;
-	}
-      vlib_cli_output (vm, "TLS-Crypt initialized");
     }
 
   /* Load TLS-Auth key if specified */
   if (tls_auth_key)
     {
-      error = ovpn_read_file_contents ((char *) tls_auth_key,
-				       &omp->options.tls_auth_key);
+      error =
+	ovpn_read_file_contents ((char *) tls_auth_key, &options.tls_auth_key);
       if (error)
 	{
 	  error = clib_error_return (0, "failed to read TLS-Auth key: %U",
 				     format_clib_error, error);
 	  goto done;
 	}
-      int rv = ovpn_tls_auth_parse_key (omp->options.tls_auth_key,
-					vec_len (omp->options.tls_auth_key),
-					&omp->tls_auth, 1);
-      if (rv < 0)
-	{
-	  error = clib_error_return (0, "failed to parse TLS-Auth key: %d", rv);
-	  goto done;
-	}
-      vlib_cli_output (vm, "TLS-Auth initialized");
     }
 
   /* Load certificates if specified */
   if (ca_cert)
     {
-      error = ovpn_read_file_contents ((char *) ca_cert, &omp->options.ca_cert);
+      error = ovpn_read_file_contents ((char *) ca_cert, &options.ca_cert);
       if (error)
 	goto done;
     }
   if (server_cert)
     {
-      error = ovpn_read_file_contents ((char *) server_cert,
-				       &omp->options.server_cert);
+      error =
+	ovpn_read_file_contents ((char *) server_cert, &options.server_cert);
       if (error)
 	goto done;
     }
   if (server_key)
     {
-      error = ovpn_read_file_contents ((char *) server_key,
-				       &omp->options.server_key);
+      error = ovpn_read_file_contents ((char *) server_key, &options.server_key);
       if (error)
 	goto done;
     }
 
   /* Set cipher */
   if (cipher)
-    {
-      omp->cipher_alg = ovpn_crypto_cipher_alg_from_name ((char *) cipher);
-      if (omp->cipher_alg == OVPN_CIPHER_ALG_NONE)
-	{
-	  error = clib_error_return (0, "unsupported cipher: %s", cipher);
-	  goto done;
-	}
-    }
-  else
-    omp->cipher_alg = OVPN_CIPHER_ALG_AES_256_GCM;
+    options.cipher_name = cipher;
 
   /* Set other options */
-  omp->options.max_clients = max_clients;
-  omp->options.keepalive_ping = keepalive_ping;
-  omp->options.keepalive_timeout = keepalive_timeout;
-  omp->options.handshake_window = handshake_timeout;
-  omp->options.renegotiate_seconds = renegotiate_seconds;
-  omp->options.tls_timeout = tls_timeout;
-  omp->options.replay_protection = replay_protection;
-  omp->options.replay_window = replay_window;
-  omp->options.replay_time = replay_time;
-  omp->options.transition_window = transition_window;
+  options.max_clients = max_clients;
+  options.keepalive_ping = keepalive_ping;
+  options.keepalive_timeout = keepalive_timeout;
+  options.handshake_window = handshake_timeout;
+  options.renegotiate_seconds = renegotiate_seconds;
+  options.tls_timeout = tls_timeout;
+  options.replay_protection = replay_protection;
+  options.replay_window = replay_window;
+  options.replay_time = replay_time;
+  options.transition_window = transition_window;
   if (pool_start.version != 0)
-    omp->options.pool_start = pool_start;
+    options.pool_start = pool_start;
   if (pool_end.version != 0)
-    omp->options.pool_end = pool_end;
-
-  /* Initialize replay protection for TLS */
-  if (omp->tls_crypt.enabled && replay_protection)
-    {
-      omp->tls_crypt.time_backtrack = replay_time;
-      omp->tls_crypt.replay_time_floor = 0;
-    }
+    options.pool_end = pool_end;
 
   /* Load static key if specified (--secret option) */
   if (secret_key)
@@ -670,8 +804,8 @@ ovpn_create_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	}
 
       /* Allocate storage for parsed key */
-      omp->options.static_key = clib_mem_alloc (OVPN_STATIC_KEY_SIZE);
-      if (!omp->options.static_key)
+      options.static_key = clib_mem_alloc (OVPN_STATIC_KEY_SIZE);
+      if (!options.static_key)
 	{
 	  vec_free (key_contents);
 	  error = clib_error_return (0, "failed to allocate static key memory");
@@ -680,65 +814,35 @@ ovpn_create_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
       /* Parse the static key file */
       int rv = ovpn_parse_static_key (key_contents, vec_len (key_contents),
-				      omp->options.static_key);
+				      options.static_key);
       vec_free (key_contents);
       if (rv < 0)
 	{
-	  clib_mem_free (omp->options.static_key);
-	  omp->options.static_key = NULL;
+	  clib_mem_free (options.static_key);
+	  options.static_key = NULL;
 	  error = clib_error_return (0, "failed to parse static key: %d", rv);
 	  goto done;
 	}
 
-      omp->options.static_key_mode = 1;
-      omp->options.static_key_direction = 0; /* Server mode = direction 0 */
-
-      /* For static key mode, use AES-256-CBC as default (not AEAD)
-       * unless explicitly overridden by cipher option */
-      if (!cipher)
-	omp->cipher_alg = OVPN_CIPHER_ALG_AES_256_CBC;
-
-      vlib_cli_output (vm, "Static key loaded (direction %u, cipher %s)",
-		       omp->options.static_key_direction,
-		       omp->cipher_alg == OVPN_CIPHER_ALG_AES_256_CBC ?
-			 "AES-256-CBC" :
-			 "specified");
+      options.static_key_mode = 1;
+      options.static_key_direction = 0; /* Server mode = direction 0 */
     }
 
-  /* Initialize picotls context (only needed for TLS mode) */
-  if (!omp->options.static_key_mode)
-    {
-      error = ovpn_init_picotls_context (omp);
-      if (error)
-	{
-	  error = clib_error_return (0, "failed to initialize picotls: %U",
-				     format_clib_error, error);
-	  goto done;
-	}
-    }
-
-  /* Create the OpenVPN interface */
+  /* Create the instance */
+  u32 instance_id = ~0;
   u32 sw_if_index = ~0;
-  int rv = ovpn_if_create (vm, (u8 *) omp->options.dev_name, is_tun, mtu,
-			   &sw_if_index);
+  int rv = ovpn_instance_create (vm, &local_addr, port, table_id, &options,
+				 &instance_id, &sw_if_index);
   if (rv != 0)
     {
-      error = clib_error_return (0, "failed to create ovpn interface");
+      error = clib_error_return (0, "failed to create instance: %d", rv);
       goto done;
     }
-  omp->options.sw_if_index = sw_if_index;
 
-  /* Register UDP port */
-  udp_register_dst_port (vm, port, ovpn4_input_node.index, UDP_IP4);
-  udp_register_dst_port (vm, port, ovpn6_input_node.index, UDP_IP6);
-
-  /* Initialize peer database */
-  ovpn_peer_db_init (&omp->multi_context.peer_db, sw_if_index);
-  ovpn_pending_db_init (&omp->multi_context.pending_db);
-
-  omp->is_enabled = 1;
-  vlib_cli_output (vm, "OpenVPN interface %s created on port %u",
-		   omp->options.dev_name, port);
+  vlib_cli_output (
+    vm, "OpenVPN instance %u created: interface %s on port %u (table %u)",
+    instance_id, options.dev_name ? options.dev_name : "ovpnX", port,
+    table_id);
 
 done:
   vec_free (dev_name);
@@ -759,7 +863,7 @@ done:
 VLIB_CLI_COMMAND (ovpn_create_command, static) = {
   .path = "ovpn create",
   .short_help = "ovpn create local <ip> port <port> [dev <name>] "
-		"[secret <keyfile>] "
+		"[table-id <id>] [secret <keyfile>] "
 		"[tls-crypt <key>] [tls-auth <key>] [ca <cert>] [cert <cert>] "
 		"[key <key>] [cipher <name>] [server <ip>/<len>]",
   .function = ovpn_create_command_fn,
@@ -773,7 +877,6 @@ static clib_error_t *
 ovpn_delete_command_fn (vlib_main_t *vm, unformat_input_t *input,
 			vlib_cli_command_t *cmd)
 {
-  ovpn_main_t *omp = &ovpn_main;
   unformat_input_t _line_input, *line_input = &_line_input;
   u32 sw_if_index = ~0;
   clib_error_t *error = NULL;
@@ -791,32 +894,13 @@ ovpn_delete_command_fn (vlib_main_t *vm, unformat_input_t *input,
       goto done;
     }
 
-  if (!omp->is_enabled || omp->options.sw_if_index != sw_if_index)
+  int rv = ovpn_instance_delete (vm, sw_if_index);
+  if (rv != 0)
     {
-      error = clib_error_return (0, "interface not found or not an OpenVPN interface");
+      error = clib_error_return (
+	0, "interface not found or not an OpenVPN interface");
       goto done;
     }
-
-  /* Unregister UDP port */
-  udp_unregister_dst_port (vm, omp->options.listen_port, UDP_IP4);
-  udp_unregister_dst_port (vm, omp->options.listen_port, UDP_IP6);
-
-  /* Delete the interface */
-  ovpn_if_delete (vm, sw_if_index);
-
-  /* Cleanup databases */
-  ovpn_peer_db_free (&omp->multi_context.peer_db);
-  ovpn_pending_db_free (&omp->multi_context.pending_db);
-
-  /* Cleanup picotls context */
-  ovpn_cleanup_picotls_context (omp);
-
-  /* Free options */
-  ovpn_free_options (&omp->options);
-
-  /* Reset state */
-  omp->options.sw_if_index = ~0;
-  omp->is_enabled = 0;
 
   vlib_cli_output (vm, "OpenVPN interface deleted");
 
@@ -843,6 +927,11 @@ ovpn_init (vlib_main_t *vm)
   omp->vm = vm;
   omp->vnm = vnet_get_main ();
 
+  /* Initialize instance pool and lookups */
+  omp->instances = NULL;
+  omp->instance_id_by_port = NULL;
+  omp->instance_by_sw_if_index = hash_create (0, sizeof (uword));
+
   /* Store node indices */
   omp->ovpn4_input_node_index = ovpn4_input_node.index;
   omp->ovpn6_input_node_index = ovpn6_input_node.index;
@@ -863,9 +952,6 @@ ovpn_init (vlib_main_t *vm)
   error = ovpn_crypto_init (vm);
   if (error)
     return error;
-
-  /* Initialize options */
-  omp->options.sw_if_index = ~0;
 
   return 0;
 }
@@ -893,128 +979,139 @@ ovpn_periodic_process (vlib_main_t *vm, vlib_node_runtime_t *rt,
       /* Handle any events (none defined for now) */
       vlib_process_get_events (vm, NULL);
 
-      if (!omp->is_enabled)
+      if (pool_elts (omp->instances) == 0)
 	continue;
 
       now = vlib_time_now (vm);
 
-      /* Expire old pending connections */
-      ovpn_pending_db_expire (&omp->multi_context.pending_db, now);
-
-      /* Cleanup expired keys (lame duck keys after transition window) */
-      ovpn_peer_db_cleanup_expired_keys (vm, &omp->multi_context.peer_db, now);
-
-      /*
-       * Apply pending address updates (NAT/float support).
-       * Data plane queues updates, we apply them here with barrier.
-       */
-      {
-	int n_updates = 0;
-	ovpn_peer_t *peer;
-
-	/* First pass: check if any updates pending */
-	pool_foreach (peer, omp->multi_context.peer_db.peers)
-	  {
-	    if (__atomic_load_n (&peer->pending_addr_update, __ATOMIC_ACQUIRE))
-	      n_updates++;
-	  }
-
-	/* Only take barrier if updates are pending */
-	if (n_updates > 0)
-	  {
-	    vlib_worker_thread_barrier_sync (vm);
-	    ovpn_peer_db_apply_pending_updates (vm,
-						&omp->multi_context.peer_db);
-	    vlib_worker_thread_barrier_release (vm);
-	  }
-      }
-
-      /* Get keepalive settings */
-      f64 ping_interval = omp->options.keepalive_ping > 0 ?
-			    (f64) omp->options.keepalive_ping :
-			    10.0;
-      f64 ping_timeout = omp->options.keepalive_timeout > 0 ?
-			   (f64) omp->options.keepalive_timeout :
-			   60.0;
-
-      /* Check each peer */
-      ovpn_peer_t *peer;
-      u32 *peers_to_delete = NULL;
-
-      pool_foreach (peer, omp->multi_context.peer_db.peers)
+      /* Iterate over all active instances */
+      ovpn_instance_t *inst;
+      pool_foreach (inst, omp->instances)
 	{
-	  /* Skip non-established peers */
-	  if (peer->state != OVPN_PEER_STATE_ESTABLISHED)
+	  if (!inst->is_active)
 	    continue;
 
-	  /*
-	   * Check keepalive timeout
-	   * If we haven't received any packet from the peer within the
-	   * timeout period, mark the peer as dead.
-	   */
-	  f64 last_activity = peer->last_rx_time;
-	  f64 idle_time = now - last_activity;
+	  /* Expire old pending connections */
+	  ovpn_pending_db_expire (&inst->multi_context.pending_db, now);
 
-	  if (idle_time > ping_timeout)
-	    {
-	      /*
-	       * Peer has exceeded keepalive timeout
-	       * Mark as dead for cleanup
-	       */
-	      peer->state = OVPN_PEER_STATE_DEAD;
-	      vec_add1 (peers_to_delete, peer->peer_id);
-	      continue;
-	    }
+	  /* Cleanup expired keys (lame duck keys after transition window) */
+	  ovpn_peer_db_cleanup_expired_keys (vm, &inst->multi_context.peer_db,
+					     now);
 
 	  /*
-	   * Check if we should send a ping
-	   * Send ping if we haven't sent anything recently
+	   * Apply pending address updates (NAT/float support).
+	   * Data plane queues updates, we apply them here with barrier.
 	   */
-	  f64 tx_idle_time = now - peer->last_tx_time;
-	  if (tx_idle_time >= ping_interval)
-	    {
-	      /*
-	       * Send ping packet on data channel
-	       * OpenVPN ping is sent as encrypted data with magic pattern
-	       */
-	      ovpn_peer_send_ping (vm, peer);
-	    }
+	  {
+	    int n_updates = 0;
+	    ovpn_peer_t *peer;
 
-	  /* Check if rekey is needed (time, bytes, or packets) */
-	  if (ovpn_peer_needs_rekey (peer, now, omp->options.renegotiate_bytes,
-				    omp->options.renegotiate_packets))
+	    /* First pass: check if any updates pending */
+	    pool_foreach (peer, inst->multi_context.peer_db.peers)
+	      {
+		if (__atomic_load_n (&peer->pending_addr_update, __ATOMIC_ACQUIRE))
+		  n_updates++;
+	      }
+
+	    /* Only take barrier if updates are pending */
+	    if (n_updates > 0)
+	      {
+		vlib_worker_thread_barrier_sync (vm);
+		ovpn_peer_db_apply_pending_updates (
+		  vm, &inst->multi_context.peer_db);
+		vlib_worker_thread_barrier_release (vm);
+	      }
+	  }
+
+	  /* Get keepalive settings */
+	  f64 ping_interval = inst->options.keepalive_ping > 0 ?
+				(f64) inst->options.keepalive_ping :
+				10.0;
+	  f64 ping_timeout = inst->options.keepalive_timeout > 0 ?
+			       (f64) inst->options.keepalive_timeout :
+			       60.0;
+
+	  /* Check each peer */
+	  ovpn_peer_t *peer;
+	  u32 *peers_to_delete = NULL;
+
+	  pool_foreach (peer, inst->multi_context.peer_db.peers)
 	    {
-	      /* Start server-initiated rekey */
-	      u8 new_key_id = ovpn_peer_next_key_id (peer);
-	      int rv =
-		ovpn_peer_start_rekey (vm, peer, omp->ptls_ctx, new_key_id);
-	      if (rv == 0)
+	      /* Skip non-established peers */
+	      if (peer->state != OVPN_PEER_STATE_ESTABLISHED)
+		continue;
+
+	      /*
+	       * Check keepalive timeout
+	       * If we haven't received any packet from the peer within the
+	       * timeout period, mark the peer as dead.
+	       */
+	      f64 last_activity = peer->last_rx_time;
+	      f64 idle_time = now - last_activity;
+
+	      if (idle_time > ping_timeout)
 		{
-		  peer->rekey_initiated = 1;
-		  /* Send SOFT_RESET to client */
-		  if (peer->tls_ctx)
+		  /*
+		   * Peer has exceeded keepalive timeout
+		   * Mark as dead for cleanup
+		   */
+		  peer->state = OVPN_PEER_STATE_DEAD;
+		  vec_add1 (peers_to_delete, peer->peer_id);
+		  continue;
+		}
+
+	      /*
+	       * Check if we should send a ping
+	       * Send ping if we haven't sent anything recently
+	       */
+	      f64 tx_idle_time = now - peer->last_tx_time;
+	      if (tx_idle_time >= ping_interval)
+		{
+		  /*
+		   * Send ping packet on data channel
+		   * OpenVPN ping is sent as encrypted data with magic pattern
+		   */
+		  ovpn_peer_send_ping (vm, peer);
+		}
+
+	      /* Check if rekey is needed (time, bytes, or packets) */
+	      if (ovpn_peer_needs_rekey (peer, now,
+					 inst->options.renegotiate_bytes,
+					 inst->options.renegotiate_packets))
+		{
+		  /* Start server-initiated rekey */
+		  u8 new_key_id = ovpn_peer_next_key_id (peer);
+		  int rv =
+		    ovpn_peer_start_rekey (vm, peer, inst->ptls_ctx, new_key_id);
+		  if (rv == 0)
 		    {
-		      ovpn_reli_buffer_t *buf;
-		      buf = ovpn_reliable_get_buf_output_sequenced (
-			peer->tls_ctx->send_reliable);
-		      if (buf)
+		      peer->rekey_initiated = 1;
+		      /* Send SOFT_RESET to client */
+		      if (peer->tls_ctx)
 			{
-			  ovpn_buf_init (buf, 128);
-			  ovpn_reliable_mark_active_outgoing (
-			    peer->tls_ctx->send_reliable, buf,
-			    OVPN_OP_CONTROL_SOFT_RESET_V1);
+			  ovpn_reli_buffer_t *buf;
+			  buf = ovpn_reliable_get_buf_output_sequenced (
+			    peer->tls_ctx->send_reliable);
+			  if (buf)
+			    {
+			      ovpn_buf_init (buf, 128);
+			      ovpn_reliable_mark_active_outgoing (
+				peer->tls_ctx->send_reliable, buf,
+				OVPN_OP_CONTROL_SOFT_RESET_V1);
+			    }
 			}
 		    }
 		}
 	    }
-	}
 
-      /* Clean up dead peers */
-      for (u32 i = 0; i < vec_len (peers_to_delete); i++)
-	{
-	  ovpn_peer_delete (&omp->multi_context.peer_db, peers_to_delete[i]);
+	  /* Clean up dead peers */
+	  for (u32 i = 0; i < vec_len (peers_to_delete); i++)
+	    {
+	      ovpn_peer_delete (&inst->multi_context.peer_db,
+				peers_to_delete[i]);
+	    }
+	  vec_free (peers_to_delete);
 	}
-      vec_free (peers_to_delete);
     }
 
   return 0;

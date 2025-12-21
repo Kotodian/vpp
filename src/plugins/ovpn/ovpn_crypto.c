@@ -1109,11 +1109,22 @@ ovpn_crypto_cbc_decrypt_no_opcode (vlib_main_t *vm, ovpn_crypto_context_t *ctx,
   vnet_crypto_process_ops (vm, &hmac_op, 1);
 
   if (hmac_op.status != VNET_CRYPTO_OP_STATUS_COMPLETED)
-    return -4;
+    {
+      clib_warning ("HMAC op failed with status %d", hmac_op.status);
+      return -4;
+    }
 
   /* Compare HMAC */
   if (clib_memcmp (hmac_computed, hmac_received, OVPN_CBC_HMAC_SIZE) != 0)
-    return -5;
+    {
+      clib_warning (
+	"HMAC mismatch: received=%02x%02x%02x%02x... computed=%02x%02x%02x%02x...",
+	hmac_received[0], hmac_received[1], hmac_received[2], hmac_received[3],
+	hmac_computed[0], hmac_computed[1], hmac_computed[2], hmac_computed[3]);
+      clib_warning ("  packet len=%u, ciphertext_len=%u, key_index=%u", len,
+		    ciphertext_len, ctx->decrypt_hmac_key_index);
+      return -5;
+    }
 
   /*
    * Step 2: Decrypt ciphertext in place

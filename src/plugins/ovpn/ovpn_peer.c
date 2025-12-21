@@ -1009,11 +1009,11 @@ ovpn_peer_complete_rekey (vlib_main_t *vm, ovpn_peer_db_t *db,
       return -4;
     }
 
-  /* Install new keys in the pending slot */
-  extern ovpn_main_t ovpn_main;
+  /* Install new keys in the pending slot - get options from instance */
+  ovpn_instance_t *inst = ovpn_instance_get_by_sw_if_index (peer->sw_if_index);
+  u32 replay_window = inst ? inst->options.replay_window : 64;
   rv = ovpn_peer_set_key (vm, db, peer, peer->pending_key_slot, cipher_alg,
-			  &keys, peer->rekey_key_id,
-			  ovpn_main.options.replay_window);
+			  &keys, peer->rekey_key_id, replay_window);
 
   /* Securely clear key material */
   clib_memset (&keys, 0, sizeof (keys));
@@ -1030,8 +1030,8 @@ ovpn_peer_complete_rekey (vlib_main_t *vm, ovpn_peer_db_t *db,
   ovpn_peer_key_t *old_key = &peer->keys[old_slot];
 
   /* Set expiration time for old key (lame duck) */
-  extern ovpn_main_t ovpn_main;
-  f64 transition_window = (f64) ovpn_main.options.transition_window;
+  f64 transition_window =
+    inst ? (f64) inst->options.transition_window : 60.0;
   if (transition_window <= 0)
     transition_window = 60.0; /* Default 60 seconds */
   old_key->expires_at = now + transition_window;
@@ -1127,10 +1127,6 @@ ovpn_peer_adj_stack (ovpn_peer_t *peer, adj_index_t ai)
        * has dpo_next=0 (error-drop) in the adj-midchain-tx context.
        */
       adj_midchain_delegate_stack (ai, fib_index, &dst);
-
-    }
-  else
-    {
     }
 }
 

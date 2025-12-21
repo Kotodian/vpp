@@ -1178,6 +1178,301 @@ ovpn_test_static_key_cbc_mode (vlib_main_t *vm)
 }
 
 /*
+ * Test TLS-Crypt HMAC computation with known test vectors
+ *
+ * Test data:
+ *   - HMAC key: bytes 192-223 from tc.key (client's outgoing HMAC key = Key 1 HMAC)
+ *   - Input: opcode(1) + session_id(8) + packet_id(4) + net_time(4) + ciphertext(5)
+ *   - Expected HMAC computed using Python's hmac.new(key, data, hashlib.sha256)
+ */
+static int
+ovpn_test_tls_crypt_hmac (vlib_main_t *vm)
+{
+  /* HMAC key from tc.key bytes 192-223 (Key 1 HMAC for client->server direction) */
+  static const u8 test_hmac_key[] = {
+    0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0xa9, 0xb0,
+    0xc1, 0xd2, 0xe3, 0xf4, 0xa5, 0xb6, 0xc7, 0xd8,
+    0xe9, 0xf0, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6,
+    0xa7, 0xb8, 0xc9, 0xd0, 0xe1, 0xf2, 0xa3, 0xb4,
+  };
+
+  /* HMAC input: opcode(0x38) + session_id(8) + packet_id(4) + net_time(4) + ciphertext(5) */
+  static const u8 test_hmac_input[] = {
+    0x38, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+    0x08, 0x00, 0x00, 0x00, 0x01, 0x67, 0x65, 0x64,
+    0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+  };
+
+  /* Expected HMAC-SHA256 output (computed by Python) */
+  static const u8 expected_hmac[] = {
+    0xb5, 0x06, 0x16, 0x3f, 0x39, 0x76, 0x06, 0x7f,
+    0x7a, 0xab, 0x04, 0xdd, 0x73, 0x1b, 0xfe, 0x0c,
+    0xc7, 0xc7, 0xe6, 0x9b, 0xe7, 0x36, 0x63, 0x87,
+    0x2a, 0x80, 0xa2, 0xe8, 0x4b, 0xe8, 0x7d, 0x50,
+  };
+
+  u8 computed_hmac[OVPN_TLS_CRYPT_HMAC_SIZE];
+  int rv;
+
+  vlib_cli_output (vm, "=== Test TLS-Crypt HMAC Computation ===\n");
+
+  /* Compute HMAC */
+  rv = ovpn_tls_crypt_hmac (test_hmac_key, test_hmac_input,
+			    sizeof (test_hmac_input), computed_hmac);
+  OVPN_TEST (rv == 0, "HMAC computation should succeed");
+
+  /* Compare with expected value */
+  OVPN_TEST (clib_memcmp (computed_hmac, expected_hmac,
+			  OVPN_TLS_CRYPT_HMAC_SIZE) == 0,
+	     "Computed HMAC should match expected value");
+
+  /* Print computed vs expected for debugging */
+  vlib_cli_output (vm, "  Expected: %02x%02x%02x%02x%02x%02x%02x%02x...\n",
+		   expected_hmac[0], expected_hmac[1], expected_hmac[2],
+		   expected_hmac[3], expected_hmac[4], expected_hmac[5],
+		   expected_hmac[6], expected_hmac[7]);
+  vlib_cli_output (vm, "  Computed: %02x%02x%02x%02x%02x%02x%02x%02x...\n",
+		   computed_hmac[0], computed_hmac[1], computed_hmac[2],
+		   computed_hmac[3], computed_hmac[4], computed_hmac[5],
+		   computed_hmac[6], computed_hmac[7]);
+
+  vlib_cli_output (vm, "TLS-Crypt HMAC computation test PASSED\n");
+  return 0;
+}
+
+/*
+ * Test TLS-Crypt key parsing from tc.key test file
+ *
+ * Verifies that:
+ *   - Server mode: encrypt uses Key 0, decrypt uses Key 1
+ *   - Key 0 cipher: bytes 0-31, Key 0 HMAC: bytes 64-95
+ *   - Key 1 cipher: bytes 128-159, Key 1 HMAC: bytes 192-223
+ */
+static int
+ovpn_test_tls_crypt_key_parsing (vlib_main_t *vm)
+{
+  /* tc.key file content (256 bytes, hex encoded in 16 lines) */
+  const char *test_key_file =
+    "#\n"
+    "# 2048 bit OpenVPN static key for TLS-Crypt testing\n"
+    "#\n"
+    "-----BEGIN OpenVPN Static key V1-----\n"
+    "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6\n"  /* bytes 0-15 */
+    "e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2\n"  /* bytes 16-31 */
+    "c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8\n"  /* bytes 32-47 */
+    "a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4\n"  /* bytes 48-63 */
+    "e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0\n"  /* bytes 64-79 */
+    "c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6\n"  /* bytes 80-95 */
+    "a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2\n"  /* bytes 96-111 */
+    "e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8\n"  /* bytes 112-127 */
+    "c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4\n"  /* bytes 128-143 */
+    "a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0\n"  /* bytes 144-159 */
+    "e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6\n"  /* bytes 160-175 */
+    "c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2\n"  /* bytes 176-191 */
+    "a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8\n"  /* bytes 192-207 */
+    "e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4\n"  /* bytes 208-223 */
+    "c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0\n"  /* bytes 224-239 */
+    "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6\n"  /* bytes 240-255 */
+    "-----END OpenVPN Static key V1-----\n";
+
+  /* Expected key values (server mode):
+   * - encrypt_cipher_key: bytes 0-31 (Key 0 cipher)
+   * - encrypt_hmac_key: bytes 64-95 (Key 0 HMAC)
+   * - decrypt_cipher_key: bytes 128-159 (Key 1 cipher)
+   * - decrypt_hmac_key: bytes 192-223 (Key 1 HMAC)
+   */
+  static const u8 expected_encrypt_cipher[] = {
+    0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0xa7, 0xb8,
+    0xc9, 0xd0, 0xe1, 0xf2, 0xa3, 0xb4, 0xc5, 0xd6,
+    0xe7, 0xf8, 0xa9, 0xb0, 0xc1, 0xd2, 0xe3, 0xf4,
+    0xa5, 0xb6, 0xc7, 0xd8, 0xe9, 0xf0, 0xa1, 0xb2,
+  };
+
+  static const u8 expected_encrypt_hmac[] = {
+    0xe5, 0xf6, 0xa7, 0xb8, 0xc9, 0xd0, 0xe1, 0xf2,
+    0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0xa9, 0xb0,
+    0xc1, 0xd2, 0xe3, 0xf4, 0xa5, 0xb6, 0xc7, 0xd8,
+    0xe9, 0xf0, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6,
+  };
+
+  static const u8 expected_decrypt_cipher[] = {
+    0xc9, 0xd0, 0xe1, 0xf2, 0xa3, 0xb4, 0xc5, 0xd6,
+    0xe7, 0xf8, 0xa9, 0xb0, 0xc1, 0xd2, 0xe3, 0xf4,
+    0xa5, 0xb6, 0xc7, 0xd8, 0xe9, 0xf0, 0xa1, 0xb2,
+    0xc3, 0xd4, 0xe5, 0xf6, 0xa7, 0xb8, 0xc9, 0xd0,
+  };
+
+  static const u8 expected_decrypt_hmac[] = {
+    0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0xa9, 0xb0,
+    0xc1, 0xd2, 0xe3, 0xf4, 0xa5, 0xb6, 0xc7, 0xd8,
+    0xe9, 0xf0, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6,
+    0xa7, 0xb8, 0xc9, 0xd0, 0xe1, 0xf2, 0xa3, 0xb4,
+  };
+
+  ovpn_tls_crypt_t ctx;
+  int rv;
+
+  vlib_cli_output (vm, "=== Test TLS-Crypt Key Parsing ===\n");
+
+  clib_memset (&ctx, 0, sizeof (ctx));
+
+  /* Parse key in server mode */
+  rv = ovpn_tls_crypt_parse_key ((const u8 *) test_key_file,
+				 strlen (test_key_file), &ctx, 1 /* server */);
+  OVPN_TEST (rv == 0, "TLS-Crypt key parsing should succeed");
+  OVPN_TEST (ctx.enabled == 1, "TLS-Crypt should be enabled");
+
+  /* Verify encrypt cipher key (Key 0 cipher: bytes 0-31) */
+  OVPN_TEST (clib_memcmp (ctx.encrypt_cipher_key, expected_encrypt_cipher,
+			  OVPN_TLS_CRYPT_CIPHER_SIZE) == 0,
+	     "Encrypt cipher key should match bytes 0-31");
+
+  /* Verify encrypt HMAC key (Key 0 HMAC: bytes 64-95) */
+  OVPN_TEST (clib_memcmp (ctx.encrypt_hmac_key, expected_encrypt_hmac,
+			  OVPN_TLS_CRYPT_HMAC_KEY_SIZE) == 0,
+	     "Encrypt HMAC key should match bytes 64-95");
+
+  /* Verify decrypt cipher key (Key 1 cipher: bytes 128-159) */
+  OVPN_TEST (clib_memcmp (ctx.decrypt_cipher_key, expected_decrypt_cipher,
+			  OVPN_TLS_CRYPT_CIPHER_SIZE) == 0,
+	     "Decrypt cipher key should match bytes 128-159");
+
+  /* Verify decrypt HMAC key (Key 1 HMAC: bytes 192-223) */
+  OVPN_TEST (clib_memcmp (ctx.decrypt_hmac_key, expected_decrypt_hmac,
+			  OVPN_TLS_CRYPT_HMAC_KEY_SIZE) == 0,
+	     "Decrypt HMAC key should match bytes 192-223");
+
+  /* Print first 8 bytes of decrypt HMAC for debugging */
+  vlib_cli_output (vm, "  Decrypt HMAC: %02x%02x%02x%02x%02x%02x%02x%02x...\n",
+		   ctx.decrypt_hmac_key[0], ctx.decrypt_hmac_key[1],
+		   ctx.decrypt_hmac_key[2], ctx.decrypt_hmac_key[3],
+		   ctx.decrypt_hmac_key[4], ctx.decrypt_hmac_key[5],
+		   ctx.decrypt_hmac_key[6], ctx.decrypt_hmac_key[7]);
+  vlib_cli_output (vm, "  Expected:     %02x%02x%02x%02x%02x%02x%02x%02x...\n",
+		   expected_decrypt_hmac[0], expected_decrypt_hmac[1],
+		   expected_decrypt_hmac[2], expected_decrypt_hmac[3],
+		   expected_decrypt_hmac[4], expected_decrypt_hmac[5],
+		   expected_decrypt_hmac[6], expected_decrypt_hmac[7]);
+
+  vlib_cli_output (vm, "TLS-Crypt key parsing test PASSED\n");
+  return 0;
+}
+
+/*
+ * Test TLS-Crypt wrap/unwrap round-trip
+ *
+ * This test verifies that server wrapping and client unwrapping works.
+ * Server wraps with Key 0 (encrypt), Client unwraps with Key 0 (decrypt).
+ * We need two contexts with opposite directions.
+ */
+static int
+ovpn_test_tls_crypt_wrap_unwrap (vlib_main_t *vm)
+{
+  /* tc.key file content */
+  const char *test_key_file =
+    "#\n"
+    "-----BEGIN OpenVPN Static key V1-----\n"
+    "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6\n"
+    "e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2\n"
+    "c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8\n"
+    "a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4\n"
+    "e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0\n"
+    "c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6\n"
+    "a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2\n"
+    "e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8\n"
+    "c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4\n"
+    "a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0\n"
+    "e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6\n"
+    "c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2\n"
+    "a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8\n"
+    "e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4\n"
+    "c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0\n"
+    "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6\n"
+    "-----END OpenVPN Static key V1-----\n";
+
+  /* Test plaintext (control packet body) */
+  static const u8 test_plaintext[] = {
+    /* ack_array_len=0, then packet_id (4 bytes) + some data */
+    0x00, 0x00, 0x00, 0x00, 0x01,
+    'H', 'e', 'l', 'l', 'o', ' ', 'T', 'L', 'S', '-', 'C', 'r', 'y', 'p', 't',
+  };
+
+  /* opcode + session_id (9 bytes) */
+  static const u8 opcode_session[] = {
+    0x38, /* P_CONTROL_HARD_RESET_CLIENT_V2 with key_id=0 */
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, /* session_id */
+  };
+
+  ovpn_tls_crypt_t server_ctx, client_ctx;
+  u8 wrapped[256];
+  u8 unwrapped[256];
+  int wrapped_len, unwrapped_len;
+  int rv;
+
+  vlib_cli_output (vm, "=== Test TLS-Crypt Wrap/Unwrap ===\n");
+
+  /* Parse key in server mode (encrypt with Key 0, decrypt with Key 1) */
+  clib_memset (&server_ctx, 0, sizeof (server_ctx));
+  rv = ovpn_tls_crypt_parse_key ((const u8 *) test_key_file,
+				 strlen (test_key_file), &server_ctx,
+				 1 /* server */);
+  OVPN_TEST (rv == 0, "Server key parsing should succeed");
+
+  /* Parse key in client mode (encrypt with Key 1, decrypt with Key 0) */
+  clib_memset (&client_ctx, 0, sizeof (client_ctx));
+  rv = ovpn_tls_crypt_parse_key ((const u8 *) test_key_file,
+				 strlen (test_key_file), &client_ctx,
+				 0 /* client */);
+  OVPN_TEST (rv == 0, "Client key parsing should succeed");
+
+  /* Initialize packet IDs */
+  server_ctx.packet_id_send = 1;
+  server_ctx.time_backtrack = 30;
+  client_ctx.packet_id_send = 1;
+  client_ctx.time_backtrack = 30;
+
+  /* Test 1: Server wraps with Key 0, Client unwraps with Key 0 */
+  wrapped_len = ovpn_tls_crypt_wrap (&server_ctx, opcode_session, test_plaintext,
+				     sizeof (test_plaintext), wrapped,
+				     sizeof (wrapped));
+  OVPN_TEST (wrapped_len > 0, "Server wrapping should succeed");
+  vlib_cli_output (vm, "  Server wrapped length: %d bytes\n", wrapped_len);
+
+  /* Client unwraps - client's decrypt_key should match server's encrypt_key */
+  unwrapped_len = ovpn_tls_crypt_unwrap (&client_ctx, opcode_session, wrapped,
+					 wrapped_len, unwrapped,
+					 sizeof (unwrapped));
+  OVPN_TEST (unwrapped_len > 0, "Client unwrapping should succeed");
+  OVPN_TEST (unwrapped_len == (int) sizeof (test_plaintext),
+	     "Unwrapped length should match original");
+
+  /* Verify content matches */
+  OVPN_TEST (clib_memcmp (unwrapped, test_plaintext, sizeof (test_plaintext)) == 0,
+	     "Unwrapped content should match original");
+
+  /* Test 2: Client wraps with Key 1, Server unwraps with Key 1 */
+  client_ctx.packet_id_send = 1; /* Reset packet ID */
+  wrapped_len = ovpn_tls_crypt_wrap (&client_ctx, opcode_session, test_plaintext,
+				     sizeof (test_plaintext), wrapped,
+				     sizeof (wrapped));
+  OVPN_TEST (wrapped_len > 0, "Client wrapping should succeed");
+  vlib_cli_output (vm, "  Client wrapped length: %d bytes\n", wrapped_len);
+
+  /* Server unwraps - server's decrypt_key should match client's encrypt_key */
+  unwrapped_len = ovpn_tls_crypt_unwrap (&server_ctx, opcode_session, wrapped,
+					 wrapped_len, unwrapped,
+					 sizeof (unwrapped));
+  OVPN_TEST (unwrapped_len > 0, "Server unwrapping should succeed");
+  OVPN_TEST (unwrapped_len == (int) sizeof (test_plaintext),
+	     "Server unwrapped length should match original");
+  OVPN_TEST (clib_memcmp (unwrapped, test_plaintext, sizeof (test_plaintext)) == 0,
+	     "Server unwrapped content should match original");
+
+  vlib_cli_output (vm, "TLS-Crypt wrap/unwrap test PASSED\n");
+  return 0;
+}
+
+/*
  * Run all handshake tests
  */
 static int
@@ -1209,6 +1504,9 @@ ovpn_handshake_test_all (vlib_main_t *vm)
   rv |= ovpn_test_static_key_crypto_setup (vm);
   rv |= ovpn_test_static_key_roundtrip (vm);
   rv |= ovpn_test_static_key_cbc_mode (vm);
+  rv |= ovpn_test_tls_crypt_hmac (vm);
+  rv |= ovpn_test_tls_crypt_key_parsing (vm);
+  rv |= ovpn_test_tls_crypt_wrap_unwrap (vm);
 
   vlib_cli_output (vm, "\n========================================\n");
   if (rv == 0)

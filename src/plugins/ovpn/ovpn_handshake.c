@@ -944,43 +944,55 @@ ovpn_tls_crypt_parse_key (const u8 *key_data, u32 key_len,
     }
 
   /*
-   * Key layout (256 bytes total = 2048 bits):
-   *   0- 63: Direction 1 HMAC key (64 bytes, but we use first 32 for SHA256)
-   *  64-127: Direction 2 HMAC key
-   * 128-191: Direction 1 Cipher key (64 bytes, but we use first 32 for AES-256)
-   * 192-255: Direction 2 Cipher key
+   * OpenVPN Static Key file layout (256 bytes total):
+   * See: https://github.com/OpenVPN/openvpn/blob/master/src/openvpn/crypto.h
    *
-   * For server mode:
-   *   - Encrypt (server->client): use direction 1 keys
-   *   - Decrypt (client->server): use direction 2 keys
+   * struct key {
+   *   uint8_t cipher[64];  // only first 32 bytes used for AES-256
+   *   uint8_t hmac[64];    // only first 32 bytes used for SHA-256
+   * }; // 128 bytes per key
    *
-   * For client mode:
-   *   - Encrypt (client->server): use direction 2 keys
-   *   - Decrypt (server->client): use direction 1 keys
+   * struct key2 {
+   *   struct key keys[2];  // 256 bytes total
+   * };
+   *
+   * Layout:
+   *   keys[0] (bytes 0-127):   cipher at 0-31, HMAC at 64-95
+   *   keys[1] (bytes 128-255): cipher at 128-159, HMAC at 192-223
+   *
+   * Key direction for TLS-Crypt:
+   *   TLS Server (KEY_DIRECTION_NORMAL): send keys[0], recv keys[1]
+   *   TLS Client (KEY_DIRECTION_INVERSE): send keys[1], recv keys[0]
    */
   if (is_server)
     {
-      /* Server: encrypt with dir1, decrypt with dir2 */
-      clib_memcpy_fast (ctx->encrypt_hmac_key, raw_key,
-			OVPN_TLS_CRYPT_HMAC_SIZE);
-      clib_memcpy_fast (ctx->decrypt_hmac_key, raw_key + 64,
-			OVPN_TLS_CRYPT_HMAC_SIZE);
-      clib_memcpy_fast (ctx->encrypt_cipher_key, raw_key + 128,
+      /* Server mode: send with keys[0], receive with keys[1] */
+      /* Encrypt (send): keys[0] - cipher at 0, HMAC at 64 */
+      clib_memcpy_fast (ctx->encrypt_cipher_key, raw_key,
 			OVPN_TLS_CRYPT_CIPHER_SIZE);
-      clib_memcpy_fast (ctx->decrypt_cipher_key, raw_key + 192,
+      clib_memcpy_fast (ctx->encrypt_hmac_key, raw_key + 64,
+			OVPN_TLS_CRYPT_HMAC_KEY_SIZE);
+
+      /* Decrypt (receive): keys[1] - cipher at 128, HMAC at 192 */
+      clib_memcpy_fast (ctx->decrypt_cipher_key, raw_key + 128,
 			OVPN_TLS_CRYPT_CIPHER_SIZE);
+      clib_memcpy_fast (ctx->decrypt_hmac_key, raw_key + 192,
+			OVPN_TLS_CRYPT_HMAC_KEY_SIZE);
     }
   else
     {
-      /* Client: encrypt with dir2, decrypt with dir1 */
-      clib_memcpy_fast (ctx->encrypt_hmac_key, raw_key + 64,
-			OVPN_TLS_CRYPT_HMAC_SIZE);
-      clib_memcpy_fast (ctx->decrypt_hmac_key, raw_key,
-			OVPN_TLS_CRYPT_HMAC_SIZE);
-      clib_memcpy_fast (ctx->encrypt_cipher_key, raw_key + 192,
+      /* Client mode: send with keys[1], receive with keys[0] */
+      /* Encrypt (send): keys[1] - cipher at 128, HMAC at 192 */
+      clib_memcpy_fast (ctx->encrypt_cipher_key, raw_key + 128,
 			OVPN_TLS_CRYPT_CIPHER_SIZE);
-      clib_memcpy_fast (ctx->decrypt_cipher_key, raw_key + 128,
+      clib_memcpy_fast (ctx->encrypt_hmac_key, raw_key + 192,
+			OVPN_TLS_CRYPT_HMAC_KEY_SIZE);
+
+      /* Decrypt (receive): keys[0] - cipher at 0, HMAC at 64 */
+      clib_memcpy_fast (ctx->decrypt_cipher_key, raw_key,
 			OVPN_TLS_CRYPT_CIPHER_SIZE);
+      clib_memcpy_fast (ctx->decrypt_hmac_key, raw_key + 64,
+			OVPN_TLS_CRYPT_HMAC_KEY_SIZE);
     }
 
   ctx->enabled = 1;
@@ -995,7 +1007,7 @@ ovpn_tls_crypt_parse_key (const u8 *key_data, u32 key_len,
 /*
  * Compute HMAC-SHA256 for TLS-Crypt using EVP_MAC API (OpenSSL 3.0+)
  */
-static int
+int
 ovpn_tls_crypt_hmac (const u8 *key, const u8 *data, u32 len, u8 *out)
 {
   EVP_MAC *mac = NULL;
@@ -1019,7 +1031,7 @@ ovpn_tls_crypt_hmac (const u8 *key, const u8 *data, u32 len, u8 *out)
 						(char *) "SHA256", 0);
   params[1] = OSSL_PARAM_construct_end ();
 
-  if (!EVP_MAC_init (ctx, key, OVPN_TLS_CRYPT_HMAC_SIZE, params))
+  if (!EVP_MAC_init (ctx, key, OVPN_TLS_CRYPT_HMAC_KEY_SIZE, params))
     goto done;
   if (!EVP_MAC_update (ctx, data, len))
     goto done;
@@ -1067,38 +1079,37 @@ done:
 }
 
 /*
- * Build the IV for AES-256-CTR from packet_id
- * IV format: [packet_id (4 bytes, network order)][zeros (12 bytes)]
- */
-static void
-ovpn_tls_crypt_build_iv (u32 packet_id, u8 *iv)
-{
-  clib_memset (iv, 0, OVPN_TLS_CRYPT_IV_SIZE);
-  u32 net_packet_id = clib_host_to_net_u32 (packet_id);
-  clib_memcpy_fast (iv, &net_packet_id, sizeof (u32));
-}
-
-/*
- * Wrap (encrypt + authenticate) a control channel packet using TLS-Crypt
+ * Wrap (authenticate + encrypt) a control channel packet using TLS-Crypt
  *
- * TLS-Crypt wrapped packet format:
- *   [HMAC(32)][packet_id(4)][net_time(4)][encrypted payload]
+ * OpenVPN TLS-Crypt wrap process (from ssl_pkt.c and tls_crypt.c):
+ *   1. Compute HMAC over: opcode || session_id || packet_id || net_time || plaintext
+ *   2. Use first 16 bytes of HMAC as IV for encryption
+ *   3. Encrypt plaintext using that IV
+ *   4. Output: packet_id || net_time || HMAC || ciphertext
  *
- * The HMAC is computed over: packet_id || net_time || encrypted_payload
- * The encryption covers the entire plaintext using the packet_id as IV
+ * The HMAC covers the full header (opcode + session_id + packet_id + net_time)
+ * plus the plaintext. This matches OpenVPN's TLS_CRYPT_OFF_TAG offset.
+ *
+ * @param ctx           TLS-Crypt context
+ * @param opcode_session Opcode byte (1) + session_id (8) = 9 bytes
+ * @param plaintext     Plaintext to encrypt
+ * @param plain_len     Length of plaintext
+ * @param wrapped       Output buffer for wrapped data
+ * @param wrapped_buf_len Size of output buffer
  */
 int
-ovpn_tls_crypt_wrap (const ovpn_tls_crypt_t *ctx, const u8 *plaintext,
-		     u32 plain_len, u8 *wrapped, u32 wrapped_buf_len)
+ovpn_tls_crypt_wrap (const ovpn_tls_crypt_t *ctx, const u8 *opcode_session,
+		     const u8 *plaintext, u32 plain_len, u8 *wrapped,
+		     u32 wrapped_buf_len)
 {
   u8 iv[OVPN_TLS_CRYPT_IV_SIZE];
-  u8 hmac_input[2048 + 8]; /* packet_id + net_time + encrypted */
+  u8 hmac_input[2048 + 17]; /* opcode(1) + session_id(8) + packet_id(4) + net_time(4) + plaintext */
   u32 hmac_input_len;
   u32 wrapped_len;
   u8 *encrypted;
   int rv;
 
-  if (!ctx || !ctx->enabled || !plaintext || !wrapped)
+  if (!ctx || !ctx->enabled || !opcode_session || !plaintext || !wrapped)
     return -1;
 
   /* Check buffer size */
@@ -1106,7 +1117,7 @@ ovpn_tls_crypt_wrap (const ovpn_tls_crypt_t *ctx, const u8 *plaintext,
   if (wrapped_buf_len < wrapped_len)
     return -2;
 
-  if (plain_len > sizeof (hmac_input) - 8)
+  if (plain_len > sizeof (hmac_input) - 17)
     return -3; /* Plaintext too large */
 
   /* Get next packet ID */
@@ -1116,28 +1127,23 @@ ovpn_tls_crypt_wrap (const ovpn_tls_crypt_t *ctx, const u8 *plaintext,
   /* Get current time */
   u32 net_time = (u32) unix_time_now ();
 
-  /* Build IV from packet_id */
-  ovpn_tls_crypt_build_iv (packet_id, iv);
-
-  /* Position output pointer after HMAC */
+  /* Position output pointer and set header fields */
   ovpn_tls_crypt_header_t *hdr = (ovpn_tls_crypt_header_t *) wrapped;
   hdr->packet_id = clib_host_to_net_u32 (packet_id);
   hdr->net_time = clib_host_to_net_u32 (net_time);
 
-  /* Encrypt the plaintext */
-  encrypted = wrapped + OVPN_TLS_CRYPT_OVERHEAD;
-  rv = ovpn_tls_crypt_aes_ctr (ctx->encrypt_cipher_key, iv, plaintext,
-			       plain_len, encrypted);
-  if (rv < 0)
-    return -4;
-
-  /* Build HMAC input: packet_id || net_time || encrypted_payload */
-  u32 net_packet_id = clib_host_to_net_u32 (packet_id);
-  u32 net_net_time = clib_host_to_net_u32 (net_time);
-  clib_memcpy_fast (hmac_input, &net_packet_id, 4);
-  clib_memcpy_fast (hmac_input + 4, &net_net_time, 4);
-  clib_memcpy_fast (hmac_input + 8, encrypted, plain_len);
-  hmac_input_len = 8 + plain_len;
+  /*
+   * Step 1: Build HMAC input per OpenVPN TLS-Crypt specification:
+   *   HMAC = HMAC-SHA256(Ka, opcode || session_id || packet_id || net_time || plaintext)
+   *
+   * This matches OpenVPN's TLS_CRYPT_OFF_TAG (17 bytes) + plaintext.
+   * See: ssl_pkt.c tls_wrap_control() and tls_crypt.c tls_crypt_wrap()
+   */
+  clib_memcpy_fast (hmac_input, opcode_session, 9);	   /* opcode + session_id */
+  clib_memcpy_fast (hmac_input + 9, &hdr->packet_id, 4);   /* packet_id (network order) */
+  clib_memcpy_fast (hmac_input + 13, &hdr->net_time, 4);   /* net_time (network order) */
+  clib_memcpy_fast (hmac_input + 17, plaintext, plain_len); /* plaintext */
+  hmac_input_len = 17 + plain_len;
 
   /* Compute HMAC and write to header */
   rv = ovpn_tls_crypt_hmac (ctx->encrypt_hmac_key, hmac_input, hmac_input_len,
@@ -1145,42 +1151,74 @@ ovpn_tls_crypt_wrap (const ovpn_tls_crypt_t *ctx, const u8 *plaintext,
   if (rv < 0)
     return -5;
 
+  /*
+   * Step 2: Extract IV from HMAC (first 16 bytes)
+   * OpenVPN uses the first 128 bits of the HMAC tag as the encryption IV.
+   */
+  clib_memcpy_fast (iv, hdr->hmac, OVPN_TLS_CRYPT_IV_SIZE);
+
+  /*
+   * Step 3: Encrypt the plaintext using the IV derived from HMAC
+   */
+  encrypted = wrapped + OVPN_TLS_CRYPT_OVERHEAD;
+  rv = ovpn_tls_crypt_aes_ctr (ctx->encrypt_cipher_key, iv, plaintext,
+			       plain_len, encrypted);
+  if (rv < 0)
+    return -4;
+
   return wrapped_len;
 }
 
 /*
- * Unwrap (verify + decrypt) a control channel packet using TLS-Crypt
+ * Unwrap (decrypt + verify) a control channel packet using TLS-Crypt
  *
  * This function includes replay protection checking and updates the
  * replay window on success.
  *
- * Control channel uses long-form packet_id with both packet_id and net_time
- * for replay protection (time_backtrack validation).
+ * OpenVPN TLS-Crypt unwrap process (from ssl_pkt.c and tls_crypt.c):
+ *   1. Extract IV from received HMAC (first 16 bytes)
+ *   2. Decrypt ciphertext using that IV
+ *   3. Compute HMAC over: opcode || session_id || packet_id || net_time || plaintext
+ *   4. Compare computed HMAC with received HMAC
+ *
+ * The HMAC covers the full header (opcode + session_id + packet_id + net_time)
+ * plus the decrypted plaintext. This matches OpenVPN's TLS_CRYPT_OFF_TAG offset.
+ *
+ * @param ctx           TLS-Crypt context
+ * @param opcode_session Opcode byte (1) + session_id (8) = 9 bytes
+ * @param wrapped       TLS-Crypt header + ciphertext (after opcode+session_id)
+ * @param wrapped_len   Length of wrapped data
+ * @param plaintext     Output buffer for decrypted plaintext
+ * @param plaintext_buf_len Size of output buffer
  */
 int
-ovpn_tls_crypt_unwrap (ovpn_tls_crypt_t *ctx, const u8 *wrapped,
-		       u32 wrapped_len, u8 *plaintext, u32 plaintext_buf_len)
+ovpn_tls_crypt_unwrap (ovpn_tls_crypt_t *ctx, const u8 *opcode_session,
+		       const u8 *wrapped, u32 wrapped_len, u8 *plaintext,
+		       u32 plaintext_buf_len)
 {
   u8 iv[OVPN_TLS_CRYPT_IV_SIZE];
   u8 computed_hmac[OVPN_TLS_CRYPT_HMAC_SIZE];
-  u8 hmac_input[2048 + 8];
+  u8 hmac_input[2048 + 17]; /* opcode(1) + session_id(8) + packet_id(4) + net_time(4) + plaintext */
   u32 hmac_input_len;
   u32 plain_len;
   u32 now;
   int rv;
 
-  if (!ctx || !ctx->enabled || !wrapped || !plaintext)
+  if (!ctx || !ctx->enabled || !opcode_session || !wrapped || !plaintext)
     return -1;
 
   /* Check minimum wrapped packet size */
   if (wrapped_len < OVPN_TLS_CRYPT_OVERHEAD)
     return -2;
 
+  /*
+   * Packet format: [packet_id (4)] [net_time (4)] [HMAC (32)] [ciphertext]
+   */
   plain_len = wrapped_len - OVPN_TLS_CRYPT_OVERHEAD;
   if (plaintext_buf_len < plain_len)
     return -3;
 
-  if (plain_len > sizeof (hmac_input) - 8)
+  if (plain_len > sizeof (hmac_input) - 17)
     return -4; /* Packet too large */
 
   /* Parse header - extract both packet_id and net_time for replay check */
@@ -1198,21 +1236,38 @@ ovpn_tls_crypt_unwrap (ovpn_tls_crypt_t *ctx, const u8 *wrapped,
   now = (u32) unix_time_now ();
 
   /*
-   * Replay protection check (BEFORE HMAC verification for efficiency)
+   * Replay protection check (BEFORE decryption for efficiency)
    * Both packet_id and net_time are validated.
-   * Note: This is safe because we do the full HMAC check below.
-   * An attacker cannot forge packets without the key.
    */
   if (!ovpn_tls_crypt_check_replay (ctx, packet_id, net_time, now))
     return -9; /* Replay detected */
 
-  /* Build HMAC input: packet_id || net_time || encrypted_payload */
-  u32 net_packet_id = clib_host_to_net_u32 (packet_id);
-  u32 net_net_time = clib_host_to_net_u32 (net_time);
-  clib_memcpy_fast (hmac_input, &net_packet_id, 4);
-  clib_memcpy_fast (hmac_input + 4, &net_net_time, 4);
-  clib_memcpy_fast (hmac_input + 8, encrypted, plain_len);
-  hmac_input_len = 8 + plain_len;
+  /*
+   * Step 1: Extract IV from received HMAC (first 16 bytes)
+   * OpenVPN uses the first 128 bits of the HMAC tag as the encryption IV.
+   */
+  clib_memcpy_fast (iv, hdr->hmac, OVPN_TLS_CRYPT_IV_SIZE);
+
+  /*
+   * Step 2: Decrypt the ciphertext
+   */
+  rv = ovpn_tls_crypt_aes_ctr (ctx->decrypt_cipher_key, iv, encrypted,
+			       plain_len, plaintext);
+  if (rv < 0)
+    return -8;
+
+  /*
+   * Step 3: Build HMAC input per OpenVPN TLS-Crypt specification:
+   *   HMAC = HMAC-SHA256(Ka, opcode || session_id || packet_id || net_time || plaintext)
+   *
+   * This matches OpenVPN's TLS_CRYPT_OFF_TAG (17 bytes) + plaintext.
+   * See: ssl_pkt.c read_control_auth() and tls_crypt.c tls_crypt_unwrap()
+   */
+  clib_memcpy_fast (hmac_input, opcode_session, 9);	   /* opcode + session_id */
+  clib_memcpy_fast (hmac_input + 9, &hdr->packet_id, 4);   /* packet_id (network order) */
+  clib_memcpy_fast (hmac_input + 13, &hdr->net_time, 4);   /* net_time (network order) */
+  clib_memcpy_fast (hmac_input + 17, plaintext, plain_len); /* decrypted plaintext */
+  hmac_input_len = 17 + plain_len;
 
   /* Compute HMAC */
   rv = ovpn_tls_crypt_hmac (ctx->decrypt_hmac_key, hmac_input, hmac_input_len,
@@ -1220,18 +1275,30 @@ ovpn_tls_crypt_unwrap (ovpn_tls_crypt_t *ctx, const u8 *wrapped,
   if (rv < 0)
     return -6;
 
-  /* Verify HMAC using constant-time comparison */
+  /*
+   * Step 4: Verify HMAC using constant-time comparison
+   */
   if (CRYPTO_memcmp (hdr->hmac, computed_hmac, OVPN_TLS_CRYPT_HMAC_SIZE) != 0)
-    return -7; /* HMAC verification failed */
-
-  /* Build IV from packet_id */
-  ovpn_tls_crypt_build_iv (packet_id, iv);
-
-  /* Decrypt the payload */
-  rv = ovpn_tls_crypt_aes_ctr (ctx->decrypt_cipher_key, iv, encrypted,
-			       plain_len, plaintext);
-  if (rv < 0)
-    return -8;
+    {
+      clib_warning ("HMAC mismatch!");
+      clib_warning ("  received[0..15]:  %02x%02x%02x%02x%02x%02x%02x%02x "
+		    "%02x%02x%02x%02x%02x%02x%02x%02x",
+		    hdr->hmac[0], hdr->hmac[1], hdr->hmac[2], hdr->hmac[3],
+		    hdr->hmac[4], hdr->hmac[5], hdr->hmac[6], hdr->hmac[7],
+		    hdr->hmac[8], hdr->hmac[9], hdr->hmac[10], hdr->hmac[11],
+		    hdr->hmac[12], hdr->hmac[13], hdr->hmac[14], hdr->hmac[15]);
+      clib_warning ("  computed[0..15]:  %02x%02x%02x%02x%02x%02x%02x%02x "
+		    "%02x%02x%02x%02x%02x%02x%02x%02x",
+		    computed_hmac[0], computed_hmac[1], computed_hmac[2],
+		    computed_hmac[3], computed_hmac[4], computed_hmac[5],
+		    computed_hmac[6], computed_hmac[7], computed_hmac[8],
+		    computed_hmac[9], computed_hmac[10], computed_hmac[11],
+		    computed_hmac[12], computed_hmac[13], computed_hmac[14],
+		    computed_hmac[15]);
+      /* Clear plaintext on HMAC failure for security */
+      clib_memset (plaintext, 0, plain_len);
+      return -7; /* HMAC verification failed */
+    }
 
   /*
    * Update replay window AFTER successful verification
@@ -1654,26 +1721,75 @@ ovpn_handshake_send_pending_packets (vlib_main_t *vm,
       if (tls_crypt && tls_crypt->enabled)
 	{
 	  /*
-	   * TLS-Crypt expects: [opcode] [session_id] [ack_array] [msg_id]
-	   * [payload]
+	   * TLS-Crypt wrapping:
+	   * Input buffer after mark_active_outgoing:
+	   *   [msg_packet_id(4)] [opcode(1)] [session_id(8)] [ack_array...] [payload]
 	   *
-	   * The reliable buffer already contains the opcode as built by
-	   * ovpn_build_control_header(), so we don't need to prepend it.
-	   * Buffer format: [opcode(1)] [session_id(8)] [ack_array...]
+	   * Wire format:
+	   *   [opcode(1)] [session_id(8)] [packet_id(4)] [net_time(4)]
+	   *   [HMAC(32)] [encrypted(msg_packet_id + ack_array + payload)]
+	   *
+	   * HMAC is computed over: opcode || session_id || packet_id || net_time || plaintext
+	   * where plaintext = msg_packet_id || ack_array || payload
+	   *
+	   * The msg_packet_id was prepended by mark_active_outgoing, so we need to skip
+	   * it to get the opcode+session_id, then include it in the encrypted payload.
 	   */
+	  u8 *buf_data = OVPN_BPTR (buf);
+	  u8 *opcode_session = buf_data + 4; /* Skip msg_packet_id to get opcode+session_id */
 	  u8 wrapped[2048 + OVPN_TLS_CRYPT_OVERHEAD];
+
+	  /*
+	   * The plaintext to encrypt is the entire buffer content:
+	   *   [msg_packet_id(4)] [ack_array...] [payload]
+	   * But we need opcode+session_id from the buffer for HMAC.
+	   *
+	   * Actually, looking at OpenVPN format more carefully:
+	   * The encrypted payload should be: [ack_array] [msg_packet_id] [TLS data]
+	   * NOT including the msg_packet_id that was prepended.
+	   *
+	   * Let me reconsider: after build_control_header:
+	   *   [opcode] [session_id] [ack_array] (no msg_packet_id yet)
+	   * After mark_active_outgoing PREPENDS msg_packet_id:
+	   *   [msg_packet_id] [opcode] [session_id] [ack_array]
+	   *
+	   * For TLS-Crypt, the plaintext should be what comes after opcode+session_id:
+	   *   [ack_array] [msg_packet_id] [TLS data if any]
+	   *
+	   * But the msg_packet_id was prepended, not appended!
+	   * This is a structural issue with how the reliable layer works.
+	   *
+	   * For now, let's pass the original content after opcode+session_id,
+	   * which is [ack_array] from position 13 (4 + 1 + 8) in the buffer.
+	   */
+	  u32 plaintext_offset = 4 + 1 + 8; /* msg_packet_id + opcode + session_id */
+	  u8 *plaintext = buf_data + plaintext_offset;
+
+	  /* But we also need to include the msg_packet_id in the plaintext!
+	   * OpenVPN format: encrypted = ack_array || msg_packet_id || TLS_data
+	   * So we need to build the plaintext correctly:
+	   *   [ack_array] [msg_packet_id]
+	   * The msg_packet_id is at buf_data[0..3]
+	   */
+	  u8 plaintext_with_pid[2048];
+	  u32 ack_len = payload_len - plaintext_offset; /* ack_array length */
+	  clib_memcpy_fast (plaintext_with_pid, plaintext, ack_len);
+	  clib_memcpy_fast (plaintext_with_pid + ack_len, buf_data, 4); /* msg_packet_id */
+	  u32 total_plaintext_len = ack_len + 4;
+
 	  int wrapped_len =
-	    ovpn_tls_crypt_wrap (tls_crypt, OVPN_BPTR (buf), payload_len,
-				 wrapped, sizeof (wrapped));
+	    ovpn_tls_crypt_wrap (tls_crypt, opcode_session, plaintext_with_pid,
+				 total_plaintext_len, wrapped, sizeof (wrapped));
 	  if (wrapped_len < 0)
 	    {
 	      vlib_buffer_free_one (vm, bi);
 	      return -2;
 	    }
 
-	  /* Copy wrapped packet to payload area */
-	  clib_memcpy_fast (payload, wrapped, wrapped_len);
-	  payload_len = wrapped_len;
+	  /* Build wire format: [opcode][session_id][wrapped] */
+	  clib_memcpy_fast (payload, opcode_session, 9); /* opcode + session_id */
+	  clib_memcpy_fast (payload + 9, wrapped, wrapped_len);
+	  payload_len = 9 + wrapped_len;
 
 	  /* Increment packet ID for next wrap */
 	  tls_crypt->packet_id_send++;
@@ -1955,20 +2071,26 @@ ovpn_handshake_send_peer_packets (vlib_main_t *vm, ovpn_peer_t *peer,
       /* Apply TLS-Crypt or TLS-Auth wrapping */
       if (tls_crypt && tls_crypt->enabled)
 	{
-	  /* TLS-Crypt: encrypt and authenticate the control packet */
+	  /*
+	   * TLS-Crypt wrapping:
+	   * pkt_data: [opcode(1)] [session_id(8)] [ack_array...] [msg_id] [payload]
+	   * Wire format: [opcode(1)] [session_id(8)] [packet_id(4)] [net_time(4)]
+	   *              [HMAC(32)] [encrypted(ack_array...payload)]
+	   */
 	  u8 wrapped[2048 + OVPN_TLS_CRYPT_OVERHEAD];
 	  int wrapped_len =
-	    ovpn_tls_crypt_wrap (tls_crypt, pkt_data, total_ctrl_len, wrapped,
-				 sizeof (wrapped));
+	    ovpn_tls_crypt_wrap (tls_crypt, pkt_data, pkt_data + 9,
+				 total_ctrl_len - 9, wrapped, sizeof (wrapped));
 	  if (wrapped_len < 0)
 	    {
 	      vlib_buffer_free_one (vm, bi);
 	      return -2;
 	    }
 
-	  /* Copy wrapped packet back to payload area */
-	  clib_memcpy_fast (pkt_data, wrapped, wrapped_len);
-	  total_ctrl_len = wrapped_len;
+	  /* Build wire format: [opcode][session_id][wrapped] */
+	  /* opcode + session_id already at pkt_data[0..8], copy wrapped after */
+	  clib_memcpy_fast (pkt_data + 9, wrapped, wrapped_len);
+	  total_ctrl_len = 9 + wrapped_len;
 
 	  /* Increment packet ID for next wrap */
 	  tls_crypt->packet_id_send++;
@@ -2096,9 +2218,13 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 			       const ip_address_t *dst_addr, u16 dst_port,
 			       u8 is_ip6)
 {
-  ovpn_main_t *omp = &ovpn_main;
-  ovpn_pending_db_t *pending_db = &omp->multi_context.pending_db;
-  ovpn_peer_db_t *peer_db = &omp->multi_context.peer_db;
+  /* Look up instance by destination port */
+  ovpn_instance_t *inst = ovpn_instance_get_by_port (dst_port);
+  if (!inst)
+    return -100; /* No instance for this port */
+
+  ovpn_pending_db_t *pending_db = &inst->multi_context.pending_db;
+  ovpn_peer_db_t *peer_db = &inst->multi_context.peer_db;
   ovpn_pending_connection_t *pending;
   ovpn_peer_t *peer;
   ovpn_reli_buffer_t buf;
@@ -2158,7 +2284,7 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
       u8 peek_opcode = ovpn_op_get_opcode (data[0]);
 
       if (peek_opcode == OVPN_OP_CONTROL_HARD_RESET_CLIENT_V3 &&
-	  omp->tls_crypt_v2.enabled)
+	  inst->tls_crypt_v2.enabled)
 	{
 	  /*
 	   * P_CONTROL_HARD_RESET_CLIENT_V3 with TLS-Crypt-V2
@@ -2182,7 +2308,7 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 	  wrapped_packet_len += 1;
 
 	  /* Unwrap the client key */
-	  rv = ovpn_tls_crypt_v2_unwrap_client_key (&omp->tls_crypt_v2, wkc,
+	  rv = ovpn_tls_crypt_v2_unwrap_client_key (&inst->tls_crypt_v2, wkc,
 						   wkc_len, &client_key);
 	  if (rv < 0)
 	    {
@@ -2199,9 +2325,9 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 	      return -12; /* Failed to create client TLS-Crypt context */
 	    }
 
-	  /* Set time_backtrack from global options for replay protection */
-	  if (omp->options.replay_protection)
-	    client_tls_crypt_temp.time_backtrack = omp->options.replay_time;
+	  /* Set time_backtrack from instance options for replay protection */
+	  if (inst->options.replay_protection)
+	    client_tls_crypt_temp.time_backtrack = inst->options.replay_time;
 
 	  tls_crypt_ctx_for_unwrap = &client_tls_crypt_temp;
 	  is_tls_crypt_v2_packet = 1;
@@ -2213,7 +2339,7 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
     }
 
   /* Check if TLS-Crypt is enabled - it takes precedence over TLS-Auth */
-  if (tls_crypt_ctx_for_unwrap || omp->tls_crypt.enabled)
+  if (tls_crypt_ctx_for_unwrap || inst->tls_crypt.enabled)
     {
       /*
        * TLS-Crypt packet format on wire:
@@ -2231,7 +2357,7 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
        * 3. Reconstruct: [opcode] [session_id from plaintext] [rest...]
        */
       ovpn_tls_crypt_t *ctx =
-	tls_crypt_ctx_for_unwrap ? tls_crypt_ctx_for_unwrap : &omp->tls_crypt;
+	tls_crypt_ctx_for_unwrap ? tls_crypt_ctx_for_unwrap : &inst->tls_crypt;
       u8 plaintext[2048];
 
       /* Minimum size: opcode(1) + session_id(8) + HMAC(32) + packet_id(4) +
@@ -2241,9 +2367,9 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 
       u8 opcode_byte = data[0];
 
-      /* Unwrap starting from HMAC (skip opcode + session_id) */
-      int plain_len = ovpn_tls_crypt_unwrap (ctx, data + 9, len - 9, plaintext,
-					     sizeof (plaintext));
+      /* Unwrap: pass opcode+session_id for HMAC, then wrapped data */
+      int plain_len = ovpn_tls_crypt_unwrap (ctx, data, data + 9, len - 9,
+					     plaintext, sizeof (plaintext));
       if (plain_len < 0)
 	{
 	  if (plain_len == -9)
@@ -2253,16 +2379,25 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 
       /*
        * Reconstruct the control packet:
-       *   [opcode+keyid] [decrypted payload...]
+       *   [opcode+keyid (1)] [session_id (8)] [decrypted payload...]
        *
-       * Note: The decrypted payload already contains session_id etc.
+       * The session_id is at data[1..8] in the original wire packet and
+       * must be preserved. The encrypted payload contains the control
+       * message content (ack_array, msg_packet_id, TLS data) that comes
+       * AFTER the session_id in the reconstructed packet.
        */
       data[0] = opcode_byte;
-      clib_memcpy_fast (data + 1, plaintext, plain_len);
-      len = 1 + plain_len;
+      /* session_id already at data[1..8], copy plaintext after it */
+      clib_memcpy_fast (data + 9, plaintext, plain_len);
+      len = 9 + plain_len;
       b->current_length = len;
+
+      clib_warning ("TLS-Crypt reconstructed: opcode=0x%02x len=%d "
+		    "session_id=%02x%02x%02x%02x%02x%02x%02x%02x",
+		    opcode_byte, len, data[1], data[2], data[3], data[4],
+		    data[5], data[6], data[7], data[8]);
     }
-  else if (omp->tls_auth.enabled)
+  else if (inst->tls_auth.enabled)
     {
       /*
        * TLS-Auth packet format on wire:
@@ -2279,7 +2414,7 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
       if (len < OVPN_TLS_AUTH_MIN_SIZE)
 	return -2;
 
-      int plain_len = ovpn_tls_auth_unwrap (&omp->tls_auth, data, len,
+      int plain_len = ovpn_tls_auth_unwrap (&inst->tls_auth, data, len,
 					    plaintext, sizeof (plaintext));
       if (plain_len < 0)
 	{
@@ -2308,6 +2443,7 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
   if (ovpn_parse_control_header (&buf, &opcode, &key_id, &session_id, &ack,
 				 &ack_session_id, &packet_id) < 0)
     {
+      clib_warning ("parse_control_header failed, len=%d", len);
       return -1;
     }
 
@@ -2361,10 +2497,10 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 			  peer->state = OVPN_PEER_STATE_HANDSHAKE;
 
 			  /* Initialize TLS context for this peer */
-			  if (omp->ptls_ctx)
+			  if (inst->ptls_ctx)
 			    {
 			      int tls_rv = ovpn_peer_tls_init (
-				peer, omp->ptls_ctx, pending->key_id);
+				peer, inst->ptls_ctx, pending->key_id);
 			      if (tls_rv < 0)
 				{
 				  ovpn_peer_delete (peer_db, peer_id);
@@ -2495,12 +2631,12 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 	  {
 	    tls_crypt_ptr = pending->client_tls_crypt;
 	  }
-	else if (omp->tls_crypt.enabled)
+	else if (inst->tls_crypt.enabled)
 	  {
-	    tls_crypt_ptr = &omp->tls_crypt;
+	    tls_crypt_ptr = &inst->tls_crypt;
 	  }
 	ovpn_tls_auth_t *tls_auth_ptr =
-	  omp->tls_auth.enabled ? &omp->tls_auth : NULL;
+	  inst->tls_auth.enabled ? &inst->tls_auth : NULL;
 	rv = ovpn_handshake_send_pending_packets (vm, pending, dst_addr,
 						  dst_port, is_ip6, tls_auth_ptr,
 						  tls_crypt_ptr);
@@ -2533,7 +2669,7 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 	  }
 
 	/* Start rekey process */
-	rv = ovpn_peer_start_rekey (vm, peer, omp->ptls_ctx, key_id);
+	rv = ovpn_peer_start_rekey (vm, peer, inst->ptls_ctx, key_id);
 	if (rv < 0)
 	  {
 	    return -22;
@@ -2563,9 +2699,9 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 	/* Send response */
 	{
 	  ovpn_tls_crypt_t *tls_crypt_ptr =
-	    omp->tls_crypt.enabled ? &omp->tls_crypt : NULL;
+	    inst->tls_crypt.enabled ? &inst->tls_crypt : NULL;
 	  ovpn_tls_auth_t *tls_auth_ptr =
-	    omp->tls_auth.enabled ? &omp->tls_auth : NULL;
+	    inst->tls_auth.enabled ? &inst->tls_auth : NULL;
 	  ovpn_handshake_send_peer_packets (vm, peer, dst_addr, dst_port,
 					    is_ip6, tls_auth_ptr, tls_crypt_ptr);
 	}
@@ -2654,10 +2790,10 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 	    peer->state = OVPN_PEER_STATE_HANDSHAKE;
 
 	    /* Initialize TLS context for this peer */
-	    if (omp->ptls_ctx)
+	    if (inst->ptls_ctx)
 	      {
 		int tls_rv =
-		  ovpn_peer_tls_init (peer, omp->ptls_ctx, pending->key_id);
+		  ovpn_peer_tls_init (peer, inst->ptls_ctx, pending->key_id);
 		if (tls_rv < 0)
 		  {
 		    ovpn_peer_delete (peer_db, peer_id);
@@ -2809,9 +2945,9 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 		if (rv > 0)
 		  {
 		    ovpn_tls_crypt_t *tls_crypt_ptr =
-		      omp->tls_crypt.enabled ? &omp->tls_crypt : NULL;
+		      inst->tls_crypt.enabled ? &inst->tls_crypt : NULL;
 		    ovpn_tls_auth_t *tls_auth_ptr =
-		      omp->tls_auth.enabled ? &omp->tls_auth : NULL;
+		      inst->tls_auth.enabled ? &inst->tls_auth : NULL;
 		    ovpn_handshake_send_peer_packets (
 		      vm, peer, dst_addr, dst_port, is_ip6, tls_auth_ptr,
 		      tls_crypt_ptr);
@@ -2940,8 +3076,8 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 				     * Validate against pool range if configured
 				     */
 				    int ip_valid = ovpn_options_ip_in_pool (
-				      &client_virtual_ip, &omp->options.pool_start,
-				      &omp->options.pool_end);
+				      &client_virtual_ip, &inst->options.pool_start,
+				      &inst->options.pool_end);
 
 				    if (ip_valid)
 				      {
@@ -2965,7 +3101,7 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 			    if (negotiated_cipher != OVPN_CIPHER_ALG_NONE)
 			      tls_ctx->negotiated_cipher_alg = negotiated_cipher;
 			    else
-			      tls_ctx->negotiated_cipher_alg = omp->cipher_alg;
+			      tls_ctx->negotiated_cipher_alg = inst->cipher_alg;
 			  }
 		      }
 
@@ -3024,11 +3160,11 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 				    /* Send the queued Key Method 2 data */
 				    {
 				      ovpn_tls_auth_t *km_tls_auth =
-					omp->tls_auth.enabled ? &omp->tls_auth
-							      : NULL;
+					inst->tls_auth.enabled ? &inst->tls_auth
+							       : NULL;
 				      ovpn_tls_crypt_t *km_tls_crypt =
-					omp->tls_crypt.enabled
-					  ? &omp->tls_crypt
+					inst->tls_crypt.enabled
+					  ? &inst->tls_crypt
 					  : NULL;
 				      ovpn_handshake_send_peer_packets (
 					vm, peer, dst_addr, dst_port, is_ip6,
@@ -3097,7 +3233,7 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 				key_rv = ovpn_peer_set_key (
 				  vm, peer_db, peer, OVPN_KEY_SLOT_PRIMARY,
 				  cipher_alg, &keys, tls_ctx->key_id,
-				  omp->options.replay_window);
+				  inst->options.replay_window);
 			      }
 
 			    if (key_rv == 0)
@@ -3109,10 +3245,10 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 				peer->current_key_slot = OVPN_KEY_SLOT_PRIMARY;
 
 				/* Set up rekey timer from options */
-				if (omp->options.renegotiate_seconds > 0)
+				if (inst->options.renegotiate_seconds > 0)
 				  {
 				    peer->rekey_interval =
-				      (f64) omp->options.renegotiate_seconds;
+				      (f64) inst->options.renegotiate_seconds;
 				    peer->next_rekey_time =
 				      now + peer->rekey_interval;
 				  }
@@ -3163,6 +3299,7 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 				    u32 fib_index = fib_table_get_index_for_sw_if_index (
 				      fproto, peer->sw_if_index);
 
+				    ovpn_main_t *omp = &ovpn_main;
 				    fib_table_entry_path_add (
 				      fib_index, &pfx, omp->fib_src_hi,
 				      FIB_ENTRY_FLAG_NONE,
@@ -3234,7 +3371,7 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 	 * The WKc is NOT tls-crypt wrapped in this case - it's sent in clear
 	 * so the server can unwrap it and establish the per-client key.
 	 */
-	if (!omp->tls_crypt_v2.enabled)
+	if (!inst->tls_crypt_v2.enabled)
 	  {
 	    /* TLS-Crypt-V2 not enabled */
 	    return -20;
@@ -3269,7 +3406,7 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 	ovpn_tls_crypt_v2_client_key_t client_key;
 
 	/* Unwrap the client key */
-	rv = ovpn_tls_crypt_v2_unwrap_client_key (&omp->tls_crypt_v2, wkc_data,
+	rv = ovpn_tls_crypt_v2_unwrap_client_key (&inst->tls_crypt_v2, wkc_data,
 						 wkc_data_len, &client_key);
 	if (rv < 0)
 	  {
@@ -3288,9 +3425,9 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 	    return -24; /* Failed to create client TLS-Crypt context */
 	  }
 
-	/* Set time_backtrack from global options for replay protection */
-	if (omp->options.replay_protection)
-	  client_ctx->time_backtrack = omp->options.replay_time;
+	/* Set time_backtrack from instance options for replay protection */
+	if (inst->options.replay_protection)
+	  client_ctx->time_backtrack = inst->options.replay_time;
 
 	/* Store the client context in pending connection */
 	pending->client_tls_crypt = client_ctx;
@@ -3332,12 +3469,12 @@ const u8 ovpn_ping_string[OVPN_PING_STRING_SIZE] = { 0x2a, 0x18, 0x7b, 0xf3,
 int
 ovpn_build_push_reply (ovpn_peer_t *peer, char *buf, u32 buf_len)
 {
-  extern ovpn_main_t ovpn_main;
-  ovpn_main_t *omp = &ovpn_main;
+  /* Get instance from peer's sw_if_index */
+  ovpn_instance_t *inst = ovpn_instance_get_by_sw_if_index (peer->sw_if_index);
   int offset = 0;
   int written;
 
-  if (!buf || buf_len < 64)
+  if (!buf || buf_len < 64 || !inst)
     return -1;
 
   /* Start with PUSH_REPLY */
@@ -3385,9 +3522,9 @@ ovpn_build_push_reply (ovpn_peer_t *peer, char *buf, u32 buf_len)
 
   /* Add ping/ping-restart for keepalive from configuration */
   u32 ping_interval =
-    omp->options.keepalive_ping > 0 ? omp->options.keepalive_ping : 10;
+    inst->options.keepalive_ping > 0 ? inst->options.keepalive_ping : 10;
   u32 ping_timeout =
-    omp->options.keepalive_timeout > 0 ? omp->options.keepalive_timeout : 60;
+    inst->options.keepalive_timeout > 0 ? inst->options.keepalive_timeout : 60;
 
   written = snprintf (buf + offset, buf_len - offset, ",ping %u,ping-restart %u",
 		      ping_interval, ping_timeout);

@@ -110,7 +110,6 @@ typedef struct ovpn_peer_tls_t_
 
   /* Buffers for TLS data */
   ovpn_reli_buffer_t plaintext_read_buf;
-  ovpn_reli_buffer_t plaintext_write_buf;
   ovpn_reli_buffer_t ack_write_buf;
 
   /* Next packet ID to send */

@@ -106,20 +106,25 @@ always_inline uword
 ovpn_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		    vlib_frame_t *frame, u8 is_ip4)
 {
-  ovpn_main_t *omp = &ovpn_main;
   u32 n_left_from, *from;
   vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b;
   u16 nexts[VLIB_FRAME_SIZE], *next;
   f64 now = vlib_time_now (vm);
   u32 last_adj_index = ~0;
   u32 last_peer_id = ~0;
+  u32 last_sw_if_index = ~0;
   ovpn_peer_t *peer = NULL;
+  ovpn_instance_t *inst = NULL;
   u32 thread_index = vm->thread_index;
   ovpn_per_thread_crypto_t *ptd = ovpn_crypto_get_ptd (thread_index);
 
   /* Track peers for post-processing */
   ovpn_peer_t *peers[VLIB_FRAME_SIZE];
   u16 inner_lens[VLIB_FRAME_SIZE];
+  /* Track tx bytes per buffer for batched counter updates */
+  u32 tx_bytes[VLIB_FRAME_SIZE];
+  /* Track error counts per error type for batched counter updates */
+  u32 error_counts[OVPN_OUTPUT_N_ERROR];
   u32 encrypt_count = 0;
 
   from = vlib_frame_vector_args (frame);
@@ -131,6 +136,8 @@ ovpn_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
   /* Initialize tracking arrays */
   clib_memset (peers, 0, sizeof (peers));
+  clib_memset (tx_bytes, 0, sizeof (tx_bytes));
+  clib_memset (error_counts, 0, sizeof (error_counts));
 
   /* Reset per-thread crypto state for batch processing */
   ovpn_crypto_reset_ptd (ptd);
@@ -152,14 +159,32 @@ ovpn_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       /* Get adjacency index from buffer */
       adj_index = vnet_buffer (b0)->ip.adj_index[VLIB_TX];
 
-      /* Lookup peer by adjacency index (cached) */
+      /*
+       * Lookup peer and instance by adjacency index (cached).
+       * The peer contains sw_if_index which maps to an instance.
+       */
       if (PREDICT_FALSE (adj_index != last_adj_index))
 	{
 	  peer_id = ovpn_peer_get_by_adj_index (adj_index);
 	  if (peer_id != ~0 && peer_id != last_peer_id)
 	    {
-	      peer = ovpn_peer_get (&omp->multi_context.peer_db, peer_id);
-	      last_peer_id = peer_id;
+	      /* Get instance from sw_if_index of the interface this adj uses
+	       */
+	      u32 sw_if_index = vnet_buffer (b0)->sw_if_index[VLIB_TX];
+	      if (sw_if_index != last_sw_if_index)
+		{
+		  inst = ovpn_instance_get_by_sw_if_index (sw_if_index);
+		  last_sw_if_index = sw_if_index;
+		}
+	      if (inst)
+		{
+		  peer = ovpn_peer_get (&inst->multi_context.peer_db, peer_id);
+		  last_peer_id = peer_id;
+		}
+	      else
+		{
+		  peer = NULL;
+		}
 	    }
 	  else if (peer_id == ~0)
 	    {
@@ -267,30 +292,18 @@ ovpn_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  /*
 	   * CBC+HMAC mode: Process immediately (not batched)
 	   *
-	   * When we reach this node, ip4-midchain has already applied the
-	   * rewrite (outer IP+UDP headers). The buffer contains:
-	   * [outer IP:20][outer UDP:8][inner packet]
+	   * Buffer state at this point:
+	   * - Outer headers (IP+UDP) were already saved to saved_outer_hdr above
+	   * - Buffer has been advanced past outer headers
+	   * - Current position points to inner packet
 	   *
 	   * We need to:
-	   * 1. Save the outer headers (they'll be overwritten by encrypt)
-	   * 2. Advance past outer headers
-	   * 3. Encrypt the inner packet (prepends opcode+hmac+iv)
-	   * 4. Memmove encrypted data to make room for outer headers
-	   * 5. Restore outer headers at the beginning
+	   * 1. Encrypt the inner packet (prepends hmac+iv)
+	   * 2. Retreat to make room for outer headers
+	   * 3. Restore outer headers at the beginning
 	   */
-	  u32 outer_hdr_len =
-	    (is_ip4 ? sizeof (ip4_header_t) : sizeof (ip6_header_t)) +
-	    sizeof (udp_header_t);
 
-	  /* Save outer headers before encryption overwrites them */
-	  u8 saved_outer_hdr[48]; /* Max size for IPv6 + UDP */
-	  clib_memcpy_fast (saved_outer_hdr, vlib_buffer_get_current (b0),
-			    outer_hdr_len);
-
-	  /* Advance past outer headers to inner packet */
-	  vlib_buffer_advance (b0, outer_hdr_len);
-
-	  /* Encrypt the inner packet (this prepends opcode+hmac+iv) */
+	  /* Encrypt the inner packet (this prepends hmac+iv) */
 	  rv = ovpn_crypto_cbc_encrypt (vm, crypto, b0);
 	  if (PREDICT_FALSE (rv < 0))
 	    {
@@ -362,16 +375,12 @@ ovpn_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  packet_id = crypto->packet_id_send - 1;
 	  outer_len = vlib_buffer_length_in_chain (vm, b0);
 
-	  /* Update peer stats immediately for CBC */
+	  /* Update peer stats and store for batched counter update */
 	  ovpn_peer_update_tx (peer, vlib_time_now (vm), outer_len);
-
-	  /* Update interface tx counters */
 	  {
-	    vnet_main_t *vnm = vnet_get_main ();
-	    vlib_increment_combined_counter (
-	      vnm->interface_main.combined_sw_if_counters +
-		VNET_INTERFACE_COUNTER_TX,
-	      vm->thread_index, peer->sw_if_index, 1, outer_len);
+	    u32 buf_idx = b - bufs;
+	    peers[buf_idx] = peer;
+	    tx_bytes[buf_idx] = outer_len;
 	  }
 	}
 
@@ -396,6 +405,7 @@ ovpn_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	{
 	  b0->error = node->errors[error];
 	  next0 = OVPN_OUTPUT_NEXT_ERROR;
+	  error_counts[error]++;
 	}
 
       next[0] = next0;
@@ -472,17 +482,37 @@ ovpn_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		ip6_tcp_udp_icmp_compute_checksum (vm, b0, ip6, &bogus);
 	    }
 
-	  /* Update peer statistics */
+	  /* Update peer statistics and store tx bytes for batched counter */
 	  ovpn_peer_update_tx (peer0, now, outer_len);
-
-	  /* Update interface tx counters */
-	  vnet_main_t *vnm = vnet_get_main ();
-	  vlib_increment_combined_counter (
-	    vnm->interface_main.combined_sw_if_counters +
-	      VNET_INTERFACE_COUNTER_TX,
-	    vm->thread_index, peer0->sw_if_index, 1, outer_len);
-
+	  tx_bytes[i] = outer_len;
 	}
+    }
+
+  /*
+   * Batch update interface tx counters
+   * Iterate through all buffers and increment counters per sw_if_index
+   */
+  {
+    vnet_main_t *vnm = vnet_get_main ();
+    for (u32 i = 0; i < frame->n_vectors; i++)
+      {
+	if (peers[i] && tx_bytes[i] > 0)
+	  {
+	    vlib_increment_combined_counter (
+	      vnm->interface_main.combined_sw_if_counters +
+		VNET_INTERFACE_COUNTER_TX,
+	      thread_index, peers[i]->sw_if_index, 1, tx_bytes[i]);
+	  }
+      }
+  }
+
+  /*
+   * Batch update error counters
+   */
+  for (u32 i = 1; i < OVPN_OUTPUT_N_ERROR; i++)
+    {
+      if (error_counts[i] > 0)
+	vlib_node_increment_counter (vm, node->node_index, i, error_counts[i]);
     }
 
   vlib_buffer_enqueue_to_next (vm, node, vlib_frame_vector_args (frame), nexts,

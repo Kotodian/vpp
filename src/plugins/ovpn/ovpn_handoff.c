@@ -66,7 +66,6 @@ static_always_inline uword
 ovpn_handoff (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame,
 	      u32 fq_index, ovpn_handoff_mode_t mode)
 {
-  ovpn_main_t *omp = &ovpn_main;
   vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b;
   u16 thread_indices[VLIB_FRAME_SIZE], *ti;
   u32 n_enq, n_left_from, *from;
@@ -81,6 +80,7 @@ ovpn_handoff (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame,
   while (n_left_from > 0)
     {
       u32 peer_id = ~0;
+      ovpn_instance_t *inst = NULL;
 
       if (PREDICT_FALSE (mode == OVPN_HANDOFF_HANDSHAKE))
 	{
@@ -99,8 +99,15 @@ ovpn_handoff (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame,
 	      peer_id = ovpn_data_v2_get_peer_id (hdr);
 	    }
 
-	  ovpn_peer_t *peer =
-	    ovpn_peer_get (&omp->multi_context.peer_db, peer_id);
+	  /* Look up instance by destination port */
+	  u8 *udp_start = data - sizeof (udp_header_t);
+	  udp_header_t *udp = (udp_header_t *) udp_start;
+	  u16 dst_port = clib_net_to_host_u16 (udp->dst_port);
+	  inst = ovpn_instance_get_by_port (dst_port);
+
+	  ovpn_peer_t *peer = NULL;
+	  if (inst)
+	    peer = ovpn_peer_get (&inst->multi_context.peer_db, peer_id);
 	  if (peer)
 	    {
 	      ti[0] = peer->input_thread_index;
@@ -115,8 +122,11 @@ ovpn_handoff (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame,
 	{
 	  /* Output packets - lookup peer by adjacency or buffer metadata */
 	  peer_id = vnet_buffer (b[0])->ip.adj_index[VLIB_TX];
-	  ovpn_peer_t *peer =
-	    ovpn_peer_get (&omp->multi_context.peer_db, peer_id);
+	  u32 sw_if_index = vnet_buffer (b[0])->sw_if_index[VLIB_TX];
+	  inst = ovpn_instance_get_by_sw_if_index (sw_if_index);
+	  ovpn_peer_t *peer = NULL;
+	  if (inst)
+	    peer = ovpn_peer_get (&inst->multi_context.peer_db, peer_id);
 	  if (peer)
 	    {
 	      ti[0] = peer->input_thread_index;

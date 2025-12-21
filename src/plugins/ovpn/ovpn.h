@@ -57,45 +57,77 @@ typedef struct ovpn_multi_context_t_
   ovpn_pending_db_t pending_db;
 } ovpn_multi_context_t;
 
-typedef struct ovpn_main_t_
+/*
+ * Per-instance OpenVPN context
+ * Each instance represents a separate OpenVPN server with its own:
+ * - Local address and port binding
+ * - TLS/crypto configuration
+ * - Peer database
+ * - FIB table for independent routing
+ */
+typedef struct ovpn_instance_t_
 {
+  /* Instance identification */
+  u32 instance_id; /* Pool index */
+  u32 sw_if_index; /* Associated interface sw_if_index */
+
+  /* Network binding */
+  ip_address_t local_addr; /* Local IP address */
+  u16 local_port;	   /* Local UDP port */
+  u8 is_ipv6;		   /* IPv4 or IPv6 mode */
+
+  /* Per-instance FIB tables (independent routing per instance) */
+  u32 fib_index4; /* IPv4 FIB table index */
+  u32 fib_index6; /* IPv6 FIB table index */
+  u32 fib_table_id; /* User-specified table ID (used for both) */
+
+  /* Per-instance options */
   ovpn_options_t options;
 
-  /* Picotls context */
+  /* Per-instance TLS context */
   ptls_context_t *ptls_ctx;
 
-  /* TLS-Crypt context for control channel encryption */
+  /* Per-instance control channel security */
   ovpn_tls_crypt_t tls_crypt;
-
-  /* TLS-Crypt-V2 context for client-specific keys */
   ovpn_tls_crypt_v2_t tls_crypt_v2;
-
-  /* TLS-Auth context for control channel authentication (with replay protection) */
   ovpn_tls_auth_t tls_auth;
 
-  /* Cipher algorithm for data channel */
+  /* Per-instance data channel cipher */
   ovpn_cipher_alg_t cipher_alg;
 
-  /* UDP registration */
-  u8 is_enabled;
+  /* Per-instance peer management */
+  ovpn_multi_context_t multi_context;
 
-  /* Node indices */
+  /* State */
+  u8 is_active;
+
+} ovpn_instance_t;
+
+typedef struct ovpn_main_t_
+{
+  /* Pool of OpenVPN instances */
+  ovpn_instance_t *instances;
+
+  /* Lookup: port -> instance_id (simple since each port is unique) */
+  u32 *instance_id_by_port;
+
+  /* Lookup: sw_if_index -> instance_id */
+  uword *instance_by_sw_if_index;
+
+  /* Node indices (shared across all instances) */
   u32 ovpn4_input_node_index;
   u32 ovpn6_input_node_index;
   u32 ovpn4_output_node_index;
   u32 ovpn6_output_node_index;
 
-  /* Frame queue indices for handoff */
+  /* Frame queue indices for handoff (shared) */
   u32 in4_fq_index;
   u32 in6_fq_index;
   u32 out4_fq_index;
   u32 out6_fq_index;
 
-  /* FIB source for high-priority routes */
+  /* FIB source for high-priority routes (shared) */
   fib_source_t fib_src_hi;
-
-  /* Multi-instance context */
-  ovpn_multi_context_t multi_context;
 
   /* For convenience */
   vlib_main_t *vm;
@@ -103,6 +135,52 @@ typedef struct ovpn_main_t_
 } ovpn_main_t;
 
 extern ovpn_main_t ovpn_main;
+
+/*
+ * Instance management functions
+ */
+
+/* Get instance by pool index */
+always_inline ovpn_instance_t *
+ovpn_instance_get (u32 instance_id)
+{
+  ovpn_main_t *omp = &ovpn_main;
+  if (pool_is_free_index (omp->instances, instance_id))
+    return NULL;
+  return pool_elt_at_index (omp->instances, instance_id);
+}
+
+/* Get instance by UDP port (fast path for input node) */
+always_inline ovpn_instance_t *
+ovpn_instance_get_by_port (u16 port)
+{
+  ovpn_main_t *omp = &ovpn_main;
+  if (vec_len (omp->instance_id_by_port) <= port)
+    return NULL;
+  u32 instance_id = omp->instance_id_by_port[port];
+  if (instance_id == ~0)
+    return NULL;
+  return pool_elt_at_index (omp->instances, instance_id);
+}
+
+/* Get instance by sw_if_index */
+always_inline ovpn_instance_t *
+ovpn_instance_get_by_sw_if_index (u32 sw_if_index)
+{
+  ovpn_main_t *omp = &ovpn_main;
+  uword *p = hash_get (omp->instance_by_sw_if_index, sw_if_index);
+  if (!p)
+    return NULL;
+  return pool_elt_at_index (omp->instances, p[0]);
+}
+
+/* Instance create/delete (implemented in ovpn.c) */
+int ovpn_instance_create (vlib_main_t *vm, ip_address_t *local_addr,
+			  u16 local_port, u32 table_id,
+			  ovpn_options_t *options, u32 *instance_id_out,
+			  u32 *sw_if_index_out);
+
+int ovpn_instance_delete (vlib_main_t *vm, u32 sw_if_index);
 
 #endif /* __included_ovpn_h__ */
 

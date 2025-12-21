@@ -177,24 +177,30 @@ ovpn_adj_midchain_fixup (vlib_main_t *vm, const struct ip_adjacency_t_ *adj,
 static void
 ovpn_if_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai)
 {
-  ovpn_main_t *omp = &ovpn_main;
+  ovpn_instance_t *inst;
   ovpn_peer_t *peer;
   ip_adjacency_t *adj;
 
   adj = adj_get (ai);
 
-  /*
-   * Convert any neighbour adjacency that has a next-hop reachable through
-   * the ovpn interface into a midchain. This is to avoid sending ARP/ND to
-   * resolve the next-hop address via the ovpn interface.
-   */
-  adj_nbr_midchain_update_rewrite (ai, NULL, NULL, ADJ_FLAG_NONE, NULL);
+  /* Get instance by sw_if_index */
+  inst = ovpn_instance_get_by_sw_if_index (sw_if_index);
+  if (!inst)
+    {
+      /*
+       * No instance found - convert to midchain with NULL fixup to avoid
+       * sending ARP/ND to resolve the next-hop via the ovpn interface.
+       */
+      adj_nbr_midchain_update_rewrite (ai, NULL, NULL, ADJ_FLAG_NONE, NULL);
+      return;
+    }
 
   /*
    * Find a peer that matches the adjacency's next-hop
    * For OpenVPN, we look for an established peer on this interface
    */
-  pool_foreach (peer, omp->multi_context.peer_db.peers)
+  int peer_found = 0;
+  pool_foreach (peer, inst->multi_context.peer_db.peers)
     {
       if (peer->sw_if_index != sw_if_index)
 	continue;
@@ -232,11 +238,15 @@ ovpn_if_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai)
 
       if (match)
 	{
-
 	  /* Associate this adjacency with the peer */
 	  ovpn_peer_adj_index_add (peer->peer_id, ai);
 
-	  /* Update the midchain with the peer's rewrite and fixup callback */
+	  /*
+	   * Convert to midchain with proper fixup and rewrite.
+	   * IMPORTANT: This must be called ONCE with all parameters - the
+	   * fixup function is only installed on the first call that converts
+	   * the adjacency to a midchain type.
+	   */
 	  adj_nbr_midchain_update_rewrite (ai, ovpn_adj_midchain_fixup, NULL,
 					   ADJ_FLAG_MIDCHAIN_IP_STACK,
 					   vec_dup (peer->rewrite));
@@ -252,8 +262,18 @@ ovpn_if_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai)
 
 	  /* Stack the adjacency on the path to reach the peer's endpoint */
 	  ovpn_peer_adj_stack (peer, ai);
+	  peer_found = 1;
 	  break;
 	}
+    }
+
+  if (!peer_found)
+    {
+      /*
+       * No matching peer found - convert to midchain with NULL fixup to avoid
+       * sending ARP/ND to resolve the next-hop via the ovpn interface.
+       */
+      adj_nbr_midchain_update_rewrite (ai, NULL, NULL, ADJ_FLAG_NONE, NULL);
     }
 }
 

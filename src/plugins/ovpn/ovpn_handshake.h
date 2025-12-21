@@ -280,10 +280,11 @@ ovpn_tls_auth_update_replay (ovpn_tls_auth_t *ctx, u32 packet_id, u32 net_time)
  *
  * Where encrypted payload = AES-256-CTR encrypted original control packet
  */
-#define OVPN_TLS_CRYPT_KEY_FILE_SIZE 256 /* OpenVPN static key file (2048 bits) */
-#define OVPN_TLS_CRYPT_KEY_SIZE	     128 /* Used portion for TLS-Crypt (1024 bits) */
-#define OVPN_TLS_CRYPT_CIPHER_SIZE  32	/* AES-256 key size */
-#define OVPN_TLS_CRYPT_HMAC_SIZE    32	/* SHA-256 HMAC output size */
+#define OVPN_TLS_CRYPT_KEY_FILE_SIZE  256 /* OpenVPN static key file (2048 bits) */
+#define OVPN_TLS_CRYPT_KEY_SIZE	      128 /* Used portion for TLS-Crypt (1024 bits) */
+#define OVPN_TLS_CRYPT_CIPHER_SIZE    32  /* AES-256 key size */
+#define OVPN_TLS_CRYPT_HMAC_SIZE      32  /* SHA-256 HMAC output size */
+#define OVPN_TLS_CRYPT_HMAC_KEY_SIZE  32  /* OpenVPN HMAC key size (256 bits) */
 #define OVPN_TLS_CRYPT_IV_SIZE	    16	/* AES-256-CTR IV size */
 #define OVPN_TLS_CRYPT_TAG_SIZE	    OVPN_TLS_CRYPT_HMAC_SIZE
 #define OVPN_TLS_CRYPT_PACKET_ID_SIZE 4
@@ -306,12 +307,12 @@ typedef struct ovpn_tls_crypt_t_
 {
   u8 enabled;
   /* Keys used for server mode:
-   * - encrypt with server_* keys (outgoing)
-   * - decrypt with client_* keys (incoming)
+   * - encrypt with Key 0 (outgoing to client)
+   * - decrypt with Key 1 (incoming from client)
    */
-  u8 encrypt_hmac_key[OVPN_TLS_CRYPT_HMAC_SIZE];
+  u8 encrypt_hmac_key[OVPN_TLS_CRYPT_HMAC_KEY_SIZE];
   u8 encrypt_cipher_key[OVPN_TLS_CRYPT_CIPHER_SIZE];
-  u8 decrypt_hmac_key[OVPN_TLS_CRYPT_HMAC_SIZE];
+  u8 decrypt_hmac_key[OVPN_TLS_CRYPT_HMAC_KEY_SIZE];
   u8 decrypt_cipher_key[OVPN_TLS_CRYPT_CIPHER_SIZE];
 
   /* Packet ID for sending */
@@ -328,15 +329,25 @@ typedef struct ovpn_tls_crypt_t_
 
 /*
  * TLS-Crypt wrapped packet header
- * Placed at the beginning of control channel packets after wrapping
+ * OpenVPN TLS-Crypt packet format (after opcode + session_id):
+ *   [packet_id (4)] [net_time (4)] [HMAC (32)] [ciphertext]
+ *
+ * Full wire format:
+ *   opcode || session_id || packet_id || net_time || HMAC || ciphertext
+ *
+ * HMAC is computed over:
+ *   (opcode || session_id || packet_id || net_time || plaintext)
+ *
+ * IV for encryption: first 16 bytes of HMAC
  */
 typedef CLIB_PACKED (struct {
-  u8 hmac[OVPN_TLS_CRYPT_HMAC_SIZE];
   u32 packet_id;
   u32 net_time;
+  u8 hmac[OVPN_TLS_CRYPT_HMAC_SIZE];
   /* followed by encrypted control packet */
 }) ovpn_tls_crypt_header_t;
 
+/* Overhead = packet_id + net_time + HMAC */
 #define OVPN_TLS_CRYPT_OVERHEAD                                               \
   (OVPN_TLS_CRYPT_HMAC_SIZE + OVPN_TLS_CRYPT_PACKET_ID_SIZE +                 \
    OVPN_TLS_CRYPT_NET_TIME_SIZE)
@@ -610,6 +621,18 @@ int ovpn_tls_auth_parse_key (const u8 *key_data, u32 key_len,
 			     ovpn_tls_auth_t *ctx, u8 is_server);
 
 /*
+ * Compute HMAC-SHA256 for TLS-Crypt
+ *
+ * @param key   HMAC key (32 bytes)
+ * @param data  Input data
+ * @param len   Length of input data
+ * @param out   Output buffer for HMAC (32 bytes)
+ *
+ * Returns 0 on success, <0 on error
+ */
+int ovpn_tls_crypt_hmac (const u8 *key, const u8 *data, u32 len, u8 *out);
+
+/*
  * Parse TLS-Crypt key from raw key data
  * The key data should be the binary content of an OpenVPN static key file
  * Returns 0 on success, <0 on error
@@ -620,27 +643,33 @@ int ovpn_tls_crypt_parse_key (const u8 *key_data, u32 key_len,
 /*
  * Wrap (encrypt + authenticate) a control channel packet using TLS-Crypt
  *
- * Input: plaintext control packet in buf starting at offset, length plain_len
+ * Input: opcode_session (9 bytes: opcode + session_id), plaintext to encrypt
  * Output: wrapped packet written to out_buf
+ *
+ * HMAC is computed over: opcode || session_id || packet_id || net_time || ciphertext
  *
  * Returns: length of wrapped packet, or <0 on error
  */
-int ovpn_tls_crypt_wrap (const ovpn_tls_crypt_t *ctx, const u8 *plaintext,
-			 u32 plain_len, u8 *wrapped, u32 wrapped_buf_len);
+int ovpn_tls_crypt_wrap (const ovpn_tls_crypt_t *ctx, const u8 *opcode_session,
+			 const u8 *plaintext, u32 plain_len, u8 *wrapped,
+			 u32 wrapped_buf_len);
 
 /*
  * Unwrap (verify + decrypt) a control channel packet using TLS-Crypt
  *
- * Input: wrapped packet
+ * Input: opcode_session (9 bytes: opcode + session_id), wrapped packet
  * Output: plaintext control packet written to plaintext buffer
+ *
+ * HMAC is computed over: opcode || session_id || packet_id || net_time || ciphertext
  *
  * Returns: length of plaintext, or <0 on error
  *
  * Note: This function performs replay protection check and updates the
  * replay window on success.
  */
-int ovpn_tls_crypt_unwrap (ovpn_tls_crypt_t *ctx, const u8 *wrapped,
-			   u32 wrapped_len, u8 *plaintext, u32 plaintext_buf_len);
+int ovpn_tls_crypt_unwrap (ovpn_tls_crypt_t *ctx, const u8 *opcode_session,
+			   const u8 *wrapped, u32 wrapped_len, u8 *plaintext,
+			   u32 plaintext_buf_len);
 
 /*
  * Check if a packet_id has been seen (replay detection) with time validation
