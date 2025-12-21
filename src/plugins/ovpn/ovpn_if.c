@@ -120,8 +120,8 @@ ovpn_if_admin_up_down (vnet_main_t *vnm, u32 hw_if_index, u32 flags)
 
 /*
  * Adjacency midchain fixup callback for OpenVPN.
- * Called by adj-midchain-tx AFTER the rewrite (outer IP+UDP header) is applied.
- * Updates the IP length, IP checksum, and UDP length fields to match
+ * Called by adj-midchain-tx AFTER the rewrite (outer IP+UDP header) is
+ * applied. Updates the IP length, IP checksum, and UDP length fields to match
  * the actual encrypted payload size.
  */
 static void
@@ -216,7 +216,8 @@ ovpn_if_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai)
       if (peer->virtual_ip_set)
 	{
 	  /* Check if next-hop matches virtual IP */
-	  if (adj->ia_nh_proto == FIB_PROTOCOL_IP4 && !peer->virtual_ip.version)
+	  if (adj->ia_nh_proto == FIB_PROTOCOL_IP4 &&
+	      !peer->virtual_ip.version)
 	    {
 	      if (ip4_address_compare (&adj->sub_type.nbr.next_hop.ip4,
 				       &peer->virtual_ip.ip.ip4) == 0)
@@ -255,9 +256,9 @@ ovpn_if_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai)
 	   * Direct the adjacency to the OpenVPN output node for encryption.
 	   * This ensures packets go through encryption before being sent out.
 	   */
-	  u32 output_node_index =
-	    (adj->ia_nh_proto == FIB_PROTOCOL_IP4) ? ovpn4_output_node.index :
-						    ovpn6_output_node.index;
+	  u32 output_node_index = (adj->ia_nh_proto == FIB_PROTOCOL_IP4) ?
+				    ovpn4_output_node.index :
+				    ovpn6_output_node.index;
 	  adj_nbr_midchain_update_next_node (ai, output_node_index);
 
 	  /* Stack the adjacency on the path to reach the peer's endpoint */
@@ -343,9 +344,10 @@ ovpn_if_create (vlib_main_t *vm __attribute__ ((unused)), u8 *name, u8 is_tun,
   oif->is_tun = is_tun;
 
   /* Store custom interface name */
-  if (name && vec_len (name) > 0)
+  if (name && name[0] != 0)
     {
-      oif->name = vec_dup (name);
+      /* Use format to copy the name as a vec (name may be a plain string) */
+      oif->name = format (0, "%s", name);
     }
   else
     {
@@ -361,7 +363,8 @@ ovpn_if_create (vlib_main_t *vm __attribute__ ((unused)), u8 *name, u8 is_tun,
 
   if (is_tun)
     {
-      /* TUN mode - create as hardware interface with ovpn_hw_interface_class */
+      /* TUN mode - create as hardware interface with ovpn_hw_interface_class
+       */
       vnet_hw_interface_t *hi;
 
       hw_if_index =

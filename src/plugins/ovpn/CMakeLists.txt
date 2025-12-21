@@ -26,6 +26,7 @@ add_vpp_plugin(ovpn
   SOURCES
   ovpn.c
   ovpn_options.c
+  ovpn_config.c
   ovpn_if.c
   ovpn_reliable.c
   ovpn_ssl.c
@@ -35,10 +36,15 @@ add_vpp_plugin(ovpn
   ovpn_handshake.c
   ovpn_input.c
   ovpn_output.c
+  ovpn_api.c
+
+  API_FILES
+  ovpn.api
 
   INSTALL_HEADERS
   ovpn.h
   ovpn_options.h
+  ovpn_config.h
   ovpn_if.h
   ovpn_buffer.h
   ovpn_reliable.h

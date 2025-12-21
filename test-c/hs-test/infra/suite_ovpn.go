@@ -52,19 +52,82 @@ func (s *OvpnSuite) SetupSuite() {
 func (s *OvpnSuite) SetupTest() {
 	s.HstSuite.SetupTest()
 
-	// Configure VPP with OpenVPN plugin
-	vpp, _ := s.Containers.Vpp.newVppInstance(s.Containers.Vpp.AllocatedCpus)
+	if *DryRun {
+		s.LogStartedContainers()
+		s.Skip("Dry run mode = true")
+	}
+}
 
+// StartVppWithOvpnConfig starts VPP with an OpenVPN configuration in startup.conf
+func (s *OvpnSuite) StartVppWithOvpnConfig(ovpnConfig Stanza) {
+	vpp, _ := s.Containers.Vpp.newVppInstance(s.Containers.Vpp.AllocatedCpus, ovpnConfig)
 	s.AssertNil(vpp.Start())
 
 	// Create TAP interfaces in VPP
 	s.AssertNil(vpp.CreateTap(s.Interfaces.Tap, false, 1), "failed to create inner tap interface")
 	s.AssertNil(vpp.CreateTap(s.Interfaces.OvpnTap, false, 2), "failed to create ovpn tap interface")
+}
 
-	if *DryRun {
-		s.LogStartedContainers()
-		s.Skip("Dry run mode = true")
-	}
+// StartVppBasic starts VPP without OpenVPN configuration (for basic tests)
+func (s *OvpnSuite) StartVppBasic() {
+	vpp, _ := s.Containers.Vpp.newVppInstance(s.Containers.Vpp.AllocatedCpus)
+	s.AssertNil(vpp.Start())
+
+	// Create TAP interfaces in VPP
+	s.AssertNil(vpp.CreateTap(s.Interfaces.Tap, false, 1), "failed to create inner tap interface")
+	s.AssertNil(vpp.CreateTap(s.Interfaces.OvpnTap, false, 2), "failed to create ovpn tap interface")
+}
+
+// GetOvpnStaticKeyConfig returns a Stanza for OpenVPN static key mode
+func (s *OvpnSuite) GetOvpnStaticKeyConfig(instanceName, keyPath string) Stanza {
+	var config Stanza
+	config.NewStanza("openvpn").
+		NewStanza(fmt.Sprintf("instance %s", instanceName)).
+		Append(fmt.Sprintf("local %s", s.VppOvpnAddr())).
+		Append(fmt.Sprintf("port %s", s.Ports.Ovpn)).
+		Append("dev ovpn0").
+		Append("dev-type tun").
+		Append(fmt.Sprintf("secret %s", keyPath)).
+		Append("cipher AES-256-CBC").
+		Close().
+		Close()
+	return config
+}
+
+// GetOvpnTlsAuthConfig returns a Stanza for OpenVPN TLS-Auth mode
+func (s *OvpnSuite) GetOvpnTlsAuthConfig(instanceName string) Stanza {
+	var config Stanza
+	config.NewStanza("openvpn").
+		NewStanza(fmt.Sprintf("instance %s", instanceName)).
+		Append(fmt.Sprintf("local %s", s.VppOvpnAddr())).
+		Append(fmt.Sprintf("port %s", s.Ports.Ovpn)).
+		Append("dev ovpn0").
+		Append("dev-type tun").
+		Append("ca /tmp/ca.crt").
+		Append("cert /tmp/server.crt").
+		Append("key /tmp/server.key").
+		Append("tls-auth /tmp/ta.key").
+		Close().
+		Close()
+	return config
+}
+
+// GetOvpnTlsCryptConfig returns a Stanza for OpenVPN TLS-Crypt mode
+func (s *OvpnSuite) GetOvpnTlsCryptConfig(instanceName string) Stanza {
+	var config Stanza
+	config.NewStanza("openvpn").
+		NewStanza(fmt.Sprintf("instance %s", instanceName)).
+		Append(fmt.Sprintf("local %s", s.VppOvpnAddr())).
+		Append(fmt.Sprintf("port %s", s.Ports.Ovpn)).
+		Append("dev ovpn0").
+		Append("dev-type tun").
+		Append("ca /tmp/ca.crt").
+		Append("cert /tmp/server.crt").
+		Append("key /tmp/server.key").
+		Append("tls-crypt /tmp/tc.key").
+		Close().
+		Close()
+	return config
 }
 
 func (s *OvpnSuite) TeardownTest() {
@@ -110,22 +173,14 @@ func (s *OvpnSuite) TunnelClientIP() string {
 	return "10.8.0.2"
 }
 
-// ConfigureVppOvpn configures the OpenVPN plugin in VPP
-func (s *OvpnSuite) ConfigureVppOvpn() {
+// ConfigureOvpnInterface configures the OpenVPN interface IP address and state
+func (s *OvpnSuite) ConfigureOvpnInterface() {
 	vpp := s.Containers.Vpp.VppInstance
 
-	// Create OpenVPN interface
-	// ovpn create local <ip> port <port> [secret <key>]
-	cmd := fmt.Sprintf("ovpn create local %s port %s",
-		s.VppOvpnAddr(), s.Ports.Ovpn)
+	// Configure tunnel IP address
+	cmd := fmt.Sprintf("set interface ip address ovpn0 %s/24", s.TunnelServerIP())
 	s.Log("VPP command: " + cmd)
 	result := vpp.Vppctl(cmd)
-	s.Log("Result: " + result)
-
-	// Configure tunnel IP address
-	cmd = fmt.Sprintf("set interface ip address ovpn0 %s/24", s.TunnelServerIP())
-	s.Log("VPP command: " + cmd)
-	result = vpp.Vppctl(cmd)
 	s.Log("Result: " + result)
 
 	// Bring up the interface
@@ -140,26 +195,20 @@ func (s *OvpnSuite) CopyStaticKeyToVpp() {
 	s.Containers.Vpp.CreateFile("/tmp/static.key", string(staticKey))
 }
 
-// ConfigureVppOvpnStaticKey configures VPP OpenVPN with static key
-func (s *OvpnSuite) ConfigureVppOvpnStaticKey(keyFile string) {
-	vpp := s.Containers.Vpp.VppInstance
+// SetupVppOvpnStaticKey sets up VPP with OpenVPN static key mode via startup.conf
+func (s *OvpnSuite) SetupVppOvpnStaticKey(keyFile string) {
+	// Copy static key to container before VPP starts
+	s.CopyStaticKeyToVpp()
 
-	// Create OpenVPN interface with static key
-	cmd := fmt.Sprintf("ovpn create local %s port %s secret %s",
-		s.VppOvpnAddr(), s.Ports.Ovpn, keyFile)
-	s.Log("VPP command: " + cmd)
-	result := vpp.Vppctl(cmd)
-	s.Log("Result: " + result)
+	// Get OpenVPN configuration for startup.conf
+	ovpnConfig := s.GetOvpnStaticKeyConfig("static-key-server", keyFile)
+	s.Log("OpenVPN startup config:\n" + ovpnConfig.ToString())
 
-	// Configure tunnel IP address
-	cmd = fmt.Sprintf("set interface ip address ovpn0 %s/24", s.TunnelServerIP())
-	s.Log("VPP command: " + cmd)
-	result = vpp.Vppctl(cmd)
-	s.Log("Result: " + result)
+	// Start VPP with OpenVPN configuration
+	s.StartVppWithOvpnConfig(ovpnConfig)
 
-	// Bring up the interface
-	result = vpp.Vppctl("set interface state ovpn0 up")
-	s.Log("Interface state: " + result)
+	// Configure interface IP and state
+	s.ConfigureOvpnInterface()
 }
 
 // CreateOpenVpnClientConfig creates the OpenVPN client configuration
@@ -274,27 +323,21 @@ func (s *OvpnSuite) CopyTlsAuthKeyToVpp() {
 	s.Containers.Vpp.CreateFile("/tmp/ta.key", string(taKey))
 }
 
-// ConfigureVppOvpnTlsAuth configures VPP OpenVPN with TLS-Auth mode
-func (s *OvpnSuite) ConfigureVppOvpnTlsAuth() {
-	vpp := s.Containers.Vpp.VppInstance
+// SetupVppOvpnTlsAuth sets up VPP with OpenVPN TLS-Auth mode via startup.conf
+func (s *OvpnSuite) SetupVppOvpnTlsAuth() {
+	// Copy TLS certificates and keys to container before VPP starts
+	s.CopyTlsCertsToVpp()
+	s.CopyTlsAuthKeyToVpp()
 
-	// Create OpenVPN interface with TLS-Auth
-	// Format: ovpn create local <ip> port <port> ca <cert> cert <cert> key <key> tls-auth <key>
-	cmd := fmt.Sprintf("ovpn create local %s port %s ca /tmp/ca.crt cert /tmp/server.crt key /tmp/server.key tls-auth /tmp/ta.key",
-		s.VppOvpnAddr(), s.Ports.Ovpn)
-	s.Log("VPP command: " + cmd)
-	result := vpp.Vppctl(cmd)
-	s.Log("Result: " + result)
+	// Get OpenVPN TLS-Auth configuration for startup.conf
+	ovpnConfig := s.GetOvpnTlsAuthConfig("tls-auth-server")
+	s.Log("OpenVPN startup config:\n" + ovpnConfig.ToString())
 
-	// Configure tunnel IP address
-	cmd = fmt.Sprintf("set interface ip address ovpn0 %s/24", s.TunnelServerIP())
-	s.Log("VPP command: " + cmd)
-	result = vpp.Vppctl(cmd)
-	s.Log("Result: " + result)
+	// Start VPP with OpenVPN configuration
+	s.StartVppWithOvpnConfig(ovpnConfig)
 
-	// Bring up the interface
-	result = vpp.Vppctl("set interface state ovpn0 up")
-	s.Log("Interface state: " + result)
+	// Configure interface IP and state
+	s.ConfigureOvpnInterface()
 }
 
 // CreateOpenVpnTlsAuthClientConfig creates the OpenVPN TLS-Auth client configuration
@@ -350,27 +393,21 @@ func (s *OvpnSuite) CopyTlsCryptKeyToVpp() {
 	s.Containers.Vpp.CreateFile("/tmp/tc.key", string(tcKey))
 }
 
-// ConfigureVppOvpnTlsCrypt configures VPP OpenVPN with TLS-Crypt mode
-func (s *OvpnSuite) ConfigureVppOvpnTlsCrypt() {
-	vpp := s.Containers.Vpp.VppInstance
+// SetupVppOvpnTlsCrypt sets up VPP with OpenVPN TLS-Crypt mode via startup.conf
+func (s *OvpnSuite) SetupVppOvpnTlsCrypt() {
+	// Copy TLS certificates and keys to container before VPP starts
+	s.CopyTlsCertsToVpp()
+	s.CopyTlsCryptKeyToVpp()
 
-	// Create OpenVPN interface with TLS-Crypt
-	// Format: ovpn create local <ip> port <port> ca <cert> cert <cert> key <key> tls-crypt <key>
-	cmd := fmt.Sprintf("ovpn create local %s port %s ca /tmp/ca.crt cert /tmp/server.crt key /tmp/server.key tls-crypt /tmp/tc.key",
-		s.VppOvpnAddr(), s.Ports.Ovpn)
-	s.Log("VPP command: " + cmd)
-	result := vpp.Vppctl(cmd)
-	s.Log("Result: " + result)
+	// Get OpenVPN TLS-Crypt configuration for startup.conf
+	ovpnConfig := s.GetOvpnTlsCryptConfig("tls-crypt-server")
+	s.Log("OpenVPN startup config:\n" + ovpnConfig.ToString())
 
-	// Configure tunnel IP address
-	cmd = fmt.Sprintf("set interface ip address ovpn0 %s/24", s.TunnelServerIP())
-	s.Log("VPP command: " + cmd)
-	result = vpp.Vppctl(cmd)
-	s.Log("Result: " + result)
+	// Start VPP with OpenVPN configuration
+	s.StartVppWithOvpnConfig(ovpnConfig)
 
-	// Bring up the interface
-	result = vpp.Vppctl("set interface state ovpn0 up")
-	s.Log("Interface state: " + result)
+	// Configure interface IP and state
+	s.ConfigureOvpnInterface()
 }
 
 // CreateOpenVpnTlsCryptClientConfig creates the OpenVPN TLS-Crypt client configuration

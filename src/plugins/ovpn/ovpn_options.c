@@ -115,7 +115,8 @@ ovpn_options_parse_client_ifconfig (const char *options_string,
   clib_memset (virtual_ip, 0, sizeof (*virtual_ip));
 
   /* Try IPv4 ifconfig first */
-  ifconfig_value = ovpn_options_string_extract_option (options_string, "ifconfig");
+  ifconfig_value =
+    ovpn_options_string_extract_option (options_string, "ifconfig");
   if (ifconfig_value)
     {
       /*
@@ -210,7 +211,8 @@ ovpn_options_parse_client_ifconfig (const char *options_string,
  * @return 1 if IP is within range, 0 otherwise
  */
 int
-ovpn_options_ip_in_pool (const ip_address_t *ip, const ip_address_t *pool_start,
+ovpn_options_ip_in_pool (const ip_address_t *ip,
+			 const ip_address_t *pool_start,
 			 const ip_address_t *pool_end)
 {
   if (!ip || !pool_start || !pool_end)
@@ -221,8 +223,7 @@ ovpn_options_ip_in_pool (const ip_address_t *ip, const ip_address_t *pool_start,
     return 1; /* No pool configured, accept any IP */
 
   /* Version must match */
-  if (ip->version != pool_start->version ||
-      ip->version != pool_end->version)
+  if (ip->version != pool_start->version || ip->version != pool_end->version)
     return 0;
 
   if (ip->version == AF_IP4)
@@ -264,7 +265,8 @@ ovpn_options_init (ovpn_options_t *opts)
   opts->proto = IP_PROTOCOL_UDP;
 
   /* Tunnel device related */
-  opts->dev_name = "tun0";
+  opts->dev_name =
+    0; /* Will be set to "tun0" default in ovpn_if_create if NULL */
   opts->sw_if_index = ~0;
   opts->mtu = 1420;
   opts->is_tun = 1;
@@ -329,8 +331,9 @@ ovpn_options_string_build_server (char *buf, u32 buf_len,
    */
 
   /* Start with version and basic tunnel options */
-  written = snprintf (buf + offset, buf_len - offset,
-		      "V4,dev-type tun,link-mtu 1559,tun-mtu 1500,proto UDPv4");
+  written =
+    snprintf (buf + offset, buf_len - offset,
+	      "V4,dev-type tun,link-mtu 1559,tun-mtu 1500,proto UDPv4");
   if (written < 0 || (u32) written >= buf_len - offset)
     return -2;
   offset += written;
@@ -618,18 +621,18 @@ ovpn_setup_static_key_crypto (ovpn_crypto_context_t *ctx,
   if (direction == 0)
     {
       /* Server: encrypt with keys[0], decrypt with keys[1] */
-      cipher_encrypt_offset = 0;    /* keys[0].cipher */
-      hmac_encrypt_offset = 64;     /* keys[0].hmac */
-      cipher_decrypt_offset = 128;  /* keys[1].cipher */
-      hmac_decrypt_offset = 192;    /* keys[1].hmac */
+      cipher_encrypt_offset = 0;   /* keys[0].cipher */
+      hmac_encrypt_offset = 64;	   /* keys[0].hmac */
+      cipher_decrypt_offset = 128; /* keys[1].cipher */
+      hmac_decrypt_offset = 192;   /* keys[1].hmac */
     }
   else
     {
       /* Client: encrypt with keys[1], decrypt with keys[0] */
-      cipher_encrypt_offset = 128;  /* keys[1].cipher */
-      hmac_encrypt_offset = 192;    /* keys[1].hmac */
-      cipher_decrypt_offset = 0;    /* keys[0].cipher */
-      hmac_decrypt_offset = 64;     /* keys[0].hmac */
+      cipher_encrypt_offset = 128; /* keys[1].cipher */
+      hmac_encrypt_offset = 192;   /* keys[1].hmac */
+      cipher_decrypt_offset = 0;   /* keys[0].cipher */
+      hmac_decrypt_offset = 64;	   /* keys[0].hmac */
     }
 
   /* Set key size based on cipher */
