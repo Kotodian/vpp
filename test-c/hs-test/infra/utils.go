@@ -80,8 +80,8 @@ func (c *Stanza) Append(name string) *Stanza {
 }
 
 func (c *Stanza) Close() *Stanza {
-	c.content += "}\n"
 	c.pad -= 2
+	c.content += strings.Repeat(" ", c.pad) + "}\n"
 	return c
 }
 
