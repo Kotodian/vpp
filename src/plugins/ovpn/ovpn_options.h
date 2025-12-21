@@ -24,6 +24,44 @@
 #define OVPN_DEFAULT_SEQ_BACKTRACK  64
 #define OVPN_DEFAULT_TIME_BACKTRACK 15
 
+/* Maximum number of push options */
+#define OVPN_MAX_PUSH_OPTIONS 64
+
+/* Maximum number of data ciphers */
+#define OVPN_MAX_DATA_CIPHERS 16
+
+/* Maximum number of DNS servers */
+#define OVPN_MAX_DNS_SERVERS 4
+
+/*
+ * DHCP option types for dhcp-option directive
+ */
+typedef enum ovpn_dhcp_option_type_t_
+{
+  OVPN_DHCP_OPTION_DNS = 0,
+  OVPN_DHCP_OPTION_WINS,
+  OVPN_DHCP_OPTION_DOMAIN,
+  OVPN_DHCP_OPTION_DOMAIN_SEARCH,
+  OVPN_DHCP_OPTION_NTP,
+  OVPN_DHCP_OPTION_NBDD,
+  OVPN_DHCP_OPTION_NBT,
+  OVPN_DHCP_OPTION_DISABLE_NBT,
+} ovpn_dhcp_option_type_t;
+
+/*
+ * Single DHCP option entry
+ */
+typedef struct ovpn_dhcp_option_t_
+{
+  ovpn_dhcp_option_type_t type;
+  union
+  {
+    ip_address_t ip; /* For DNS, WINS, NTP, NBDD */
+    u8 *string;	     /* For DOMAIN, DOMAIN_SEARCH */
+    u8 nbt_type;     /* For NBT (1=b-node, 2=p-node, 4=m-node, 8=h-node) */
+  };
+} ovpn_dhcp_option_t;
+
 typedef struct ovpn_options_t_
 {
 
@@ -53,12 +91,13 @@ typedef struct ovpn_options_t_
   u32 replay_time;
 
   /* Negotiation */
-  u32 renegotiate_seconds;  /* Renegotiate data channel key after n seconds */
-  u64 renegotiate_bytes;    /* Renegotiate after n bytes transferred (0=disabled) */
-  u64 renegotiate_packets;  /* Renegotiate after n packets (0=disabled) */
-  u32 handshake_window;     /* TLS handshake must complete within n seconds */
-  u32 transition_window;    /* Old key allowed to live n seconds after new key */
-  u32 tls_timeout;          /* Control channel packet retransmit timeout */
+  u32 renegotiate_seconds; /* Renegotiate data channel key after n seconds */
+  u64
+    renegotiate_bytes; /* Renegotiate after n bytes transferred (0=disabled) */
+  u64 renegotiate_packets; /* Renegotiate after n packets (0=disabled) */
+  u32 handshake_window;	   /* TLS handshake must complete within n seconds */
+  u32 transition_window; /* Old key allowed to live n seconds after new key */
+  u32 tls_timeout;	 /* Control channel packet retransmit timeout */
 
   /* Client*/
   ip_address_t pool_start;
@@ -71,13 +110,51 @@ typedef struct ovpn_options_t_
 
   /* Optional*/
   u8 *tls_crypt_key;
-  u8 *tls_crypt_v2_key;  /* TLS-Crypt-V2 server key */
+  u8 *tls_crypt_v2_key; /* TLS-Crypt-V2 server key */
   u8 *tls_auth_key;
 
   /* Static key mode (--secret) */
-  u8 *static_key;	     /* Raw static key data (256 bytes) */
-  u8 static_key_direction;   /* 0 = normal, 1 = inverse */
-  u8 static_key_mode;	     /* 1 if using static key mode */
+  u8 *static_key;	   /* Raw static key data (256 bytes) */
+  u8 static_key_direction; /* 0 = normal, 1 = inverse */
+  u8 static_key_mode;	   /* 1 if using static key mode */
+
+  /*
+   * Push options (--push "option")
+   * Array of strings to push to clients during connection
+   */
+  u8 **push_options; /* vec of vec strings */
+  u32 n_push_options;
+
+  /*
+   * DHCP options (--dhcp-option)
+   * These are pushed to clients for network configuration
+   */
+  ovpn_dhcp_option_t *dhcp_options; /* vec of dhcp options */
+  u32 n_dhcp_options;
+
+  /*
+   * Data channel cipher negotiation (--data-ciphers)
+   * List of acceptable ciphers in order of preference
+   * OpenVPN 2.5+ uses NCP (Negotiable Crypto Parameters)
+   */
+  u8 **data_ciphers; /* vec of cipher name strings */
+  u32 n_data_ciphers;
+  u8 *data_ciphers_fallback; /* Fallback cipher if negotiation fails */
+
+  /*
+   * Route push options
+   */
+  fib_prefix_t *push_routes; /* vec of routes to push */
+  u32 n_push_routes;
+  u8 redirect_gateway;	     /* Push redirect-gateway to clients */
+  u8 redirect_gateway_flags; /* def1, local, autolocal, bypass-dhcp, bypass-dns
+			      */
+
+  /*
+   * Client-to-client routing
+   */
+  u8 client_to_client; /* Allow clients to reach each other */
+
 } ovpn_options_t;
 
 /* Static key size: 256 bytes (2048 bits) */
@@ -138,7 +215,8 @@ char *ovpn_options_string_extract_option (const char *options_string,
  */
 int ovpn_options_string_build_server (char *buf, u32 buf_len,
 				      const char *cipher_name, u8 use_tls_ekm,
-				      u32 peer_id, const ip_address_t *virtual_ip,
+				      u32 peer_id,
+				      const ip_address_t *virtual_ip,
 				      const ip_address_t *virtual_netmask);
 
 /**
@@ -171,6 +249,104 @@ int ovpn_options_parse_client_ifconfig (const char *options_string,
 int ovpn_options_ip_in_pool (const ip_address_t *ip,
 			     const ip_address_t *pool_start,
 			     const ip_address_t *pool_end);
+
+/**
+ * Add a push option
+ *
+ * @param opts Options structure
+ * @param option Option string to push (will be copied)
+ * @return 0 on success, <0 on error
+ */
+int ovpn_options_add_push (ovpn_options_t *opts, const char *option);
+
+/**
+ * Add a DHCP option
+ *
+ * @param opts Options structure
+ * @param type DHCP option type
+ * @param value Value (IP address or string depending on type)
+ * @return 0 on success, <0 on error
+ */
+int ovpn_options_add_dhcp_option (ovpn_options_t *opts,
+				  ovpn_dhcp_option_type_t type,
+				  const void *value);
+
+/**
+ * Add a DNS server (convenience wrapper for dhcp-option DNS)
+ *
+ * @param opts Options structure
+ * @param dns_ip DNS server IP address
+ * @return 0 on success, <0 on error
+ */
+int ovpn_options_add_dns (ovpn_options_t *opts, const ip_address_t *dns_ip);
+
+/**
+ * Set the domain name (convenience wrapper for dhcp-option DOMAIN)
+ *
+ * @param opts Options structure
+ * @param domain Domain name string
+ * @return 0 on success, <0 on error
+ */
+int ovpn_options_set_domain (ovpn_options_t *opts, const char *domain);
+
+/**
+ * Add a data cipher to the negotiation list
+ *
+ * @param opts Options structure
+ * @param cipher_name Cipher name (e.g., "AES-256-GCM")
+ * @return 0 on success, <0 on error
+ */
+int ovpn_options_add_data_cipher (ovpn_options_t *opts,
+				  const char *cipher_name);
+
+/**
+ * Set data ciphers from a colon-separated string
+ *
+ * @param opts Options structure
+ * @param cipher_list Colon-separated list of ciphers (e.g.,
+ * "AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305")
+ * @return 0 on success, <0 on error
+ */
+int ovpn_options_set_data_ciphers (ovpn_options_t *opts,
+				   const char *cipher_list);
+
+/**
+ * Add a route to push to clients
+ *
+ * @param opts Options structure
+ * @param prefix Route prefix to push
+ * @return 0 on success, <0 on error
+ */
+int ovpn_options_add_push_route (ovpn_options_t *opts,
+				 const fib_prefix_t *prefix);
+
+/**
+ * Build push options string for sending to client
+ *
+ * @param opts Options structure
+ * @param buf Output buffer
+ * @param buf_len Buffer length
+ * @return Length written, or <0 on error
+ */
+int ovpn_options_build_push_reply (const ovpn_options_t *opts, char *buf,
+				   u32 buf_len);
+
+/**
+ * Free all dynamically allocated options (push, dhcp, ciphers, routes)
+ *
+ * @param opts Options structure
+ */
+void ovpn_options_free_dynamic (ovpn_options_t *opts);
+
+/**
+ * Negotiate cipher from client's IV_CIPHERS list
+ *
+ * @param opts Server options with data_ciphers list
+ * @param client_ciphers Client's cipher list (colon-separated)
+ * @return Negotiated cipher name (static string), or NULL if no match
+ */
+const char *ovpn_options_negotiate_cipher (const ovpn_options_t *opts,
+					   const char *client_ciphers);
 
 #endif /* __included_ovpn_options_h__ */
 

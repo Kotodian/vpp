@@ -52,12 +52,10 @@
 #define OVPN_CONTROL_BUF_SIZE 2048
 
 /* Forward declarations */
-static int ovpn_handshake_send_pending_packets (vlib_main_t *vm,
-						ovpn_pending_connection_t *pending,
-						const ip_address_t *local_addr,
-						u16 local_port, u8 is_ip6,
-						ovpn_tls_auth_t *auth,
-						ovpn_tls_crypt_t *tls_crypt);
+static int ovpn_handshake_send_pending_packets (
+  vlib_main_t *vm, ovpn_pending_connection_t *pending,
+  const ip_address_t *local_addr, u16 local_port, u8 is_ip6,
+  ovpn_tls_auth_t *auth, ovpn_tls_crypt_t *tls_crypt);
 
 static int ovpn_handshake_send_peer_packets (vlib_main_t *vm,
 					     ovpn_peer_t *peer,
@@ -316,10 +314,9 @@ ovpn_handshake_send_server_reset (vlib_main_t *vm,
     return -1;
 
   /* Build control header with ACK for client's HARD_RESET */
-  if (ovpn_build_control_header (buf, opcode, pending->key_id,
-				 &pending->local_session_id,
-				 &pending->recv_ack,
-				 &pending->remote_session_id) < 0)
+  if (ovpn_build_control_header (
+	buf, opcode, pending->key_id, &pending->local_session_id,
+	&pending->recv_ack, &pending->remote_session_id) < 0)
     return -1;
 
   /* Mark as active for retransmission */
@@ -448,17 +445,20 @@ ovpn_tls_auth_unwrap (ovpn_tls_auth_t *ctx, const u8 *wrapped, u32 wrapped_len,
       return -1;
     }
 
-  /*
-   * OpenVPN TLS-Auth wire format:
-   * Input:  [opcode(1)] [session_id(8)] [HMAC(32)] [packet_id(4)] [net_time(4)] [ack_array] [msg_pkt_id(4)] [TLS_payload]
-   * Output: [opcode(1)] [session_id(8)] [ack_array] [msg_pkt_id(4)] [TLS_payload]
-   *
-   * HMAC covers (reordered): [packet_id] [net_time] [opcode] [session_id] [ack_array] [msg_pkt_id] [TLS_payload]
-   */
+    /*
+     * OpenVPN TLS-Auth wire format:
+     * Input:  [opcode(1)] [session_id(8)] [HMAC(32)] [packet_id(4)]
+     * [net_time(4)] [ack_array] [msg_pkt_id(4)] [TLS_payload] Output:
+     * [opcode(1)] [session_id(8)] [ack_array] [msg_pkt_id(4)] [TLS_payload]
+     *
+     * HMAC covers (reordered): [packet_id] [net_time] [opcode] [session_id]
+     * [ack_array] [msg_pkt_id] [TLS_payload]
+     */
 
-  /*
-   * Minimum size: opcode(1) + session_id(8) + HMAC(32) + packet_id(4) + net_time(4) = 49 bytes
-   */
+    /*
+     * Minimum size: opcode(1) + session_id(8) + HMAC(32) + packet_id(4) +
+     * net_time(4) = 49 bytes
+     */
 #define OVPN_TLS_AUTH_MIN_SIZE                                                \
   (1 + OVPN_SESSION_ID_SIZE + OVPN_HMAC_SIZE + OVPN_TLS_AUTH_PACKET_ID_SIZE + \
    OVPN_TLS_AUTH_NET_TIME_SIZE)
@@ -466,10 +466,10 @@ ovpn_tls_auth_unwrap (ovpn_tls_auth_t *ctx, const u8 *wrapped, u32 wrapped_len,
   if (wrapped_len < OVPN_TLS_AUTH_MIN_SIZE)
     return -2;
 
-  /* Plaintext = opcode + session_id + rest (everything except HMAC + packet_id + net_time) */
-  plain_len =
-    wrapped_len - (OVPN_HMAC_SIZE + OVPN_TLS_AUTH_PACKET_ID_SIZE +
-		   OVPN_TLS_AUTH_NET_TIME_SIZE);
+  /* Plaintext = opcode + session_id + rest (everything except HMAC + packet_id
+   * + net_time) */
+  plain_len = wrapped_len - (OVPN_HMAC_SIZE + OVPN_TLS_AUTH_PACKET_ID_SIZE +
+			     OVPN_TLS_AUTH_NET_TIME_SIZE);
   if (plaintext_buf_len < plain_len)
     return -2;
 
@@ -480,7 +480,8 @@ ovpn_tls_auth_unwrap (ovpn_tls_auth_t *ctx, const u8 *wrapped, u32 wrapped_len,
 
   /*
    * Parse packet structure:
-   *   [opcode(1)] [session_id(8)] [HMAC(32)] [packet_id(4)] [net_time(4)] [rest...]
+   *   [opcode(1)] [session_id(8)] [HMAC(32)] [packet_id(4)] [net_time(4)]
+   * [rest...]
    */
   u8 opcode = wrapped[0];
   const u8 *session_id = wrapped + 1;
@@ -509,15 +510,16 @@ ovpn_tls_auth_unwrap (ovpn_tls_auth_t *ctx, const u8 *wrapped, u32 wrapped_len,
    * Build HMAC input: packet_id || net_time || opcode || session_id || rest
    *
    * OpenVPN reorders the packet for HMAC calculation:
-   * - Wire format: opcode || session_id || HMAC || packet_id || net_time || rest
+   * - Wire format: opcode || session_id || HMAC || packet_id || net_time ||
+   * rest
    * - HMAC covers: packet_id || net_time || opcode || session_id || rest
    */
   u8 *h = hmac_input;
-  clib_memcpy_fast (h, pkt_id_ptr, 4);	   /* packet_id (network order) */
+  clib_memcpy_fast (h, pkt_id_ptr, 4); /* packet_id (network order) */
   h += 4;
   clib_memcpy_fast (h, net_time_ptr, 4); /* net_time (network order) */
   h += 4;
-  *h++ = opcode;			   /* opcode byte */
+  *h++ = opcode; /* opcode byte */
   clib_memcpy_fast (h, session_id, OVPN_SESSION_ID_SIZE);
   h += OVPN_SESSION_ID_SIZE;
   clib_memcpy_fast (h, rest, rest_len);
@@ -540,8 +542,8 @@ ovpn_tls_auth_unwrap (ovpn_tls_auth_t *ctx, const u8 *wrapped, u32 wrapped_len,
   ovpn_tls_auth_update_replay (ctx, packet_id, net_time);
 
   /*
-   * Copy plaintext: opcode || session_id || rest (ack_array, packet_id, payload)
-   * This reconstructs the control packet without the TLS-Auth wrapper
+   * Copy plaintext: opcode || session_id || rest (ack_array, packet_id,
+   * payload) This reconstructs the control packet without the TLS-Auth wrapper
    */
   plaintext[0] = opcode;
   clib_memcpy_fast (plaintext + 1, session_id, OVPN_SESSION_ID_SIZE);
@@ -576,10 +578,12 @@ ovpn_tls_auth_wrap (ovpn_tls_auth_t *ctx, const u8 *plaintext, u32 plain_len,
 
   /*
    * OpenVPN TLS-Auth wire format:
-   * Input:  [opcode(1)] [session_id(8)] [ack_array] [msg_pkt_id(4)] [TLS_payload]
-   * Output: [opcode(1)] [session_id(8)] [HMAC(32)] [packet_id(4)] [net_time(4)] [ack_array] [msg_pkt_id(4)] [TLS_payload]
+   * Input:  [opcode(1)] [session_id(8)] [ack_array] [msg_pkt_id(4)]
+   * [TLS_payload] Output: [opcode(1)] [session_id(8)] [HMAC(32)]
+   * [packet_id(4)] [net_time(4)] [ack_array] [msg_pkt_id(4)] [TLS_payload]
    *
-   * HMAC covers (reordered): [packet_id] [net_time] [opcode] [session_id] [ack_array] [msg_pkt_id] [TLS_payload]
+   * HMAC covers (reordered): [packet_id] [net_time] [opcode] [session_id]
+   * [ack_array] [msg_pkt_id] [TLS_payload]
    */
 
   /* Input must have at least opcode + session_id */
@@ -1082,7 +1086,8 @@ done:
  * Wrap (authenticate + encrypt) a control channel packet using TLS-Crypt
  *
  * OpenVPN TLS-Crypt wrap process (from ssl_pkt.c and tls_crypt.c):
- *   1. Compute HMAC over: opcode || session_id || packet_id || net_time || plaintext
+ *   1. Compute HMAC over: opcode || session_id || packet_id || net_time ||
+ * plaintext
  *   2. Use first 16 bytes of HMAC as IV for encryption
  *   3. Encrypt plaintext using that IV
  *   4. Output: packet_id || net_time || HMAC || ciphertext
@@ -1103,7 +1108,8 @@ ovpn_tls_crypt_wrap (const ovpn_tls_crypt_t *ctx, const u8 *opcode_session,
 		     u32 wrapped_buf_len)
 {
   u8 iv[OVPN_TLS_CRYPT_IV_SIZE];
-  u8 hmac_input[2048 + 17]; /* opcode(1) + session_id(8) + packet_id(4) + net_time(4) + plaintext */
+  u8 hmac_input[2048 + 17]; /* opcode(1) + session_id(8) + packet_id(4) +
+			       net_time(4) + plaintext */
   u32 hmac_input_len;
   u32 wrapped_len;
   u8 *encrypted;
@@ -1134,14 +1140,17 @@ ovpn_tls_crypt_wrap (const ovpn_tls_crypt_t *ctx, const u8 *opcode_session,
 
   /*
    * Step 1: Build HMAC input per OpenVPN TLS-Crypt specification:
-   *   HMAC = HMAC-SHA256(Ka, opcode || session_id || packet_id || net_time || plaintext)
+   *   HMAC = HMAC-SHA256(Ka, opcode || session_id || packet_id || net_time ||
+   * plaintext)
    *
    * This matches OpenVPN's TLS_CRYPT_OFF_TAG (17 bytes) + plaintext.
    * See: ssl_pkt.c tls_wrap_control() and tls_crypt.c tls_crypt_wrap()
    */
-  clib_memcpy_fast (hmac_input, opcode_session, 9);	   /* opcode + session_id */
-  clib_memcpy_fast (hmac_input + 9, &hdr->packet_id, 4);   /* packet_id (network order) */
-  clib_memcpy_fast (hmac_input + 13, &hdr->net_time, 4);   /* net_time (network order) */
+  clib_memcpy_fast (hmac_input, opcode_session, 9); /* opcode + session_id */
+  clib_memcpy_fast (hmac_input + 9, &hdr->packet_id,
+		    4); /* packet_id (network order) */
+  clib_memcpy_fast (hmac_input + 13, &hdr->net_time,
+		    4); /* net_time (network order) */
   clib_memcpy_fast (hmac_input + 17, plaintext, plain_len); /* plaintext */
   hmac_input_len = 17 + plain_len;
 
@@ -1178,11 +1187,13 @@ ovpn_tls_crypt_wrap (const ovpn_tls_crypt_t *ctx, const u8 *opcode_session,
  * OpenVPN TLS-Crypt unwrap process (from ssl_pkt.c and tls_crypt.c):
  *   1. Extract IV from received HMAC (first 16 bytes)
  *   2. Decrypt ciphertext using that IV
- *   3. Compute HMAC over: opcode || session_id || packet_id || net_time || plaintext
+ *   3. Compute HMAC over: opcode || session_id || packet_id || net_time ||
+ * plaintext
  *   4. Compare computed HMAC with received HMAC
  *
  * The HMAC covers the full header (opcode + session_id + packet_id + net_time)
- * plus the decrypted plaintext. This matches OpenVPN's TLS_CRYPT_OFF_TAG offset.
+ * plus the decrypted plaintext. This matches OpenVPN's TLS_CRYPT_OFF_TAG
+ * offset.
  *
  * @param ctx           TLS-Crypt context
  * @param opcode_session Opcode byte (1) + session_id (8) = 9 bytes
@@ -1198,7 +1209,8 @@ ovpn_tls_crypt_unwrap (ovpn_tls_crypt_t *ctx, const u8 *opcode_session,
 {
   u8 iv[OVPN_TLS_CRYPT_IV_SIZE];
   u8 computed_hmac[OVPN_TLS_CRYPT_HMAC_SIZE];
-  u8 hmac_input[2048 + 17]; /* opcode(1) + session_id(8) + packet_id(4) + net_time(4) + plaintext */
+  u8 hmac_input[2048 + 17]; /* opcode(1) + session_id(8) + packet_id(4) +
+			       net_time(4) + plaintext */
   u32 hmac_input_len;
   u32 plain_len;
   u32 now;
@@ -1258,15 +1270,19 @@ ovpn_tls_crypt_unwrap (ovpn_tls_crypt_t *ctx, const u8 *opcode_session,
 
   /*
    * Step 3: Build HMAC input per OpenVPN TLS-Crypt specification:
-   *   HMAC = HMAC-SHA256(Ka, opcode || session_id || packet_id || net_time || plaintext)
+   *   HMAC = HMAC-SHA256(Ka, opcode || session_id || packet_id || net_time ||
+   * plaintext)
    *
    * This matches OpenVPN's TLS_CRYPT_OFF_TAG (17 bytes) + plaintext.
    * See: ssl_pkt.c read_control_auth() and tls_crypt.c tls_crypt_unwrap()
    */
-  clib_memcpy_fast (hmac_input, opcode_session, 9);	   /* opcode + session_id */
-  clib_memcpy_fast (hmac_input + 9, &hdr->packet_id, 4);   /* packet_id (network order) */
-  clib_memcpy_fast (hmac_input + 13, &hdr->net_time, 4);   /* net_time (network order) */
-  clib_memcpy_fast (hmac_input + 17, plaintext, plain_len); /* decrypted plaintext */
+  clib_memcpy_fast (hmac_input, opcode_session, 9); /* opcode + session_id */
+  clib_memcpy_fast (hmac_input + 9, &hdr->packet_id,
+		    4); /* packet_id (network order) */
+  clib_memcpy_fast (hmac_input + 13, &hdr->net_time,
+		    4); /* net_time (network order) */
+  clib_memcpy_fast (hmac_input + 17, plaintext,
+		    plain_len); /* decrypted plaintext */
   hmac_input_len = 17 + plain_len;
 
   /* Compute HMAC */
@@ -1286,7 +1302,8 @@ ovpn_tls_crypt_unwrap (ovpn_tls_crypt_t *ctx, const u8 *opcode_session,
 		    hdr->hmac[0], hdr->hmac[1], hdr->hmac[2], hdr->hmac[3],
 		    hdr->hmac[4], hdr->hmac[5], hdr->hmac[6], hdr->hmac[7],
 		    hdr->hmac[8], hdr->hmac[9], hdr->hmac[10], hdr->hmac[11],
-		    hdr->hmac[12], hdr->hmac[13], hdr->hmac[14], hdr->hmac[15]);
+		    hdr->hmac[12], hdr->hmac[13], hdr->hmac[14],
+		    hdr->hmac[15]);
       clib_warning ("  computed[0..15]:  %02x%02x%02x%02x%02x%02x%02x%02x "
 		    "%02x%02x%02x%02x%02x%02x%02x%02x",
 		    computed_hmac[0], computed_hmac[1], computed_hmac[2],
@@ -1418,9 +1435,9 @@ ovpn_tls_crypt_v2_parse_server_key (const u8 *key_data, u32 key_len,
  *   7. Extract Kc (first 256 bytes) and metadata (rest)
  */
 int
-ovpn_tls_crypt_v2_unwrap_client_key (const ovpn_tls_crypt_v2_t *ctx,
-				     const u8 *wkc, u32 wkc_len,
-				     ovpn_tls_crypt_v2_client_key_t *client_key)
+ovpn_tls_crypt_v2_unwrap_client_key (
+  const ovpn_tls_crypt_v2_t *ctx, const u8 *wkc, u32 wkc_len,
+  ovpn_tls_crypt_v2_client_key_t *client_key)
 {
   u8 decrypted[OVPN_TLS_CRYPT_V2_MAX_WKC_LEN];
   u8 computed_tag[OVPN_TLS_CRYPT_V2_TAG_SIZE];
@@ -1517,11 +1534,13 @@ ovpn_tls_crypt_v2_unwrap_client_key (const ovpn_tls_crypt_v2_t *ctx,
   /*
    * Extract client key (first 256 bytes) and metadata (rest)
    */
-  clib_memcpy_fast (client_key->key, decrypted, OVPN_TLS_CRYPT_V2_CLIENT_KEY_LEN);
+  clib_memcpy_fast (client_key->key, decrypted,
+		    OVPN_TLS_CRYPT_V2_CLIENT_KEY_LEN);
 
   if (plaintext_len > OVPN_TLS_CRYPT_V2_CLIENT_KEY_LEN)
     {
-      client_key->metadata_len = plaintext_len - OVPN_TLS_CRYPT_V2_CLIENT_KEY_LEN;
+      client_key->metadata_len =
+	plaintext_len - OVPN_TLS_CRYPT_V2_CLIENT_KEY_LEN;
       client_key->metadata = clib_mem_alloc (client_key->metadata_len);
       if (client_key->metadata)
 	{
@@ -1567,8 +1586,8 @@ ovpn_tls_crypt_v2_client_key_free (ovpn_tls_crypt_v2_client_key_t *client_key)
  */
 int
 ovpn_tls_crypt_v2_client_key_to_tls_crypt (
-  const ovpn_tls_crypt_v2_client_key_t *client_key, ovpn_tls_crypt_t *tls_crypt,
-  u8 is_server)
+  const ovpn_tls_crypt_v2_client_key_t *client_key,
+  ovpn_tls_crypt_t *tls_crypt, u8 is_server)
 {
   if (!client_key || !tls_crypt)
     return -1;
@@ -1611,7 +1630,8 @@ ovpn_tls_crypt_v2_client_key_to_tls_crypt (
   tls_crypt->packet_id_send = 1;
   tls_crypt->replay_bitmap = 0;
   tls_crypt->replay_packet_id_floor = 0;
-  /* Time-based replay protection: caller should set time_backtrack from options */
+  /* Time-based replay protection: caller should set time_backtrack from
+   * options */
   tls_crypt->time_backtrack = 0;
   tls_crypt->replay_time_floor = 0;
 
@@ -1673,7 +1693,8 @@ ovpn_tls_crypt_v2_extract_wkc (const u8 *packet, u32 packet_len,
 
 /*
  * Send control packets from pending connection's reliable buffer
- * Allocates vlib_buffer, builds IP/UDP headers, copies payload, sends to IP lookup
+ * Allocates vlib_buffer, builds IP/UDP headers, copies payload, sends to IP
+ * lookup
  */
 static int
 ovpn_handshake_send_pending_packets (vlib_main_t *vm,
@@ -1723,20 +1744,24 @@ ovpn_handshake_send_pending_packets (vlib_main_t *vm,
 	  /*
 	   * TLS-Crypt wrapping:
 	   * Input buffer after mark_active_outgoing:
-	   *   [msg_packet_id(4)] [opcode(1)] [session_id(8)] [ack_array...] [payload]
+	   *   [msg_packet_id(4)] [opcode(1)] [session_id(8)] [ack_array...]
+	   * [payload]
 	   *
 	   * Wire format:
 	   *   [opcode(1)] [session_id(8)] [packet_id(4)] [net_time(4)]
 	   *   [HMAC(32)] [encrypted(msg_packet_id + ack_array + payload)]
 	   *
-	   * HMAC is computed over: opcode || session_id || packet_id || net_time || plaintext
-	   * where plaintext = msg_packet_id || ack_array || payload
+	   * HMAC is computed over: opcode || session_id || packet_id ||
+	   * net_time || plaintext where plaintext = msg_packet_id || ack_array
+	   * || payload
 	   *
-	   * The msg_packet_id was prepended by mark_active_outgoing, so we need to skip
-	   * it to get the opcode+session_id, then include it in the encrypted payload.
+	   * The msg_packet_id was prepended by mark_active_outgoing, so we
+	   * need to skip it to get the opcode+session_id, then include it in
+	   * the encrypted payload.
 	   */
 	  u8 *buf_data = OVPN_BPTR (buf);
-	  u8 *opcode_session = buf_data + 4; /* Skip msg_packet_id to get opcode+session_id */
+	  u8 *opcode_session =
+	    buf_data + 4; /* Skip msg_packet_id to get opcode+session_id */
 	  u8 wrapped[2048 + OVPN_TLS_CRYPT_OVERHEAD];
 
 	  /*
@@ -1745,16 +1770,16 @@ ovpn_handshake_send_pending_packets (vlib_main_t *vm,
 	   * But we need opcode+session_id from the buffer for HMAC.
 	   *
 	   * Actually, looking at OpenVPN format more carefully:
-	   * The encrypted payload should be: [ack_array] [msg_packet_id] [TLS data]
-	   * NOT including the msg_packet_id that was prepended.
+	   * The encrypted payload should be: [ack_array] [msg_packet_id] [TLS
+	   * data] NOT including the msg_packet_id that was prepended.
 	   *
 	   * Let me reconsider: after build_control_header:
 	   *   [opcode] [session_id] [ack_array] (no msg_packet_id yet)
 	   * After mark_active_outgoing PREPENDS msg_packet_id:
 	   *   [msg_packet_id] [opcode] [session_id] [ack_array]
 	   *
-	   * For TLS-Crypt, the plaintext should be what comes after opcode+session_id:
-	   *   [ack_array] [msg_packet_id] [TLS data if any]
+	   * For TLS-Crypt, the plaintext should be what comes after
+	   * opcode+session_id: [ack_array] [msg_packet_id] [TLS data if any]
 	   *
 	   * But the msg_packet_id was prepended, not appended!
 	   * This is a structural issue with how the reliable layer works.
@@ -1762,7 +1787,8 @@ ovpn_handshake_send_pending_packets (vlib_main_t *vm,
 	   * For now, let's pass the original content after opcode+session_id,
 	   * which is [ack_array] from position 13 (4 + 1 + 8) in the buffer.
 	   */
-	  u32 plaintext_offset = 4 + 1 + 8; /* msg_packet_id + opcode + session_id */
+	  u32 plaintext_offset =
+	    4 + 1 + 8; /* msg_packet_id + opcode + session_id */
 	  u8 *plaintext = buf_data + plaintext_offset;
 
 	  /* But we also need to include the msg_packet_id in the plaintext!
@@ -1774,12 +1800,13 @@ ovpn_handshake_send_pending_packets (vlib_main_t *vm,
 	  u8 plaintext_with_pid[2048];
 	  u32 ack_len = payload_len - plaintext_offset; /* ack_array length */
 	  clib_memcpy_fast (plaintext_with_pid, plaintext, ack_len);
-	  clib_memcpy_fast (plaintext_with_pid + ack_len, buf_data, 4); /* msg_packet_id */
+	  clib_memcpy_fast (plaintext_with_pid + ack_len, buf_data,
+			    4); /* msg_packet_id */
 	  u32 total_plaintext_len = ack_len + 4;
 
-	  int wrapped_len =
-	    ovpn_tls_crypt_wrap (tls_crypt, opcode_session, plaintext_with_pid,
-				 total_plaintext_len, wrapped, sizeof (wrapped));
+	  int wrapped_len = ovpn_tls_crypt_wrap (
+	    tls_crypt, opcode_session, plaintext_with_pid, total_plaintext_len,
+	    wrapped, sizeof (wrapped));
 	  if (wrapped_len < 0)
 	    {
 	      vlib_buffer_free_one (vm, bi);
@@ -1787,7 +1814,8 @@ ovpn_handshake_send_pending_packets (vlib_main_t *vm,
 	    }
 
 	  /* Build wire format: [opcode][session_id][wrapped] */
-	  clib_memcpy_fast (payload, opcode_session, 9); /* opcode + session_id */
+	  clib_memcpy_fast (payload, opcode_session,
+			    9); /* opcode + session_id */
 	  clib_memcpy_fast (payload + 9, wrapped, wrapped_len);
 	  payload_len = 9 + wrapped_len;
 
@@ -1820,14 +1848,13 @@ ovpn_handshake_send_pending_packets (vlib_main_t *vm,
 	  wire_len += header_len;
 
 	  /* Append [msg_pkt_id] */
-	  clib_memcpy_fast (wire_format + wire_len, buf_data + msg_pkt_id_offset,
-			    4);
+	  clib_memcpy_fast (wire_format + wire_len,
+			    buf_data + msg_pkt_id_offset, 4);
 	  wire_len += 4;
 
 	  u8 wrapped[2048 + OVPN_TLS_AUTH_OVERHEAD];
-	  int wrapped_len =
-	    ovpn_tls_auth_wrap (auth, wire_format, wire_len, wrapped,
-			       sizeof (wrapped));
+	  int wrapped_len = ovpn_tls_auth_wrap (auth, wire_format, wire_len,
+						wrapped, sizeof (wrapped));
 	  if (wrapped_len < 0)
 	    {
 	      vlib_buffer_free_one (vm, bi);
@@ -2016,8 +2043,7 @@ ovpn_handshake_send_peer_packets (vlib_main_t *vm, ovpn_peer_t *peer,
       u32 ctrl_hdr_len = 0;
 
       /* Opcode + key_id */
-      ctrl_hdr[ctrl_hdr_len++] =
-	ovpn_op_compose (opcode, tls_ctx->key_id);
+      ctrl_hdr[ctrl_hdr_len++] = ovpn_op_compose (opcode, tls_ctx->key_id);
 
       /* Our session ID (8 bytes) */
       clib_memcpy (&ctrl_hdr[ctrl_hdr_len], peer->session_id.id,
@@ -2073,14 +2099,14 @@ ovpn_handshake_send_peer_packets (vlib_main_t *vm, ovpn_peer_t *peer,
 	{
 	  /*
 	   * TLS-Crypt wrapping:
-	   * pkt_data: [opcode(1)] [session_id(8)] [ack_array...] [msg_id] [payload]
-	   * Wire format: [opcode(1)] [session_id(8)] [packet_id(4)] [net_time(4)]
-	   *              [HMAC(32)] [encrypted(ack_array...payload)]
+	   * pkt_data: [opcode(1)] [session_id(8)] [ack_array...] [msg_id]
+	   * [payload] Wire format: [opcode(1)] [session_id(8)] [packet_id(4)]
+	   * [net_time(4)] [HMAC(32)] [encrypted(ack_array...payload)]
 	   */
 	  u8 wrapped[2048 + OVPN_TLS_CRYPT_OVERHEAD];
-	  int wrapped_len =
-	    ovpn_tls_crypt_wrap (tls_crypt, pkt_data, pkt_data + 9,
-				 total_ctrl_len - 9, wrapped, sizeof (wrapped));
+	  int wrapped_len = ovpn_tls_crypt_wrap (
+	    tls_crypt, pkt_data, pkt_data + 9, total_ctrl_len - 9, wrapped,
+	    sizeof (wrapped));
 	  if (wrapped_len < 0)
 	    {
 	      vlib_buffer_free_one (vm, bi);
@@ -2088,7 +2114,8 @@ ovpn_handshake_send_peer_packets (vlib_main_t *vm, ovpn_peer_t *peer,
 	    }
 
 	  /* Build wire format: [opcode][session_id][wrapped] */
-	  /* opcode + session_id already at pkt_data[0..8], copy wrapped after */
+	  /* opcode + session_id already at pkt_data[0..8], copy wrapped after
+	   */
 	  clib_memcpy_fast (pkt_data + 9, wrapped, wrapped_len);
 	  total_ctrl_len = 9 + wrapped_len;
 
@@ -2099,9 +2126,8 @@ ovpn_handshake_send_peer_packets (vlib_main_t *vm, ovpn_peer_t *peer,
 	{
 	  /* TLS-Auth: add HMAC + packet_id + net_time for replay protection */
 	  u8 wrapped[2048 + OVPN_TLS_AUTH_OVERHEAD];
-	  int wrapped_len =
-	    ovpn_tls_auth_wrap (auth, pkt_data, total_ctrl_len, wrapped,
-			       sizeof (wrapped));
+	  int wrapped_len = ovpn_tls_auth_wrap (auth, pkt_data, total_ctrl_len,
+						wrapped, sizeof (wrapped));
 	  if (wrapped_len < 0)
 	    {
 	      vlib_buffer_free_one (vm, bi);
@@ -2143,8 +2169,8 @@ ovpn_handshake_send_peer_packets (vlib_main_t *vm, ovpn_peer_t *peer,
 	  ip4->ip_version_and_header_length = 0x45;
 	  ip4->ttl = 64;
 	  ip4->protocol = IP_PROTOCOL_UDP;
-	  ip4->length = clib_host_to_net_u16 (ip_hdr_size + udp_hdr_size +
-					      total_ctrl_len);
+	  ip4->length =
+	    clib_host_to_net_u16 (ip_hdr_size + udp_hdr_size + total_ctrl_len);
 
 	  ip4->dst_address.as_u32 = peer->remote_addr.ip.ip4.as_u32;
 	  if (local_addr)
@@ -2243,7 +2269,8 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
    * Control channel packet authentication and replay protection
    *
    * Both TLS-Crypt and TLS-Auth use a TWO packet_id scheme:
-   * 1. Wrapper packet_id: In the TLS-Crypt/TLS-Auth header for REPLAY PROTECTION
+   * 1. Wrapper packet_id: In the TLS-Crypt/TLS-Auth header for REPLAY
+   * PROTECTION
    * 2. Message packet_id: Inside the control packet for RELIABLE ORDERING
    *
    * The wrapper layer handles authentication and anti-replay.
@@ -2254,8 +2281,10 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
    * TLS-Crypt-V2 handling
    *
    * TLS-Crypt-V2 uses per-client keys:
-   * - P_CONTROL_HARD_RESET_CLIENT_V3: Has WKc appended, needs to extract and unwrap
-   * - Subsequent packets: Use the stored client context from pending connection
+   * - P_CONTROL_HARD_RESET_CLIENT_V3: Has WKc appended, needs to extract and
+   * unwrap
+   * - Subsequent packets: Use the stored client context from pending
+   * connection
    *
    * We need to determine which TLS-Crypt context to use BEFORE unwrapping:
    * 1. Check if there's an existing pending connection with client_tls_crypt
@@ -2297,8 +2326,8 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 	  ovpn_tls_crypt_v2_client_key_t client_key;
 
 	  /* Extract WKc from the end of the packet (pass data after opcode) */
-	  rv = ovpn_tls_crypt_v2_extract_wkc (data + 1, len - 1, &wkc, &wkc_len,
-					     &wrapped_packet_len);
+	  rv = ovpn_tls_crypt_v2_extract_wkc (data + 1, len - 1, &wkc,
+					      &wkc_len, &wrapped_packet_len);
 	  if (rv < 0)
 	    {
 	      return -10; /* Failed to extract WKc */
@@ -2309,7 +2338,7 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 
 	  /* Unwrap the client key */
 	  rv = ovpn_tls_crypt_v2_unwrap_client_key (&inst->tls_crypt_v2, wkc,
-						   wkc_len, &client_key);
+						    wkc_len, &client_key);
 	  if (rv < 0)
 	    {
 	      return -11; /* Failed to unwrap client key */
@@ -2401,16 +2430,17 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
     {
       /*
        * TLS-Auth packet format on wire:
-       *   [opcode+keyid (1)] [session_id (8)] [HMAC (32)] [packet_id (4)] [net_time (4)]
-       *   [ack_array...] [msg_packet_id (4)] [payload]
+       *   [opcode+keyid (1)] [session_id (8)] [HMAC (32)] [packet_id (4)]
+       * [net_time (4)] [ack_array...] [msg_packet_id (4)] [payload]
        *
        * The unwrap function verifies HMAC and removes the wrapper:
-       *   Input:  [opcode] [session_id] [HMAC] [packet_id] [net_time] [rest...]
-       *   Output: [opcode] [session_id] [rest...]
+       *   Input:  [opcode] [session_id] [HMAC] [packet_id] [net_time]
+       * [rest...] Output: [opcode] [session_id] [rest...]
        */
       u8 plaintext[2048];
 
-      /* Minimum size: opcode(1) + session_id(8) + HMAC(32) + packet_id(4) + net_time(4) = 49 */
+      /* Minimum size: opcode(1) + session_id(8) + HMAC(32) + packet_id(4) +
+       * net_time(4) = 49 */
       if (len < OVPN_TLS_AUTH_MIN_SIZE)
 	return -2;
 
@@ -2519,9 +2549,10 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 				  /*
 				   * Copy send_reliable packet_id from pending.
 				   * The pending sent HARD_RESET_SERVER with
-				   * packet_id=0, so the peer's next send should
-				   * use packet_id=1. Otherwise, the client will
-				   * see duplicate packet_id=0 and ignore it.
+				   * packet_id=0, so the peer's next send
+				   * should use packet_id=1. Otherwise, the
+				   * client will see duplicate packet_id=0 and
+				   * ignore it.
 				   */
 				  peer->tls_ctx->send_reliable->packet_id =
 				    pending->send_reliable->packet_id;
@@ -2583,29 +2614,32 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 	  }
 
 	/* Create or update pending connection */
-	pending = ovpn_pending_connection_create (pending_db, src_addr,
-						  src_port, &session_id,
-						  key_id);
+	pending = ovpn_pending_connection_create (
+	  pending_db, src_addr, src_port, &session_id, key_id);
 	if (!pending)
 	  {
 	    return -3;
 	  }
 
 	/*
-	 * For TLS-Crypt-V2 (V3 packets), store the per-client TLS-Crypt context
-	 * This context will be used for all subsequent control channel packets
+	 * For TLS-Crypt-V2 (V3 packets), store the per-client TLS-Crypt
+	 * context This context will be used for all subsequent control channel
+	 * packets
 	 */
 	if (is_tls_crypt_v2_packet && tls_crypt_ctx_for_unwrap)
 	  {
-	    /* Free any existing client context from a previous connection attempt */
+	    /* Free any existing client context from a previous connection
+	     * attempt */
 	    if (pending->client_tls_crypt)
 	      {
 		clib_mem_free (pending->client_tls_crypt);
 	      }
 
 	    /* Allocate and copy the client TLS-Crypt context */
-	    pending->client_tls_crypt = clib_mem_alloc (sizeof (ovpn_tls_crypt_t));
-	    clib_memcpy_fast (pending->client_tls_crypt, tls_crypt_ctx_for_unwrap,
+	    pending->client_tls_crypt =
+	      clib_mem_alloc (sizeof (ovpn_tls_crypt_t));
+	    clib_memcpy_fast (pending->client_tls_crypt,
+			      tls_crypt_ctx_for_unwrap,
 			      sizeof (ovpn_tls_crypt_t));
 	    pending->is_tls_crypt_v2 = 1;
 	  }
@@ -2638,8 +2672,8 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 	ovpn_tls_auth_t *tls_auth_ptr =
 	  inst->tls_auth.enabled ? &inst->tls_auth : NULL;
 	rv = ovpn_handshake_send_pending_packets (vm, pending, dst_addr,
-						  dst_port, is_ip6, tls_auth_ptr,
-						  tls_crypt_ptr);
+						  dst_port, is_ip6,
+						  tls_auth_ptr, tls_crypt_ptr);
 	if (rv < 0)
 	  {
 	    ovpn_pending_connection_delete (pending_db, pending);
@@ -2690,9 +2724,9 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 	  if (buf)
 	    {
 	      ovpn_buf_init (buf, 128);
-	      ovpn_reliable_mark_active_outgoing (peer->tls_ctx->send_reliable,
-						  buf,
-						  OVPN_OP_CONTROL_SOFT_RESET_V1);
+	      ovpn_reliable_mark_active_outgoing (
+		peer->tls_ctx->send_reliable, buf,
+		OVPN_OP_CONTROL_SOFT_RESET_V1);
 	    }
 	}
 
@@ -2702,8 +2736,8 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 	    inst->tls_crypt.enabled ? &inst->tls_crypt : NULL;
 	  ovpn_tls_auth_t *tls_auth_ptr =
 	    inst->tls_auth.enabled ? &inst->tls_auth : NULL;
-	  ovpn_handshake_send_peer_packets (vm, peer, dst_addr, dst_port,
-					    is_ip6, tls_auth_ptr, tls_crypt_ptr);
+	  ovpn_handshake_send_peer_packets (
+	    vm, peer, dst_addr, dst_port, is_ip6, tls_auth_ptr, tls_crypt_ptr);
 	}
 
 	rv = 1;
@@ -2726,7 +2760,8 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 	      {
 		/* Process ACKs - remove acknowledged packets */
 		for (u32 i = 0; i < ack.len; i++)
-		ovpn_reliable_send_purge (peer->tls_ctx->send_reliable, &ack);
+		  ovpn_reliable_send_purge (peer->tls_ctx->send_reliable,
+					    &ack);
 		rv = 0;
 	      }
 	    break;
@@ -2854,9 +2889,9 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 		  {
 		    /*
 		     * Need to send response over TLS
-		     * Since peer is established, we need to re-encrypt with TLS
-		     * For now, we'll allocate a temporary TLS context to send
-		     * the response
+		     * Since peer is established, we need to re-encrypt with
+		     * TLS For now, we'll allocate a temporary TLS context to
+		     * send the response
 		     *
 		     * TODO: Implement proper control message response sending
 		     * for established peers. This requires:
@@ -2869,7 +2904,8 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 	    break;
 	  }
 
-	/* Second check: peer in HANDSHAKE or REKEYING state with TLS context */
+	/* Second check: peer in HANDSHAKE or REKEYING state with TLS context
+	 */
 	if (peer && peer->tls_ctx &&
 	    (peer->state == OVPN_PEER_STATE_HANDSHAKE ||
 	     peer->state == OVPN_PEER_STATE_REKEYING))
@@ -2986,13 +3022,16 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 			    tls_ctx->peer_options = peer_opts;
 
 			    /*
-			     * Negotiate data channel cipher from client options
+			     * Negotiate data channel cipher from client
+			     * options
 			     *
 			     * The client sends its supported ciphers via:
 			     * 1. IV_CIPHERS=cipher1:cipher2:... (OpenVPN 2.5+)
 			     * 2. cipher <name> in options string (legacy)
 			     *
-			     * We select the first cipher that both support.
+			     * If server has data-ciphers configured, negotiate
+			     * the first mutually supported cipher. Otherwise,
+			     * accept client's preferred cipher.
 			     */
 			    ovpn_cipher_alg_t negotiated_cipher =
 			      OVPN_CIPHER_ALG_NONE;
@@ -3007,26 +3046,52 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 				if (iv_ciphers)
 				  {
 				    /*
-				     * IV_CIPHERS format: cipher1:cipher2:cipher3
-				     * Select first cipher that matches our
-				     * supported list
+				     * IV_CIPHERS format:
+				     * cipher1:cipher2:cipher3
+				     *
+				     * If server has data-ciphers configured,
+				     * use negotiation to find mutually
+				     * supported cipher. Server's preference
+				     * order takes precedence.
 				     */
-				    char *cipher_list = iv_ciphers;
-				    char *cipher_name;
-				    char *saveptr = NULL;
-
-				    while ((cipher_name = strtok_r (
-					      cipher_list, ":", &saveptr)) !=
-					   NULL)
+				    if (inst->options.n_data_ciphers > 0)
 				      {
-					cipher_list = NULL;
-					ovpn_cipher_alg_t alg =
-					  ovpn_crypto_cipher_alg_from_name (
-					    cipher_name);
-					if (alg != OVPN_CIPHER_ALG_NONE)
+					/* Use server's data-ciphers for
+					 * negotiation */
+					const char *negotiated_name =
+					  ovpn_options_negotiate_cipher (
+					    &inst->options, iv_ciphers);
+					if (negotiated_name)
 					  {
-					    negotiated_cipher = alg;
-					    break;
+					    negotiated_cipher =
+					      ovpn_crypto_cipher_alg_from_name (
+						negotiated_name);
+					  }
+				      }
+				    else
+				      {
+					/*
+					 * No server data-ciphers configured,
+					 * accept client's first supported
+					 * cipher
+					 */
+					char *cipher_list = iv_ciphers;
+					char *cipher_name;
+					char *saveptr = NULL;
+
+					while ((cipher_name =
+						  strtok_r (cipher_list, ":",
+							    &saveptr)) != NULL)
+					  {
+					    cipher_list = NULL;
+					    ovpn_cipher_alg_t alg =
+					      ovpn_crypto_cipher_alg_from_name (
+						cipher_name);
+					    if (alg != OVPN_CIPHER_ALG_NONE)
+					      {
+						negotiated_cipher = alg;
+						break;
+					      }
 					  }
 				      }
 				    clib_mem_free (iv_ciphers);
@@ -3059,24 +3124,28 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 				  }
 
 				/*
-				 * Parse client's requested virtual IP (ifconfig)
+				 * Parse client's requested virtual IP
+				 * (ifconfig)
 				 *
-				 * OpenVPN clients can specify their desired virtual IP
-				 * using the ifconfig option in their options string.
-				 * If valid and within pool range, honor the request.
+				 * OpenVPN clients can specify their desired
+				 * virtual IP using the ifconfig option in
+				 * their options string. If valid and within
+				 * pool range, honor the request.
 				 */
 				ip_address_t client_virtual_ip;
 				int ifconfig_rv =
-				  ovpn_options_parse_client_ifconfig (peer_opts,
-								     &client_virtual_ip);
+				  ovpn_options_parse_client_ifconfig (
+				    peer_opts, &client_virtual_ip);
 				if (ifconfig_rv == 0)
 				  {
 				    /*
 				     * Client requested a specific virtual IP
-				     * Validate against pool range if configured
+				     * Validate against pool range if
+				     * configured
 				     */
 				    int ip_valid = ovpn_options_ip_in_pool (
-				      &client_virtual_ip, &inst->options.pool_start,
+				      &client_virtual_ip,
+				      &inst->options.pool_start,
 				      &inst->options.pool_end);
 
 				    if (ip_valid)
@@ -3086,10 +3155,12 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 					  peer_db, peer, &client_virtual_ip);
 					if (set_rv == 0)
 					  {
-					    /* Successfully assigned client's requested IP */
+					    /* Successfully assigned client's
+					     * requested IP */
 					  }
-					/* If set_rv < 0, IP is already in use - will
-					 * fall back to pool allocation or no IP */
+					/* If set_rv < 0, IP is already in use
+					 * - will fall back to pool allocation
+					 * or no IP */
 				      }
 				  }
 			      }
@@ -3099,9 +3170,11 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 			     * back to server's configured cipher
 			     */
 			    if (negotiated_cipher != OVPN_CIPHER_ALG_NONE)
-			      tls_ctx->negotiated_cipher_alg = negotiated_cipher;
+			      tls_ctx->negotiated_cipher_alg =
+				negotiated_cipher;
 			    else
-			      tls_ctx->negotiated_cipher_alg = inst->cipher_alg;
+			      tls_ctx->negotiated_cipher_alg =
+				inst->cipher_alg;
 			  }
 		      }
 
@@ -3114,8 +3187,8 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 
 			/* Build server options string with negotiated cipher
 			 * and virtual IP */
-			const char *cipher_name =
-			  ovpn_cipher_alg_to_name (tls_ctx->negotiated_cipher_alg);
+			const char *cipher_name = ovpn_cipher_alg_to_name (
+			  tls_ctx->negotiated_cipher_alg);
 
 			/*
 			 * Pass virtual IP if assigned to this peer
@@ -3140,7 +3213,7 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 			    ptls_buffer_init (&sendbuf, "", 0);
 
 			    int tls_rv = ptls_send (tls_ctx->tls, &sendbuf,
-						   km_buf, km_len);
+						    km_buf, km_len);
 			    if (tls_rv == 0 && sendbuf.off > 0)
 			      {
 				/* Queue TLS data for sending */
@@ -3151,7 +3224,7 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 				  {
 				    ovpn_buf_init (out_buf, 128);
 				    ovpn_buf_write (out_buf, sendbuf.base,
-						   sendbuf.off);
+						    sendbuf.off);
 				    ovpn_reliable_mark_active_outgoing (
 				      tls_ctx->send_reliable, out_buf,
 				      OVPN_OP_CONTROL_V1);
@@ -3160,12 +3233,13 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 				    /* Send the queued Key Method 2 data */
 				    {
 				      ovpn_tls_auth_t *km_tls_auth =
-					inst->tls_auth.enabled ? &inst->tls_auth
-							       : NULL;
+					inst->tls_auth.enabled ?
+					  &inst->tls_auth :
+					  NULL;
 				      ovpn_tls_crypt_t *km_tls_crypt =
-					inst->tls_crypt.enabled
-					  ? &inst->tls_crypt
-					  : NULL;
+					inst->tls_crypt.enabled ?
+					  &inst->tls_crypt :
+					  NULL;
 				      ovpn_handshake_send_peer_packets (
 					vm, peer, dst_addr, dst_port, is_ip6,
 					km_tls_auth, km_tls_crypt);
@@ -3177,7 +3251,8 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 		      }
 
 		    /* Check if key exchange is complete */
-		    if (tls_ctx->key_method_sent && tls_ctx->key_method_received)
+		    if (tls_ctx->key_method_sent &&
+			tls_ctx->key_method_received)
 		      {
 			/*
 			 * Key Method 2 exchange complete!
@@ -3194,8 +3269,8 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 			     */
 			    int key_rv;
 
-			    key_rv = ovpn_peer_complete_rekey (vm, peer_db, peer,
-							      cipher_alg);
+			    key_rv = ovpn_peer_complete_rekey (
+			      vm, peer_db, peer, cipher_alg);
 			    if (key_rv == 0)
 			      {
 				rv = 3; /* Rekey complete */
@@ -3270,34 +3345,35 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 				    ip46_address_t nh;
 				    fib_protocol_t fproto;
 
-				    fproto =
-				      ip_address_to_46 (&peer->virtual_ip, &nh);
+				    fproto = ip_address_to_46 (
+				      &peer->virtual_ip, &nh);
 
 				    /*
-				     * Create neighbor adjacency - this triggers
-				     * update_adjacency callback which converts
-				     * it to a midchain adjacency
+				     * Create neighbor adjacency - this
+				     * triggers update_adjacency callback which
+				     * converts it to a midchain adjacency
 				     */
 				    (void) adj_nbr_add_or_lock (
 				      fproto, fib_proto_to_link (fproto), &nh,
 				      peer->sw_if_index);
 
 				    /*
-				     * Add /32 host route for peer's virtual IP.
-				     * For NBMA interfaces, the connected route
-				     * (e.g. 10.8.0.0/24) uses dpo-drop. We need
-				     * an explicit /32 route to reach the peer.
+				     * Add /32 host route for peer's virtual
+				     * IP. For NBMA interfaces, the connected
+				     * route (e.g. 10.8.0.0/24) uses dpo-drop.
+				     * We need an explicit /32 route to reach
+				     * the peer.
 				     */
 				    fib_prefix_t pfx;
 				    clib_memset (&pfx, 0, sizeof (pfx));
 				    pfx.fp_proto = fproto;
-				    pfx.fp_len = (fproto == FIB_PROTOCOL_IP4)
-						   ? 32
-						   : 128;
+				    pfx.fp_len =
+				      (fproto == FIB_PROTOCOL_IP4) ? 32 : 128;
 				    pfx.fp_addr = nh;
 
-				    u32 fib_index = fib_table_get_index_for_sw_if_index (
-				      fproto, peer->sw_if_index);
+				    u32 fib_index =
+				      fib_table_get_index_for_sw_if_index (
+					fproto, peer->sw_if_index);
 
 				    ovpn_main_t *omp = &ovpn_main;
 				    fib_table_entry_path_add (
@@ -3305,17 +3381,19 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 				      FIB_ENTRY_FLAG_NONE,
 				      fib_proto_to_dpo (fproto), &nh,
 				      peer->sw_if_index, ~0, /* fib_index */
-				      1,		      /* weight */
-				      NULL,		      /* label stack */
+				      1,		     /* weight */
+				      NULL,		     /* label stack */
 				      FIB_ROUTE_PATH_FLAG_NONE);
 				  }
 
 				/*
 				 * Update adjacencies on the interface
-				 * This associates the peer with any adjacencies
-				 * pointing to its virtual IP, enabling TX path
+				 * This associates the peer with any
+				 * adjacencies pointing to its virtual IP,
+				 * enabling TX path
 				 */
-				ovpn_if_update_adj_for_peer (peer->sw_if_index);
+				ovpn_if_update_adj_for_peer (
+				  peer->sw_if_index);
 
 				/* Free TLS context - no longer needed */
 				ovpn_peer_tls_free (peer);
@@ -3406,17 +3484,18 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 	ovpn_tls_crypt_v2_client_key_t client_key;
 
 	/* Unwrap the client key */
-	rv = ovpn_tls_crypt_v2_unwrap_client_key (&inst->tls_crypt_v2, wkc_data,
-						 wkc_data_len, &client_key);
+	rv = ovpn_tls_crypt_v2_unwrap_client_key (
+	  &inst->tls_crypt_v2, wkc_data, wkc_data_len, &client_key);
 	if (rv < 0)
 	  {
 	    return -23; /* Failed to unwrap client key */
 	  }
 
 	/* Create per-client TLS-Crypt context */
-	ovpn_tls_crypt_t *client_ctx = clib_mem_alloc (sizeof (ovpn_tls_crypt_t));
-	rv = ovpn_tls_crypt_v2_client_key_to_tls_crypt (&client_key, client_ctx,
-						       1 /* is_server */);
+	ovpn_tls_crypt_t *client_ctx =
+	  clib_mem_alloc (sizeof (ovpn_tls_crypt_t));
+	rv = ovpn_tls_crypt_v2_client_key_to_tls_crypt (
+	  &client_key, client_ctx, 1 /* is_server */);
 	ovpn_tls_crypt_v2_client_key_free (&client_key);
 
 	if (rv < 0)
@@ -3449,7 +3528,7 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
  * OpenVPN ping string - magic byte pattern for keepalive
  */
 const u8 ovpn_ping_string[OVPN_PING_STRING_SIZE] = { 0x2a, 0x18, 0x7b, 0xf3,
-						    0x64, 0x1e, 0xb4, 0xcb };
+						     0x64, 0x1e, 0xb4, 0xcb };
 
 /*
  * Build PUSH_REPLY message for a peer
@@ -3526,8 +3605,8 @@ ovpn_build_push_reply (ovpn_peer_t *peer, char *buf, u32 buf_len)
   u32 ping_timeout =
     inst->options.keepalive_timeout > 0 ? inst->options.keepalive_timeout : 60;
 
-  written = snprintf (buf + offset, buf_len - offset, ",ping %u,ping-restart %u",
-		      ping_interval, ping_timeout);
+  written = snprintf (buf + offset, buf_len - offset,
+		      ",ping %u,ping-restart %u", ping_interval, ping_timeout);
   if (written < 0 || (u32) written >= buf_len - offset)
     return -4;
   offset += written;
@@ -3537,6 +3616,28 @@ ovpn_build_push_reply (ovpn_peer_t *peer, char *buf, u32 buf_len)
   if (written < 0 || (u32) written >= buf_len - offset)
     return -5;
   offset += written;
+
+  /*
+   * Add configured push options from instance options
+   * This includes:
+   *   - DHCP options (DNS, WINS, DOMAIN, etc.)
+   *   - Push routes
+   *   - redirect-gateway
+   *   - Custom push options
+   */
+  if (inst->options.n_dhcp_options > 0 || inst->options.n_push_routes > 0 ||
+      inst->options.n_push_options > 0 || inst->options.redirect_gateway)
+    {
+      char push_buf[2048];
+      int push_len = ovpn_options_build_push_reply (&inst->options, push_buf,
+						    sizeof (push_buf));
+      if (push_len > 0)
+	{
+	  written = snprintf (buf + offset, buf_len - offset, ",%s", push_buf);
+	  if (written > 0 && (u32) written < buf_len - offset)
+	    offset += written;
+	}
+    }
 
   /* Null terminate */
   if ((u32) offset < buf_len)

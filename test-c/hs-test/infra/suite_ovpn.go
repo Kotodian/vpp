@@ -130,6 +130,131 @@ func (s *OvpnSuite) GetOvpnTlsCryptConfig(instanceName string) Stanza {
 	return config
 }
 
+// GetOvpnStaticKeyWithPushConfig returns a Stanza for OpenVPN with push options
+func (s *OvpnSuite) GetOvpnStaticKeyWithPushConfig(instanceName, keyPath string) Stanza {
+	var config Stanza
+	config.NewStanza("openvpn").
+		NewStanza(fmt.Sprintf("instance %s", instanceName)).
+		Append(fmt.Sprintf("local %s", s.VppOvpnAddr())).
+		Append(fmt.Sprintf("port %s", s.Ports.Ovpn)).
+		Append("dev ovpn0").
+		Append("dev-type tun").
+		Append(fmt.Sprintf("secret %s", keyPath)).
+		Append("cipher AES-256-CBC").
+		// Push options - use route directive and simple push options
+		Append("route 10.0.0.0 255.0.0.0").
+		Append("dhcp-option DNS 8.8.8.8").
+		Append("push persist-tun").
+		Append("keepalive 10 60").
+		Close().
+		Close()
+	return config
+}
+
+// GetOvpnStaticKeyWithDhcpConfig returns a Stanza for OpenVPN with DHCP options
+func (s *OvpnSuite) GetOvpnStaticKeyWithDhcpConfig(instanceName, keyPath string) Stanza {
+	var config Stanza
+	config.NewStanza("openvpn").
+		NewStanza(fmt.Sprintf("instance %s", instanceName)).
+		Append(fmt.Sprintf("local %s", s.VppOvpnAddr())).
+		Append(fmt.Sprintf("port %s", s.Ports.Ovpn)).
+		Append("dev ovpn0").
+		Append("dev-type tun").
+		Append(fmt.Sprintf("secret %s", keyPath)).
+		Append("cipher AES-256-CBC").
+		// DHCP options
+		Append("dhcp-option DNS 8.8.8.8").
+		Append("dhcp-option DNS 8.8.4.4").
+		Append("dhcp-option DOMAIN vpn.example.com").
+		// Route options
+		Append("route 10.0.0.0 255.0.0.0").
+		Close().
+		Close()
+	return config
+}
+
+// GetOvpnStaticKeyWithDataCiphersConfig returns a Stanza for OpenVPN with data-ciphers
+func (s *OvpnSuite) GetOvpnStaticKeyWithDataCiphersConfig(instanceName, keyPath string) Stanza {
+	var config Stanza
+	config.NewStanza("openvpn").
+		NewStanza(fmt.Sprintf("instance %s", instanceName)).
+		Append(fmt.Sprintf("local %s", s.VppOvpnAddr())).
+		Append(fmt.Sprintf("port %s", s.Ports.Ovpn)).
+		Append("dev ovpn0").
+		Append("dev-type tun").
+		Append(fmt.Sprintf("secret %s", keyPath)).
+		// Data ciphers for negotiation
+		Append("data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305").
+		Append("data-ciphers-fallback AES-256-CBC").
+		Close().
+		Close()
+	return config
+}
+
+// GetOvpnFullFeaturedConfig returns a Stanza with all new options enabled
+func (s *OvpnSuite) GetOvpnFullFeaturedConfig(instanceName, keyPath string) Stanza {
+	var config Stanza
+	config.NewStanza("openvpn").
+		NewStanza(fmt.Sprintf("instance %s", instanceName)).
+		Append(fmt.Sprintf("local %s", s.VppOvpnAddr())).
+		Append(fmt.Sprintf("port %s", s.Ports.Ovpn)).
+		Append("dev ovpn0").
+		Append("dev-type tun").
+		Append(fmt.Sprintf("secret %s", keyPath)).
+		Append("cipher AES-256-CBC").
+		// Data ciphers
+		Append("data-ciphers AES-256-GCM:AES-128-GCM").
+		Append("data-ciphers-fallback AES-256-CBC").
+		// DHCP options
+		Append("dhcp-option DNS 8.8.8.8").
+		Append("dhcp-option DOMAIN vpn.test.local").
+		// Routes
+		Append("route 172.16.0.0 255.255.0.0").
+		// Simple push options (without quotes)
+		Append("push persist-tun").
+		// Keepalive
+		Append("keepalive 10 60").
+		Close().
+		Close()
+	return config
+}
+
+// SetupVppOvpnWithPush sets up VPP with OpenVPN push options via startup.conf
+func (s *OvpnSuite) SetupVppOvpnWithPush(keyFile string) {
+	s.CopyStaticKeyToVpp()
+	ovpnConfig := s.GetOvpnStaticKeyWithPushConfig("push-server", keyFile)
+	s.Log("OpenVPN startup config with push:\n" + ovpnConfig.ToString())
+	s.StartVppWithOvpnConfig(ovpnConfig)
+	s.ConfigureOvpnInterface()
+}
+
+// SetupVppOvpnWithDhcp sets up VPP with OpenVPN DHCP options via startup.conf
+func (s *OvpnSuite) SetupVppOvpnWithDhcp(keyFile string) {
+	s.CopyStaticKeyToVpp()
+	ovpnConfig := s.GetOvpnStaticKeyWithDhcpConfig("dhcp-server", keyFile)
+	s.Log("OpenVPN startup config with DHCP:\n" + ovpnConfig.ToString())
+	s.StartVppWithOvpnConfig(ovpnConfig)
+	s.ConfigureOvpnInterface()
+}
+
+// SetupVppOvpnWithDataCiphers sets up VPP with OpenVPN data-ciphers via startup.conf
+func (s *OvpnSuite) SetupVppOvpnWithDataCiphers(keyFile string) {
+	s.CopyStaticKeyToVpp()
+	ovpnConfig := s.GetOvpnStaticKeyWithDataCiphersConfig("cipher-server", keyFile)
+	s.Log("OpenVPN startup config with data-ciphers:\n" + ovpnConfig.ToString())
+	s.StartVppWithOvpnConfig(ovpnConfig)
+	s.ConfigureOvpnInterface()
+}
+
+// SetupVppOvpnFullFeatured sets up VPP with all new OpenVPN options
+func (s *OvpnSuite) SetupVppOvpnFullFeatured(keyFile string) {
+	s.CopyStaticKeyToVpp()
+	ovpnConfig := s.GetOvpnFullFeaturedConfig("full-featured-server", keyFile)
+	s.Log("OpenVPN startup config (full featured):\n" + ovpnConfig.ToString())
+	s.StartVppWithOvpnConfig(ovpnConfig)
+	s.ConfigureOvpnInterface()
+}
+
 func (s *OvpnSuite) TeardownTest() {
 	defer s.HstSuite.TeardownTest()
 	if CurrentSpecReport().Failed() {

@@ -79,6 +79,9 @@ ovpn_config_free (ovpn_parsed_config_t *config)
   if (config->options.static_key)
     clib_mem_free (config->options.static_key);
 
+  /* Free dynamic options (push, dhcp, ciphers, routes) */
+  ovpn_options_free_dynamic (&config->options);
+
   vec_free (config->ca_file);
   vec_free (config->cert_file);
   vec_free (config->key_file);
@@ -182,6 +185,7 @@ parse_option (u8 *line_start, u8 *line_end, const char *base_dir,
   u32 u32_val;
   u8 *str_val = NULL;
   ip4_address_t ip4_addr, ip4_mask;
+  ip6_address_t ip6_addr;
 
   /* Create null-terminated copy of the line */
   line = vec_new (u8, line_end - line_start + 1);
@@ -450,10 +454,106 @@ parse_option (u8 *line_start, u8 *line_end, const char *base_dir,
     {
       /* Compression not supported */
     }
-  else if (unformat (&input, "push %s", &str_val))
+  else if (unformat (&input, "push"))
     {
-      /* Push directives - may implement later */
+      /*
+       * Push directive: push "option value"
+       * The rest of the line (after "push ") is the option to push
+       */
+      u8 *rest = 0;
+      if (unformat (&input, " \"%v\"", &rest) ||
+	  unformat (&input, " %v", &rest))
+	{
+	  /* Remove any trailing whitespace/newline */
+	  while (vec_len (rest) > 0 && (rest[vec_len (rest) - 1] == ' ' ||
+					rest[vec_len (rest) - 1] == '\t' ||
+					rest[vec_len (rest) - 1] == '\n' ||
+					rest[vec_len (rest) - 1] == '\r' ||
+					rest[vec_len (rest) - 1] == '"'))
+	    {
+	      vec_dec_len (rest, 1);
+	    }
+	  vec_add1 (rest, 0);
+	  ovpn_options_add_push (&config->options, (char *) rest);
+	  vec_free (rest);
+	}
+    }
+  else if (unformat (&input, "dhcp-option DNS %U", unformat_ip4_address,
+		     &ip4_addr))
+    {
+      ip_address_t dns_ip;
+      ip_address_set (&dns_ip, &ip4_addr, AF_IP4);
+      ovpn_options_add_dns (&config->options, &dns_ip);
+    }
+  else if (unformat (&input, "dhcp-option DNS6 %U", unformat_ip6_address,
+		     &ip6_addr))
+    {
+      ip_address_t dns_ip;
+      ip_address_set (&dns_ip, &ip6_addr, AF_IP6);
+      ovpn_options_add_dns (&config->options, &dns_ip);
+    }
+  else if (unformat (&input, "dhcp-option WINS %U", unformat_ip4_address,
+		     &ip4_addr))
+    {
+      ip_address_t wins_ip;
+      ip_address_set (&wins_ip, &ip4_addr, AF_IP4);
+      ovpn_options_add_dhcp_option (&config->options, OVPN_DHCP_OPTION_WINS,
+				    &wins_ip);
+    }
+  else if (unformat (&input, "dhcp-option DOMAIN %s", &str_val))
+    {
+      ovpn_options_set_domain (&config->options, (char *) str_val);
       vec_free (str_val);
+    }
+  else if (unformat (&input, "dhcp-option DOMAIN-SEARCH %s", &str_val))
+    {
+      ovpn_options_add_dhcp_option (&config->options,
+				    OVPN_DHCP_OPTION_DOMAIN_SEARCH, str_val);
+      vec_free (str_val);
+    }
+  else if (unformat (&input, "dhcp-option NTP %U", unformat_ip4_address,
+		     &ip4_addr))
+    {
+      ip_address_t ntp_ip;
+      ip_address_set (&ntp_ip, &ip4_addr, AF_IP4);
+      ovpn_options_add_dhcp_option (&config->options, OVPN_DHCP_OPTION_NTP,
+				    &ntp_ip);
+    }
+  else if (unformat (&input, "dhcp-option DISABLE-NBT"))
+    {
+      u8 dummy = 0;
+      ovpn_options_add_dhcp_option (&config->options,
+				    OVPN_DHCP_OPTION_DISABLE_NBT, &dummy);
+    }
+  else if (unformat (&input, "route %U %U", unformat_ip4_address, &ip4_addr,
+		     unformat_ip4_address, &ip4_mask))
+    {
+      /* Parse route to push to clients */
+      fib_prefix_t route;
+      clib_memset (&route, 0, sizeof (route));
+      route.fp_proto = FIB_PROTOCOL_IP4;
+      route.fp_addr.ip4 = ip4_addr;
+      route.fp_len = ip4_mask_to_preflen (&ip4_mask);
+      ovpn_options_add_push_route (&config->options, &route);
+    }
+  else if (unformat (&input, "redirect-gateway"))
+    {
+      config->options.redirect_gateway = 1;
+      /* Parse optional flags */
+      if (unformat (&input, "def1"))
+	config->options.redirect_gateway_flags |= 0x01;
+      if (unformat (&input, "local"))
+	config->options.redirect_gateway_flags |= 0x02;
+      if (unformat (&input, "autolocal"))
+	config->options.redirect_gateway_flags |= 0x04;
+      if (unformat (&input, "bypass-dhcp"))
+	config->options.redirect_gateway_flags |= 0x08;
+      if (unformat (&input, "bypass-dns"))
+	config->options.redirect_gateway_flags |= 0x10;
+    }
+  else if (unformat (&input, "client-to-client"))
+    {
+      config->options.client_to_client = 1;
     }
   else if (unformat (&input, "client-config-dir %s", &str_val))
     {
@@ -471,26 +571,27 @@ parse_option (u8 *line_start, u8 *line_end, const char *base_dir,
     }
   else if (unformat (&input, "data-ciphers %s", &str_val))
     {
-      /* Use the first cipher in the list if cipher not set */
-      if (!config->options.cipher_name)
+      /* Parse data-ciphers list (colon or comma separated) */
+      ovpn_options_set_data_ciphers (&config->options, (char *) str_val);
+
+      /* Also set cipher_name to first cipher for backwards compatibility */
+      if (!config->options.cipher_name && config->options.n_data_ciphers > 0)
 	{
-	  /* Parse first cipher from comma-separated list */
-	  u8 *cipher = str_val;
-	  u8 *end = cipher;
-	  while (*end && *end != ':' && *end != ',')
-	    end++;
-	  config->options.cipher_name = vec_new (u8, end - cipher + 1);
-	  clib_memcpy (config->options.cipher_name, cipher, end - cipher);
-	  config->options.cipher_name[end - cipher] = 0;
+	  config->options.cipher_name =
+	    (u8 *) format (0, "%s%c", config->options.data_ciphers[0], 0);
 	}
       vec_free (str_val);
     }
   else if (unformat (&input, "data-ciphers-fallback %s", &str_val))
     {
-      vec_free (str_val);
+      vec_free (config->options.data_ciphers_fallback);
+      config->options.data_ciphers_fallback = str_val;
+      str_val = NULL;
     }
   else if (unformat (&input, "ncp-ciphers %s", &str_val))
     {
+      /* ncp-ciphers is deprecated alias for data-ciphers */
+      ovpn_options_set_data_ciphers (&config->options, (char *) str_val);
       vec_free (str_val);
     }
   else if (unformat (&input, "tls-version-min %s", &str_val))
@@ -910,12 +1011,7 @@ ovpn_parse_inline_instance (vlib_main_t *vm, const char *instance_name,
 	{
 	  config.local_port = (u16) u32_val;
 	}
-      else if (unformat (input, "dev %s", &str_val))
-	{
-	  vec_free (config.options.dev_name);
-	  config.options.dev_name = (char *) str_val;
-	  str_val = NULL;
-	}
+      /* dev-type must be checked before "dev %s" to avoid partial match */
       else if (unformat (input, "dev-type tun"))
 	{
 	  config.options.is_tun = 1;
@@ -923,6 +1019,12 @@ ovpn_parse_inline_instance (vlib_main_t *vm, const char *instance_name,
       else if (unformat (input, "dev-type tap"))
 	{
 	  config.options.is_tun = 0;
+	}
+      else if (unformat (input, "dev %s", &str_val))
+	{
+	  vec_free (config.options.dev_name);
+	  config.options.dev_name = (char *) str_val;
+	  str_val = NULL;
 	}
       /* Server mode */
       else if (unformat (input, "server %U %U", unformat_ip4_address,
@@ -1024,6 +1126,80 @@ ovpn_parse_inline_instance (vlib_main_t *vm, const char *instance_name,
       else if (unformat (input, "max-clients %u", &u32_val))
 	{
 	  config.options.max_clients = u32_val;
+	}
+      /* Push options - handle quoted strings */
+      else if (unformat (input, "push"))
+	{
+	  /*
+	   * Try to parse: push "option value" or push option
+	   * VPP's unformat doesn't handle quotes well, so we use %v
+	   */
+	  if (unformat (input, " \"%v\"", &str_val) ||
+	      unformat (input, " %s", &str_val))
+	    {
+	      /* Null-terminate the vector */
+	      vec_add1 (str_val, 0);
+	      ovpn_options_add_push (&config.options, (char *) str_val);
+	      vec_free (str_val);
+	    }
+	}
+      /* DHCP options */
+      else if (unformat (input, "dhcp-option DNS %U", unformat_ip4_address,
+			 &ip4_addr))
+	{
+	  ip_address_t dns_ip;
+	  ip_address_set (&dns_ip, &ip4_addr, AF_IP4);
+	  ovpn_options_add_dns (&config.options, &dns_ip);
+	}
+      else if (unformat (input, "dhcp-option DOMAIN %s", &str_val))
+	{
+	  ovpn_options_set_domain (&config.options, (char *) str_val);
+	  vec_free (str_val);
+	}
+      else if (unformat (input, "dhcp-option WINS %U", unformat_ip4_address,
+			 &ip4_addr))
+	{
+	  ip_address_t wins_ip;
+	  ip_address_set (&wins_ip, &ip4_addr, AF_IP4);
+	  ovpn_options_add_dhcp_option (&config.options, OVPN_DHCP_OPTION_WINS,
+					&wins_ip);
+	}
+      /* Route options */
+      else if (unformat (input, "route %U %U", unformat_ip4_address, &ip4_addr,
+			 unformat_ip4_address, &ip4_mask))
+	{
+	  fib_prefix_t route;
+	  clib_memset (&route, 0, sizeof (route));
+	  route.fp_proto = FIB_PROTOCOL_IP4;
+	  route.fp_addr.ip4 = ip4_addr;
+	  route.fp_len = ip4_mask_to_preflen (&ip4_mask);
+	  ovpn_options_add_push_route (&config.options, &route);
+	}
+      else if (unformat (input, "redirect-gateway"))
+	{
+	  config.options.redirect_gateway = 1;
+	}
+      /* Data ciphers */
+      else if (unformat (input, "data-ciphers %s", &str_val))
+	{
+	  ovpn_options_set_data_ciphers (&config.options, (char *) str_val);
+	  if (!config.options.cipher_name && config.options.n_data_ciphers > 0)
+	    {
+	      config.options.cipher_name =
+		(u8 *) format (0, "%s%c", config.options.data_ciphers[0], 0);
+	    }
+	  vec_free (str_val);
+	}
+      else if (unformat (input, "data-ciphers-fallback %s", &str_val))
+	{
+	  vec_free (config.options.data_ciphers_fallback);
+	  config.options.data_ciphers_fallback = str_val;
+	  str_val = NULL;
+	}
+      /* Client-to-client */
+      else if (unformat (input, "client-to-client"))
+	{
+	  config.options.client_to_client = 1;
 	}
       else
 	{

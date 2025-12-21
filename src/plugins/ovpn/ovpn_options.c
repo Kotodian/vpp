@@ -678,6 +678,422 @@ ovpn_setup_static_key_crypto (ovpn_crypto_context_t *ctx,
 }
 
 /*
+ * Add a push option to the options list
+ */
+int
+ovpn_options_add_push (ovpn_options_t *opts, const char *option)
+{
+  u8 *option_copy;
+
+  if (!opts || !option)
+    return -1;
+
+  if (opts->n_push_options >= OVPN_MAX_PUSH_OPTIONS)
+    return -2; /* Too many push options */
+
+  /* Copy the option string */
+  option_copy = format (0, "%s%c", option, 0);
+
+  vec_add1 (opts->push_options, option_copy);
+  opts->n_push_options++;
+
+  return 0;
+}
+
+/*
+ * Add a DHCP option
+ */
+int
+ovpn_options_add_dhcp_option (ovpn_options_t *opts,
+			      ovpn_dhcp_option_type_t type, const void *value)
+{
+  ovpn_dhcp_option_t dhcp_opt;
+
+  if (!opts || !value)
+    return -1;
+
+  clib_memset (&dhcp_opt, 0, sizeof (dhcp_opt));
+  dhcp_opt.type = type;
+
+  switch (type)
+    {
+    case OVPN_DHCP_OPTION_DNS:
+    case OVPN_DHCP_OPTION_WINS:
+    case OVPN_DHCP_OPTION_NTP:
+    case OVPN_DHCP_OPTION_NBDD:
+      ip_address_copy (&dhcp_opt.ip, (const ip_address_t *) value);
+      break;
+
+    case OVPN_DHCP_OPTION_DOMAIN:
+    case OVPN_DHCP_OPTION_DOMAIN_SEARCH:
+      dhcp_opt.string = format (0, "%s%c", (const char *) value, 0);
+      break;
+
+    case OVPN_DHCP_OPTION_NBT:
+      dhcp_opt.nbt_type = *(const u8 *) value;
+      break;
+
+    case OVPN_DHCP_OPTION_DISABLE_NBT:
+      /* No value needed */
+      break;
+
+    default:
+      return -2;
+    }
+
+  vec_add1 (opts->dhcp_options, dhcp_opt);
+  opts->n_dhcp_options++;
+
+  return 0;
+}
+
+/*
+ * Add a DNS server (convenience wrapper)
+ */
+int
+ovpn_options_add_dns (ovpn_options_t *opts, const ip_address_t *dns_ip)
+{
+  if (opts->n_dhcp_options >= OVPN_MAX_DNS_SERVERS * 2)
+    return -1;
+
+  return ovpn_options_add_dhcp_option (opts, OVPN_DHCP_OPTION_DNS, dns_ip);
+}
+
+/*
+ * Set domain name (convenience wrapper)
+ */
+int
+ovpn_options_set_domain (ovpn_options_t *opts, const char *domain)
+{
+  return ovpn_options_add_dhcp_option (opts, OVPN_DHCP_OPTION_DOMAIN, domain);
+}
+
+/*
+ * Add a data cipher to the negotiation list
+ */
+int
+ovpn_options_add_data_cipher (ovpn_options_t *opts, const char *cipher_name)
+{
+  u8 *cipher_copy;
+
+  if (!opts || !cipher_name)
+    return -1;
+
+  if (opts->n_data_ciphers >= OVPN_MAX_DATA_CIPHERS)
+    return -2;
+
+  cipher_copy = format (0, "%s%c", cipher_name, 0);
+  vec_add1 (opts->data_ciphers, cipher_copy);
+  opts->n_data_ciphers++;
+
+  return 0;
+}
+
+/*
+ * Set data ciphers from colon-separated string
+ * Format: "AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"
+ */
+int
+ovpn_options_set_data_ciphers (ovpn_options_t *opts, const char *cipher_list)
+{
+  const char *p, *start;
+  u8 *cipher_name;
+
+  if (!opts || !cipher_list)
+    return -1;
+
+  /* Free existing ciphers */
+  for (u32 i = 0; i < opts->n_data_ciphers; i++)
+    vec_free (opts->data_ciphers[i]);
+  vec_free (opts->data_ciphers);
+  opts->n_data_ciphers = 0;
+
+  /* Parse colon-separated list */
+  p = cipher_list;
+  while (*p)
+    {
+      /* Skip leading whitespace */
+      while (*p == ' ' || *p == '\t')
+	p++;
+
+      if (!*p)
+	break;
+
+      start = p;
+
+      /* Find end of cipher name */
+      while (*p && *p != ':' && *p != ',' && *p != ' ' && *p != '\t')
+	p++;
+
+      if (p > start)
+	{
+	  cipher_name = vec_new (u8, p - start + 1);
+	  clib_memcpy (cipher_name, start, p - start);
+	  cipher_name[p - start] = 0;
+
+	  vec_add1 (opts->data_ciphers, cipher_name);
+	  opts->n_data_ciphers++;
+
+	  if (opts->n_data_ciphers >= OVPN_MAX_DATA_CIPHERS)
+	    break;
+	}
+
+      /* Skip delimiter */
+      if (*p == ':' || *p == ',')
+	p++;
+    }
+
+  return 0;
+}
+
+/*
+ * Add a route to push to clients
+ */
+int
+ovpn_options_add_push_route (ovpn_options_t *opts, const fib_prefix_t *prefix)
+{
+  if (!opts || !prefix)
+    return -1;
+
+  vec_add1 (opts->push_routes, *prefix);
+  opts->n_push_routes++;
+
+  return 0;
+}
+
+/*
+ * Build push options string to send to client
+ * Format: "push \"option\",push \"option\"..."
+ */
+int
+ovpn_options_build_push_reply (const ovpn_options_t *opts, char *buf,
+			       u32 buf_len)
+{
+  int offset = 0;
+  int written;
+
+  if (!opts || !buf || buf_len < 16)
+    return -1;
+
+  /* Add DHCP options as push directives */
+  for (u32 i = 0; i < opts->n_dhcp_options; i++)
+    {
+      const ovpn_dhcp_option_t *dhcp = &opts->dhcp_options[i];
+      char ip_str[INET6_ADDRSTRLEN];
+
+      switch (dhcp->type)
+	{
+	case OVPN_DHCP_OPTION_DNS:
+	  if (dhcp->ip.version == AF_IP4)
+	    {
+	      inet_ntop (AF_INET, &dhcp->ip.ip.ip4, ip_str, sizeof (ip_str));
+	      written = snprintf (buf + offset, buf_len - offset,
+				  "%sdhcp-option DNS %s",
+				  offset > 0 ? "," : "", ip_str);
+	    }
+	  else
+	    {
+	      inet_ntop (AF_INET6, &dhcp->ip.ip.ip6, ip_str, sizeof (ip_str));
+	      written = snprintf (buf + offset, buf_len - offset,
+				  "%sdhcp-option DNS6 %s",
+				  offset > 0 ? "," : "", ip_str);
+	    }
+	  if (written > 0 && (u32) written < buf_len - offset)
+	    offset += written;
+	  break;
+
+	case OVPN_DHCP_OPTION_WINS:
+	  inet_ntop (AF_INET, &dhcp->ip.ip.ip4, ip_str, sizeof (ip_str));
+	  written =
+	    snprintf (buf + offset, buf_len - offset, "%sdhcp-option WINS %s",
+		      offset > 0 ? "," : "", ip_str);
+	  if (written > 0 && (u32) written < buf_len - offset)
+	    offset += written;
+	  break;
+
+	case OVPN_DHCP_OPTION_DOMAIN:
+	  written = snprintf (buf + offset, buf_len - offset,
+			      "%sdhcp-option DOMAIN %s", offset > 0 ? "," : "",
+			      dhcp->string);
+	  if (written > 0 && (u32) written < buf_len - offset)
+	    offset += written;
+	  break;
+
+	case OVPN_DHCP_OPTION_DOMAIN_SEARCH:
+	  written = snprintf (buf + offset, buf_len - offset,
+			      "%sdhcp-option DOMAIN-SEARCH %s",
+			      offset > 0 ? "," : "", dhcp->string);
+	  if (written > 0 && (u32) written < buf_len - offset)
+	    offset += written;
+	  break;
+
+	default:
+	  break;
+	}
+    }
+
+  /* Add routes */
+  for (u32 i = 0; i < opts->n_push_routes; i++)
+    {
+      const fib_prefix_t *route = &opts->push_routes[i];
+      char ip_str[INET6_ADDRSTRLEN];
+      char mask_str[INET_ADDRSTRLEN];
+
+      if (route->fp_proto == FIB_PROTOCOL_IP4)
+	{
+	  ip4_address_t netmask;
+	  ip4_preflen_to_mask (route->fp_len, &netmask);
+
+	  inet_ntop (AF_INET, &route->fp_addr.ip4, ip_str, sizeof (ip_str));
+	  inet_ntop (AF_INET, &netmask, mask_str, sizeof (mask_str));
+
+	  written = snprintf (buf + offset, buf_len - offset, "%sroute %s %s",
+			      offset > 0 ? "," : "", ip_str, mask_str);
+	}
+      else
+	{
+	  inet_ntop (AF_INET6, &route->fp_addr.ip6, ip_str, sizeof (ip_str));
+	  written =
+	    snprintf (buf + offset, buf_len - offset, "%sroute-ipv6 %s/%u",
+		      offset > 0 ? "," : "", ip_str, route->fp_len);
+	}
+      if (written > 0 && (u32) written < buf_len - offset)
+	offset += written;
+    }
+
+  /* Add redirect-gateway if set */
+  if (opts->redirect_gateway)
+    {
+      written = snprintf (buf + offset, buf_len - offset, "%sredirect-gateway",
+			  offset > 0 ? "," : "");
+      if (written > 0 && (u32) written < buf_len - offset)
+	offset += written;
+
+      /* Add flags */
+      if (opts->redirect_gateway_flags & 0x01) /* def1 */
+	{
+	  written = snprintf (buf + offset, buf_len - offset, " def1");
+	  if (written > 0 && (u32) written < buf_len - offset)
+	    offset += written;
+	}
+    }
+
+  /* Add custom push options */
+  for (u32 i = 0; i < opts->n_push_options; i++)
+    {
+      written = snprintf (buf + offset, buf_len - offset, "%s%s",
+			  offset > 0 ? "," : "", opts->push_options[i]);
+      if (written > 0 && (u32) written < buf_len - offset)
+	offset += written;
+    }
+
+  if ((u32) offset < buf_len)
+    buf[offset] = '\0';
+
+  return offset;
+}
+
+/*
+ * Free all dynamically allocated options
+ */
+void
+ovpn_options_free_dynamic (ovpn_options_t *opts)
+{
+  if (!opts)
+    return;
+
+  /* Free push options */
+  for (u32 i = 0; i < opts->n_push_options; i++)
+    vec_free (opts->push_options[i]);
+  vec_free (opts->push_options);
+  opts->n_push_options = 0;
+
+  /* Free DHCP options */
+  for (u32 i = 0; i < opts->n_dhcp_options; i++)
+    {
+      ovpn_dhcp_option_t *dhcp = &opts->dhcp_options[i];
+      if (dhcp->type == OVPN_DHCP_OPTION_DOMAIN ||
+	  dhcp->type == OVPN_DHCP_OPTION_DOMAIN_SEARCH)
+	{
+	  vec_free (dhcp->string);
+	}
+    }
+  vec_free (opts->dhcp_options);
+  opts->n_dhcp_options = 0;
+
+  /* Free data ciphers */
+  for (u32 i = 0; i < opts->n_data_ciphers; i++)
+    vec_free (opts->data_ciphers[i]);
+  vec_free (opts->data_ciphers);
+  vec_free (opts->data_ciphers_fallback);
+  opts->n_data_ciphers = 0;
+
+  /* Free push routes */
+  vec_free (opts->push_routes);
+  opts->n_push_routes = 0;
+}
+
+/*
+ * Negotiate cipher between server's data-ciphers and client's IV_CIPHERS
+ *
+ * Server's ciphers are in preference order. Find the first one that
+ * the client also supports.
+ */
+const char *
+ovpn_options_negotiate_cipher (const ovpn_options_t *opts,
+			       const char *client_ciphers)
+{
+  if (!opts || !client_ciphers)
+    return NULL;
+
+  /* If server has no data-ciphers configured, use cipher_name or default */
+  if (opts->n_data_ciphers == 0)
+    {
+      if (opts->cipher_name)
+	return (const char *) opts->cipher_name;
+      return "AES-256-GCM"; /* Default */
+    }
+
+  /* Check each server cipher against client's list */
+  for (u32 i = 0; i < opts->n_data_ciphers; i++)
+    {
+      const char *server_cipher = (const char *) opts->data_ciphers[i];
+      const char *p = client_ciphers;
+
+      while (*p)
+	{
+	  const char *start = p;
+
+	  /* Find end of this cipher name */
+	  while (*p && *p != ':' && *p != ',')
+	    p++;
+
+	  /* Compare (case-insensitive) */
+	  size_t len = p - start;
+	  if (len == strlen (server_cipher) &&
+	      strncasecmp (start, server_cipher, len) == 0)
+	    {
+	      return server_cipher;
+	    }
+
+	  /* Skip delimiter */
+	  if (*p == ':' || *p == ',')
+	    p++;
+	}
+    }
+
+  /* No match found - use fallback if configured */
+  if (opts->data_ciphers_fallback)
+    return (const char *) opts->data_ciphers_fallback;
+
+  /* Last resort: use first server cipher */
+  if (opts->n_data_ciphers > 0)
+    return (const char *) opts->data_ciphers[0];
+
+  return NULL;
+}
+
+/*
  * fd.io coding-style-patch-verification: ON
  *
  * Local Variables:

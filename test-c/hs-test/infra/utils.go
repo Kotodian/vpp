@@ -67,7 +67,8 @@ func AssertFileSize(f1, f2 string) error {
 }
 
 func (c *Stanza) NewStanza(name string) *Stanza {
-	c.Append("\n" + name + " {")
+	c.content += strings.Repeat(" ", c.pad)
+	c.content += name + " {\n"
 	c.pad += 2
 	return c
 }

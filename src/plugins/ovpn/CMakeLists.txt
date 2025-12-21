@@ -70,6 +70,7 @@ add_vpp_plugin(ovpn_unittest
   test/ovpn_buffer_test.c
   test/ovpn_handshake_test.c
   test/ovpn_crypto_test.c
+  test/ovpn_options_test.c
   ovpn_reliable.c
   ovpn_ssl.c
   ovpn_crypto.c

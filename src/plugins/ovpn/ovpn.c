@@ -284,8 +284,8 @@ ovpn_cleanup_picotls_context_for_instance (ovpn_instance_t *inst)
  */
 
 int
-ovpn_instance_create (vlib_main_t *vm, ip_address_t *local_addr, u16 local_port,
-		      u32 table_id, ovpn_options_t *options,
+ovpn_instance_create (vlib_main_t *vm, ip_address_t *local_addr,
+		      u16 local_port, u32 table_id, ovpn_options_t *options,
 		      u32 *instance_id_out, u32 *sw_if_index_out)
 {
   ovpn_main_t *omp = &ovpn_main;
@@ -312,12 +312,10 @@ ovpn_instance_create (vlib_main_t *vm, ip_address_t *local_addr, u16 local_port,
 
   /* Setup per-instance FIB tables */
   inst->fib_table_id = table_id;
-  inst->fib_index4 =
-    fib_table_find_or_create_and_lock (FIB_PROTOCOL_IP4, table_id,
-				       omp->fib_src_hi);
-  inst->fib_index6 =
-    fib_table_find_or_create_and_lock (FIB_PROTOCOL_IP6, table_id,
-				       omp->fib_src_hi);
+  inst->fib_index4 = fib_table_find_or_create_and_lock (
+    FIB_PROTOCOL_IP4, table_id, omp->fib_src_hi);
+  inst->fib_index6 = fib_table_find_or_create_and_lock (
+    FIB_PROTOCOL_IP6, table_id, omp->fib_src_hi);
 
   /* Copy options to instance */
   clib_memcpy (&inst->options, options, sizeof (ovpn_options_t));
@@ -490,16 +488,16 @@ ovpn_show_command_fn (vlib_main_t *vm,
       return 0;
     }
 
-  vlib_cli_output (vm, "OpenVPN Instances (%u configured):",
-		   pool_elts (omp->instances));
+  vlib_cli_output (
+    vm, "OpenVPN Instances (%u configured):", pool_elts (omp->instances));
 
   pool_foreach (inst, omp->instances)
     {
       ovpn_options_t *opt = &inst->options;
 
-      vlib_cli_output (vm, "\nInstance %u (interface %s, sw_if_index %u):",
-		       inst->instance_id, inst->options.dev_name,
-		       inst->sw_if_index);
+      vlib_cli_output (
+	vm, "\nInstance %u (interface %s, sw_if_index %u):", inst->instance_id,
+	inst->options.dev_name, inst->sw_if_index);
       vlib_cli_output (vm, "  Status: %s",
 		       inst->is_active ? "Active" : "Inactive");
       vlib_cli_output (vm, "  Local: %U port %u", format_ip_address,
@@ -521,11 +519,12 @@ ovpn_show_command_fn (vlib_main_t *vm,
 
       vlib_cli_output (
 	vm, "  Cipher Algorithm: %s",
-	inst->cipher_alg == OVPN_CIPHER_ALG_AES_128_GCM	     ? "AES-128-GCM" :
-	inst->cipher_alg == OVPN_CIPHER_ALG_AES_256_GCM	     ? "AES-256-GCM" :
-	inst->cipher_alg == OVPN_CIPHER_ALG_CHACHA20_POLY1305 ? "CHACHA20-POLY1305" :
-	inst->cipher_alg == OVPN_CIPHER_ALG_AES_256_CBC	     ? "AES-256-CBC" :
-							       "NONE");
+	inst->cipher_alg == OVPN_CIPHER_ALG_AES_128_GCM ? "AES-128-GCM" :
+	inst->cipher_alg == OVPN_CIPHER_ALG_AES_256_GCM ? "AES-256-GCM" :
+	inst->cipher_alg == OVPN_CIPHER_ALG_CHACHA20_POLY1305 ?
+							  "CHACHA20-POLY1305" :
+	inst->cipher_alg == OVPN_CIPHER_ALG_AES_256_CBC ? "AES-256-CBC" :
+							  "NONE");
 
       if (inst->tls_crypt.enabled)
 	vlib_cli_output (vm, "  TLS-Crypt: enabled");
@@ -536,6 +535,59 @@ ovpn_show_command_fn (vlib_main_t *vm,
 		       opt->keepalive_ping, opt->keepalive_timeout);
       vlib_cli_output (vm, "  Peers: %u",
 		       pool_elts (inst->multi_context.peer_db.peers));
+
+      /* Show data ciphers */
+      if (opt->n_data_ciphers > 0)
+	{
+	  vlib_cli_output (vm, "  Data Ciphers (%u):", opt->n_data_ciphers);
+	  for (u32 i = 0; i < opt->n_data_ciphers; i++)
+	    vlib_cli_output (vm, "    [%u] %s", i, opt->data_ciphers[i]);
+	}
+
+      /* Show DHCP options */
+      if (opt->n_dhcp_options > 0)
+	{
+	  vlib_cli_output (vm, "  DHCP Options (%u):", opt->n_dhcp_options);
+	  for (u32 i = 0; i < opt->n_dhcp_options; i++)
+	    {
+	      ovpn_dhcp_option_t *dhcp = &opt->dhcp_options[i];
+	      const char *type_str =
+		dhcp->type == OVPN_DHCP_OPTION_DNS	   ? "DNS" :
+		dhcp->type == OVPN_DHCP_OPTION_WINS	   ? "WINS" :
+		dhcp->type == OVPN_DHCP_OPTION_DOMAIN	   ? "DOMAIN" :
+		dhcp->type == OVPN_DHCP_OPTION_NTP	   ? "NTP" :
+		dhcp->type == OVPN_DHCP_OPTION_DISABLE_NBT ? "DISABLE-NBT" :
+							     "UNKNOWN";
+	      if (dhcp->type == OVPN_DHCP_OPTION_DOMAIN && dhcp->string)
+		vlib_cli_output (vm, "    %s: %s", type_str, dhcp->string);
+	      else
+		vlib_cli_output (vm, "    %s: %U", type_str, format_ip_address,
+				 &dhcp->ip);
+	    }
+	}
+
+      /* Show push routes */
+      if (opt->n_push_routes > 0)
+	{
+	  vlib_cli_output (vm, "  Push Routes (%u):", opt->n_push_routes);
+	  for (u32 i = 0; i < opt->n_push_routes; i++)
+	    vlib_cli_output (vm, "    [%u] %U", i, format_fib_prefix,
+			     &opt->push_routes[i]);
+	}
+
+      /* Show custom push options */
+      if (opt->n_push_options > 0)
+	{
+	  vlib_cli_output (vm,
+			   "  Custom Push Options (%u):", opt->n_push_options);
+	  for (u32 i = 0; i < opt->n_push_options; i++)
+	    vlib_cli_output (vm, "    [%u] %s", i, opt->push_options[i]);
+	}
+
+      /* Show redirect gateway */
+      if (opt->redirect_gateway)
+	vlib_cli_output (vm, "  Redirect Gateway: enabled (flags: 0x%x)",
+			 opt->redirect_gateway_flags);
     }
 
   return 0;
@@ -766,7 +818,8 @@ ovpn_create_command_fn (vlib_main_t *vm, unformat_input_t *input,
     }
   if (server_key)
     {
-      error = ovpn_read_file_contents ((char *) server_key, &options.server_key);
+      error =
+	ovpn_read_file_contents ((char *) server_key, &options.server_key);
       if (error)
 	goto done;
     }
@@ -808,7 +861,8 @@ ovpn_create_command_fn (vlib_main_t *vm, unformat_input_t *input,
       if (!options.static_key)
 	{
 	  vec_free (key_contents);
-	  error = clib_error_return (0, "failed to allocate static key memory");
+	  error =
+	    clib_error_return (0, "failed to allocate static key memory");
 	  goto done;
 	}
 
@@ -945,8 +999,8 @@ ovpn_init (vlib_main_t *vm)
   omp->out6_fq_index = vlib_frame_queue_main_init (ovpn6_output_node.index, 0);
 
   /* Allocate high-priority FIB source for tunnel routes */
-  omp->fib_src_hi = fib_source_allocate ("ovpn-hi", FIB_SOURCE_PRIORITY_HI,
-					 FIB_SOURCE_BH_API);
+  omp->fib_src_hi =
+    fib_source_allocate ("ovpn-hi", FIB_SOURCE_PRIORITY_HI, FIB_SOURCE_BH_API);
 
   /* Initialize crypto subsystem */
   error = ovpn_crypto_init (vm);
@@ -1009,7 +1063,8 @@ ovpn_periodic_process (vlib_main_t *vm, vlib_node_runtime_t *rt,
 	    /* First pass: check if any updates pending */
 	    pool_foreach (peer, inst->multi_context.peer_db.peers)
 	      {
-		if (__atomic_load_n (&peer->pending_addr_update, __ATOMIC_ACQUIRE))
+		if (__atomic_load_n (&peer->pending_addr_update,
+				     __ATOMIC_ACQUIRE))
 		  n_updates++;
 	      }
 
@@ -1081,8 +1136,8 @@ ovpn_periodic_process (vlib_main_t *vm, vlib_node_runtime_t *rt,
 		{
 		  /* Start server-initiated rekey */
 		  u8 new_key_id = ovpn_peer_next_key_id (peer);
-		  int rv =
-		    ovpn_peer_start_rekey (vm, peer, inst->ptls_ctx, new_key_id);
+		  int rv = ovpn_peer_start_rekey (vm, peer, inst->ptls_ctx,
+						  new_key_id);
 		  if (rv == 0)
 		    {
 		      peer->rekey_initiated = 1;
