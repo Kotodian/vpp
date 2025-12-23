@@ -695,7 +695,7 @@ ovpn_peer_tls_init (ovpn_peer_t *peer, ptls_context_t *ptls_ctx, u8 key_id)
   /* Initialize key exchange flags */
   tls_ctx->key_method_sent = 0;
   tls_ctx->key_method_received = 0;
-  tls_ctx->use_tls_ekm = 0; /* Default to PRF method for compatibility */
+  tls_ctx->use_tls_ekm = 0; /* Use PRF-based key derivation for compatibility */
 
   /* Initialize plaintext read buffer for decrypted application data */
   tls_ctx->plaintext_read_buf.capacity = 2048;
@@ -864,9 +864,14 @@ ovpn_peer_tls_process (ovpn_peer_t *peer, u8 *data, u32 len)
       size_t consumed = len;
       ret = ptls_receive (tls_ctx->tls, &plaintext, data, &consumed);
 
+      clib_warning ("ptls_receive: ret=%d, consumed=%zu, len=%u, "
+		    "plaintext.off=%zu",
+		    ret, consumed, len, plaintext.off);
+
       if (ret != 0)
 	{
 	  /* Error decrypting */
+	  clib_warning ("ptls_receive error: %d", ret);
 	  ptls_buffer_dispose (&plaintext);
 	  ptls_buffer_dispose (&sendbuf);
 	  return -1;

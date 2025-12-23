@@ -237,6 +237,7 @@ ovpn_init_picotls_context_for_instance (ovpn_instance_t *inst)
   ctx->get_time = &ptls_get_time;
   ctx->require_dhe_on_psk = 1;
   ctx->max_early_data_size = 0;
+  ctx->use_exporter = 1; /* Enable TLS-EKM (RFC 5705) for OpenVPN key derivation */
 
   /* Load certificates if provided */
   if (inst->options.server_cert && inst->options.server_key)

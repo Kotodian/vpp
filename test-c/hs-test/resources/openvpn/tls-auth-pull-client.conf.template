@@ -1,0 +1,40 @@
+# OpenVPN TLS-Auth client configuration with pull mode for PUSH_REPLY testing
+# This template tests PUSH_REQUEST/PUSH_REPLY functionality
+
+# Pull mode - this causes client to send PUSH_REQUEST to server
+client
+pull
+
+dev tun
+proto udp
+remote {{.ServerAddress}} {{.ServerPort}}
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+
+# TLS mode with certificates
+ca /etc/openvpn/ca.crt
+cert /etc/openvpn/client.crt
+key /etc/openvpn/client.key
+
+# TLS-Auth for control channel HMAC authentication
+# key-direction 1 = client mode (matches VPP server with direction 0)
+tls-auth /etc/openvpn/ta.key 1
+
+# Cipher and auth settings
+cipher AES-256-GCM
+auth SHA256
+
+# TLS settings - client-side TLS
+tls-client
+
+# Keepalive
+keepalive 10 60
+
+# Verbosity - use high level for debugging
+verb 7
+
+# Log file
+log /tmp/openvpn/client.log
+status /tmp/openvpn/status.log 10

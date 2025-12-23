@@ -492,9 +492,19 @@ ovpn_derive_data_channel_keys_v2 (ptls_t *tls,
       if (!tls)
 	return -2;
 
-      /* Export enough key material for both directions */
+      /* Debug: check TLS handshake state */
+      clib_warning (
+	"DEBUG TLS-EKM: tls=%p, handshake_complete=%d, is_psk_handshake=%d",
+	tls, ptls_handshake_is_complete (tls), ptls_is_psk_handshake (tls));
+
+      /*
+       * Export key material with empty context
+       * OpenVPN 2.6 TLS-EKM uses empty context for key derivation
+       * The last parameter is_early=0 for post-handshake exporter secret
+       */
       ret = ptls_export_secret (tls, exported_keys, sizeof (exported_keys),
 				label, ptls_iovec_init (NULL, 0), 0);
+      clib_warning ("DEBUG TLS-EKM: ptls_export_secret returned %d", ret);
       if (ret != 0)
 	return -3;
 

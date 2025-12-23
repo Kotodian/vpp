@@ -112,6 +112,31 @@ func (s *OvpnSuite) GetOvpnTlsAuthConfig(instanceName string) Stanza {
 	return config
 }
 
+// GetOvpnTlsAuthWithPushConfig returns a Stanza for OpenVPN TLS-Auth mode with push options
+func (s *OvpnSuite) GetOvpnTlsAuthWithPushConfig(instanceName string) Stanza {
+	var config Stanza
+	config.NewStanza("openvpn").
+		NewStanza(fmt.Sprintf("instance %s", instanceName)).
+		Append(fmt.Sprintf("local %s", s.VppOvpnAddr())).
+		Append(fmt.Sprintf("port %s", s.Ports.Ovpn)).
+		Append("dev ovpn0").
+		Append("dev-type tun").
+		Append("ca /tmp/ca.crt").
+		Append("cert /tmp/server.crt").
+		Append("key /tmp/server.key").
+		Append("tls-auth /tmp/ta.key").
+		// Push options for client
+		Append("route 10.0.0.0 255.0.0.0").
+		Append("dhcp-option DNS 8.8.8.8").
+		Append("dhcp-option DNS 8.8.4.4").
+		Append("dhcp-option DOMAIN vpn.example.com").
+		Append("push persist-tun").
+		Append("keepalive 10 60").
+		Close().
+		Close()
+	return config
+}
+
 // GetOvpnTlsCryptConfig returns a Stanza for OpenVPN TLS-Crypt mode
 func (s *OvpnSuite) GetOvpnTlsCryptConfig(instanceName string) Stanza {
 	var config Stanza
@@ -463,6 +488,66 @@ func (s *OvpnSuite) SetupVppOvpnTlsAuth() {
 
 	// Configure interface IP and state
 	s.ConfigureOvpnInterface()
+}
+
+// SetupVppOvpnTlsAuthWithPush sets up VPP with OpenVPN TLS-Auth mode and push options
+func (s *OvpnSuite) SetupVppOvpnTlsAuthWithPush() {
+	// Copy TLS certificates and keys to container before VPP starts
+	s.CopyTlsCertsToVpp()
+	s.CopyTlsAuthKeyToVpp()
+
+	// Get OpenVPN TLS-Auth configuration with push options
+	ovpnConfig := s.GetOvpnTlsAuthWithPushConfig("tls-auth-push-server")
+	s.Log("OpenVPN startup config with push:\n" + ovpnConfig.ToString())
+
+	// Start VPP with OpenVPN configuration
+	s.StartVppWithOvpnConfig(ovpnConfig)
+
+	// Configure interface IP and state
+	s.ConfigureOvpnInterface()
+}
+
+// CreateOpenVpnTlsAuthPullClientConfig creates the OpenVPN TLS-Auth client config with pull mode
+// This enables PUSH_REQUEST/PUSH_REPLY functionality testing
+func (s *OvpnSuite) CreateOpenVpnTlsAuthPullClientConfig() {
+	values := struct {
+		ServerAddress string
+		ServerPort    string
+	}{
+		ServerAddress: s.VppOvpnAddr(),
+		ServerPort:    s.Ports.Ovpn,
+	}
+
+	// Create log and config directories in container
+	s.Containers.OpenVpnClient.Exec(false, "mkdir -p /tmp/openvpn")
+	s.Containers.OpenVpnClient.Exec(false, "mkdir -p /etc/openvpn")
+
+	// Copy CA certificate
+	caCert, err := os.ReadFile("./resources/openvpn/tls/ca.crt")
+	s.AssertNil(err, "failed to read ca.crt")
+	s.Containers.OpenVpnClient.CreateFile("/etc/openvpn/ca.crt", string(caCert))
+
+	// Copy client certificate
+	clientCert, err := os.ReadFile("./resources/openvpn/tls/client.crt")
+	s.AssertNil(err, "failed to read client.crt")
+	s.Containers.OpenVpnClient.CreateFile("/etc/openvpn/client.crt", string(clientCert))
+
+	// Copy client key
+	clientKey, err := os.ReadFile("./resources/openvpn/tls/client.key")
+	s.AssertNil(err, "failed to read client.key")
+	s.Containers.OpenVpnClient.CreateFile("/etc/openvpn/client.key", string(clientKey))
+
+	// Copy TLS-Auth key
+	taKey, err := os.ReadFile("./resources/openvpn/tls/ta.key")
+	s.AssertNil(err, "failed to read ta.key")
+	s.Containers.OpenVpnClient.CreateFile("/etc/openvpn/ta.key", string(taKey))
+
+	// Create client config from template with pull mode
+	s.Containers.OpenVpnClient.CreateConfigFromTemplate(
+		"/etc/openvpn/client.conf",
+		"./resources/openvpn/tls-auth-pull-client.conf.template",
+		values,
+	)
 }
 
 // CreateOpenVpnTlsAuthClientConfig creates the OpenVPN TLS-Auth client configuration

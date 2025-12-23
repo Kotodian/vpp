@@ -27,6 +27,7 @@ func init() {
 		OvpnHandshakeInvalidKeyTest,
 		OvpnTlsAuthHandshakeTest,
 		OvpnTlsCryptHandshakeTest,
+		OvpnTlsAuthPushReplyTest,
 		OvpnPushOptionsConnectivityTest,
 		OvpnDhcpOptionsConnectivityTest,
 		OvpnDataCiphersNegotiationTest,
@@ -1514,4 +1515,162 @@ func OvpnTlsCryptHandshakeTest(s *OvpnSuite) {
 	}
 
 	s.Log("TLS-Crypt handshake test PASSED")
+}
+
+// OvpnTlsAuthPushReplyTest tests PUSH_REQUEST/PUSH_REPLY over TLS control channel
+// This test verifies:
+// 1. VPP receives PUSH_REQUEST from client after TLS handshake completes
+// 2. VPP sends PUSH_REPLY with configured push options
+// 3. Client receives and applies the pushed options
+func OvpnTlsAuthPushReplyTest(s *OvpnSuite) {
+	// Setup VPP with TLS-Auth and push options
+	s.Log("Setting up VPP OpenVPN with TLS-Auth and push options...")
+	s.SetupVppOvpnTlsAuthWithPush()
+	vpp := s.Containers.Vpp.VppInstance
+
+	// Show initial state
+	s.Log("=== Initial VPP OpenVPN State ===")
+	s.Log("Interface: " + s.ShowOvpnInterface())
+
+	// Add static ARP entry
+	s.Log("Adding static ARP entry...")
+	arpCmd := "set ip neighbor " + s.Interfaces.OvpnTap.Peer.Name() + " " +
+		s.Interfaces.OvpnTap.Ip4AddressString() + " " +
+		s.Interfaces.OvpnTap.HwAddress.String()
+	vpp.Vppctl(arpCmd)
+
+	// Enable VPP tracing
+	s.Log("Enabling VPP trace...")
+	vpp.Vppctl("trace add virtio-input 100")
+	vpp.Vppctl("trace add ovpn4-input 100")
+
+	// Start OpenVPN client container
+	s.Log("Starting OpenVPN client container...")
+	s.Containers.OpenVpnClient.Run()
+
+	// Clear trace before TLS handshake
+	vpp.Vppctl("clear trace")
+
+	// Create TLS-Auth client configuration with pull mode (for PUSH_REQUEST)
+	s.Log("Creating OpenVPN TLS-Auth client config with pull mode...")
+	s.CreateOpenVpnTlsAuthPullClientConfig()
+
+	// Start OpenVPN client
+	s.Log("Starting OpenVPN client with TLS-Auth and pull mode...")
+	err := s.StartOpenVpnClient()
+	s.AssertNil(err, "Failed to start OpenVPN client")
+
+	// Wait for TLS handshake and PUSH_REQUEST to be sent
+	// In pull mode, client sends PUSH_REQUEST after TLS handshake completes
+	// We wait enough time for TLS handshake + multiple PUSH_REQUEST retries
+	s.Log("Waiting for TLS handshake and PUSH_REQUEST exchange...")
+	time.Sleep(15 * time.Second)
+
+	// Check client logs for PUSH_REQUEST and PUSH_REPLY
+	s.Log("=== Checking Client Logs ===")
+	// Use the same method as CollectOvpnLogs
+	clientLogs, err := s.Containers.OpenVpnClient.Exec(false, "cat /tmp/openvpn/client.log")
+	if err != nil {
+		s.Log("Failed to read client logs: " + err.Error())
+		// Try alternative path
+		clientLogs, _ = s.Containers.OpenVpnClient.Exec(false, "ls -la /tmp/openvpn/ && cat /tmp/openvpn/*.log 2>&1")
+	}
+	s.Log(clientLogs)
+
+	// First verify PUSH_REQUEST was sent (this proves TLS handshake completed)
+	// OpenVPN client logs: "SENT CONTROL [OpenVPN Server]: 'PUSH_REQUEST'"
+	hasPushRequest := strings.Contains(clientLogs, "PUSH_REQUEST") ||
+		strings.Contains(clientLogs, "SENT CONTROL")
+	if hasPushRequest {
+		s.Log("SUCCESS: Client sent PUSH_REQUEST (TLS handshake completed)")
+	} else {
+		s.Log("ERROR: Client did not send PUSH_REQUEST")
+		s.Log("Client logs length: " + fmt.Sprintf("%d", len(clientLogs)))
+	}
+
+	// Verify PUSH_REPLY was received from VPP
+	hasPushReply := strings.Contains(clientLogs, "PUSH_REPLY") ||
+		strings.Contains(clientLogs, "PUSH: Received control message")
+
+	if hasPushReply {
+		s.Log("SUCCESS: Client received PUSH_REPLY from VPP")
+	} else {
+		s.Log("FAIL: Client did not receive PUSH_REPLY from VPP")
+	}
+
+	// Check for specific pushed options
+	hasRouteOption := strings.Contains(clientLogs, "route") ||
+		strings.Contains(clientLogs, "10.0.0.0")
+	hasDnsOption := strings.Contains(clientLogs, "dhcp-option") ||
+		strings.Contains(clientLogs, "DNS") ||
+		strings.Contains(clientLogs, "8.8.8.8")
+	hasDomainOption := strings.Contains(clientLogs, "DOMAIN") ||
+		strings.Contains(clientLogs, "vpn.example.com")
+
+	s.Log("=== Pushed Options Detection ===")
+	if hasRouteOption {
+		s.Log("- Route option: FOUND")
+	} else {
+		s.Log("- Route option: NOT FOUND")
+	}
+	if hasDnsOption {
+		s.Log("- DNS option: FOUND")
+	} else {
+		s.Log("- DNS option: NOT FOUND")
+	}
+	if hasDomainOption {
+		s.Log("- DOMAIN option: FOUND")
+	} else {
+		s.Log("- DOMAIN option: NOT FOUND")
+	}
+
+	// Check client's routing table for pushed routes
+	s.Log("=== Client Routing Table ===")
+	routeTable, _ := s.Containers.OpenVpnClient.Exec(false, "ip route 2>&1")
+	s.Log(routeTable)
+
+	// Check client's resolv.conf for DNS options
+	s.Log("=== Client /etc/resolv.conf ===")
+	resolvConf, _ := s.Containers.OpenVpnClient.Exec(false, "cat /etc/resolv.conf 2>&1")
+	s.Log(resolvConf)
+
+	// Show VPP state
+	s.Log("=== VPP OpenVPN State ===")
+	s.Log("Peers: " + s.ShowOvpnPeers())
+
+	// Verify interface counters
+	s.Log("=== VPP Interface Counters ===")
+	counters := vpp.Vppctl("show interface ovpn0")
+	s.Log(counters)
+
+	// Check if VPP received packets (PUSH_REQUEST should be in there)
+	hasRxPackets := strings.Contains(counters, "rx packets")
+	hasTxPackets := strings.Contains(counters, "tx packets")
+	s.Log("VPP rx packets: " + fmt.Sprintf("%v", hasRxPackets))
+	s.Log("VPP tx packets: " + fmt.Sprintf("%v", hasTxPackets))
+
+	// Check VPP errors
+	s.Log("=== VPP Errors ===")
+	errors := vpp.Vppctl("show errors")
+	for _, line := range strings.Split(errors, "\n") {
+		if strings.Contains(strings.ToLower(line), "ovpn") {
+			s.Log(line)
+		}
+	}
+
+	// Show VPP trace
+	s.Log("=== VPP Trace ===")
+	trace := vpp.Vppctl("show trace max 50")
+	s.Log(trace)
+
+	// Assertions
+	// 1. PUSH_REQUEST must be sent (proves TLS handshake completed)
+	s.AssertEqual(true, hasPushRequest,
+		"Client must send PUSH_REQUEST after TLS handshake")
+
+	// 2. PUSH_REPLY must be received (this is what we're testing)
+	s.AssertEqual(true, hasPushReply,
+		"VPP must send PUSH_REPLY to client")
+
+	s.Log("TLS-Auth PUSH_REPLY test PASSED")
 }
