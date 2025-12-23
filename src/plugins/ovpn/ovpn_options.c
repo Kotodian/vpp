@@ -37,21 +37,12 @@ u8
 ovpn_options_cmp_equal_safe (char *actual, const char *expected,
 			     size_t actual_n)
 {
-  u8 ret = 1;
-
   if (actual_n > 0)
     {
       actual[actual_n - 1] = 0;
-      if (clib_strncmp (actual, expected, 2) == 0)
-	{
-	  // TODO:
-	}
-      else
-	{
-	  ret = !clib_strcmp (actual, expected);
-	}
+      return !clib_strcmp (actual, expected);
     }
-  return ret;
+  return 0;
 }
 
 u8

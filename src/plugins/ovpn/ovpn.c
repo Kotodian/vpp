@@ -994,6 +994,444 @@ VLIB_CLI_COMMAND (ovpn_delete_command, static) = {
 };
 
 /*
+ * Helper function to convert peer state to string
+ */
+static const char *
+ovpn_peer_state_to_string (ovpn_peer_state_t state)
+{
+  switch (state)
+    {
+    case OVPN_PEER_STATE_INITIAL:
+      return "initial";
+    case OVPN_PEER_STATE_HANDSHAKE:
+      return "handshake";
+    case OVPN_PEER_STATE_ESTABLISHED:
+      return "established";
+    case OVPN_PEER_STATE_REKEYING:
+      return "rekeying";
+    case OVPN_PEER_STATE_DEAD:
+      return "dead";
+    default:
+      return "unknown";
+    }
+}
+
+/*
+ * CLI: show ovpn peers [interface <interface>] [peer-id <id>] [verbose]
+ * Display connected OpenVPN peers with their status and statistics.
+ */
+static clib_error_t *
+ovpn_show_peers_command_fn (vlib_main_t *vm, unformat_input_t *input,
+			    vlib_cli_command_t *cmd)
+{
+  ovpn_main_t *omp = &ovpn_main;
+  unformat_input_t _line_input, *line_input = &_line_input;
+  u32 sw_if_index = ~0;
+  u32 filter_peer_id = ~0;
+  u8 verbose = 0;
+  f64 now = vlib_time_now (vm);
+
+  if (unformat_user (input, unformat_line_input, line_input))
+    {
+      while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
+	{
+	  if (unformat (line_input, "interface %U", unformat_vnet_sw_interface,
+			omp->vnm, &sw_if_index))
+	    ;
+	  else if (unformat (line_input, "peer-id %u", &filter_peer_id))
+	    ;
+	  else if (unformat (line_input, "verbose"))
+	    verbose = 1;
+	  else
+	    {
+	      unformat_free (line_input);
+	      return clib_error_return (0, "unknown input: %U",
+					format_unformat_error, line_input);
+	    }
+	}
+      unformat_free (line_input);
+    }
+
+  u32 total_peers = 0;
+  ovpn_instance_t *inst;
+
+  pool_foreach (inst, omp->instances)
+    {
+      if (!inst->is_active)
+	continue;
+
+      /* Filter by interface if specified */
+      if (sw_if_index != ~0 && inst->sw_if_index != sw_if_index)
+	continue;
+
+      ovpn_peer_db_t *peer_db = &inst->multi_context.peer_db;
+      u32 num_peers = pool_elts (peer_db->peers);
+
+      if (num_peers == 0)
+	continue;
+
+      vlib_cli_output (vm, "Instance %u (sw_if_index %u, port %u):",
+		       inst->instance_id, inst->sw_if_index, inst->local_port);
+
+      ovpn_peer_t *peer;
+      pool_foreach (peer, peer_db->peers)
+	{
+	  /* Filter by peer-id if specified */
+	  if (filter_peer_id != ~0 && peer->peer_id != filter_peer_id)
+	    continue;
+
+	  total_peers++;
+
+	  f64 uptime = peer->established_time > 0 ?
+			 now - peer->established_time :
+			 0;
+	  f64 idle = now - peer->last_rx_time;
+
+	  vlib_cli_output (vm, "  Peer %u:", peer->peer_id);
+	  vlib_cli_output (vm, "    State: %s",
+			   ovpn_peer_state_to_string (peer->state));
+	  vlib_cli_output (vm, "    Remote: %U:%u", format_ip_address,
+			   &peer->remote_addr, peer->remote_port);
+
+	  if (peer->virtual_ip_set)
+	    vlib_cli_output (vm, "    Virtual IP: %U", format_ip_address,
+			     &peer->virtual_ip);
+
+	  vlib_cli_output (vm, "    RX: %llu bytes / %llu packets",
+			   peer->rx_bytes, peer->rx_packets);
+	  vlib_cli_output (vm, "    TX: %llu bytes / %llu packets",
+			   peer->tx_bytes, peer->tx_packets);
+
+	  if (peer->state == OVPN_PEER_STATE_ESTABLISHED)
+	    {
+	      vlib_cli_output (vm, "    Uptime: %.1f seconds", uptime);
+	      vlib_cli_output (vm, "    Idle: %.1f seconds", idle);
+	    }
+
+	  if (verbose)
+	    {
+	      vlib_cli_output (vm, "    Session ID: %02x%02x%02x%02x%02x%02x%02x%02x",
+			       peer->session_id.id[0], peer->session_id.id[1],
+			       peer->session_id.id[2], peer->session_id.id[3],
+			       peer->session_id.id[4], peer->session_id.id[5],
+			       peer->session_id.id[6], peer->session_id.id[7]);
+	      vlib_cli_output (vm, "    Remote Session ID: %02x%02x%02x%02x%02x%02x%02x%02x",
+			       peer->remote_session_id.id[0],
+			       peer->remote_session_id.id[1],
+			       peer->remote_session_id.id[2],
+			       peer->remote_session_id.id[3],
+			       peer->remote_session_id.id[4],
+			       peer->remote_session_id.id[5],
+			       peer->remote_session_id.id[6],
+			       peer->remote_session_id.id[7]);
+	      vlib_cli_output (vm, "    Current Key Slot: %u",
+			       peer->current_key_slot);
+	      vlib_cli_output (vm, "    Generation: %u", peer->generation);
+
+	      if (peer->keys[OVPN_KEY_SLOT_PRIMARY].is_active)
+		vlib_cli_output (vm, "    Primary Key ID: %u",
+				 peer->keys[OVPN_KEY_SLOT_PRIMARY].key_id);
+	      if (peer->keys[OVPN_KEY_SLOT_SECONDARY].is_active)
+		vlib_cli_output (vm, "    Secondary Key ID: %u",
+				 peer->keys[OVPN_KEY_SLOT_SECONDARY].key_id);
+	    }
+	}
+    }
+
+  vlib_cli_output (vm, "Total peers: %u", total_peers);
+  return 0;
+}
+
+/*?
+ * Show OpenVPN peers
+ *
+ * @cliexpar
+ * @cliexstart{show ovpn peers}
+ * show ovpn peers [interface <interface>] [peer-id <id>] [verbose]
+ * @cliexend
+ ?*/
+VLIB_CLI_COMMAND (ovpn_show_peers_command, static) = {
+  .path = "show ovpn peers",
+  .short_help = "show ovpn peers [interface <interface>] [peer-id <id>] [verbose]",
+  .function = ovpn_show_peers_command_fn,
+};
+
+/*
+ * CLI: ovpn peer kill <peer-id> [interface <interface>]
+ * Disconnect a specific OpenVPN peer.
+ */
+static clib_error_t *
+ovpn_peer_kill_command_fn (vlib_main_t *vm, unformat_input_t *input,
+			   vlib_cli_command_t *cmd)
+{
+  ovpn_main_t *omp = &ovpn_main;
+  unformat_input_t _line_input, *line_input = &_line_input;
+  u32 peer_id = ~0;
+  u32 sw_if_index = ~0;
+  clib_error_t *error = NULL;
+
+  if (!unformat_user (input, unformat_line_input, line_input))
+    return clib_error_return (0, "missing arguments");
+
+  while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (line_input, "%u", &peer_id))
+	;
+      else if (unformat (line_input, "interface %U", unformat_vnet_sw_interface,
+			 omp->vnm, &sw_if_index))
+	;
+      else
+	{
+	  error = clib_error_return (0, "unknown input: %U",
+				     format_unformat_error, line_input);
+	  goto done;
+	}
+    }
+
+  if (peer_id == ~0)
+    {
+      error = clib_error_return (0, "peer-id is required");
+      goto done;
+    }
+
+  /* Find and kill the peer */
+  u8 found = 0;
+  ovpn_instance_t *inst;
+
+  pool_foreach (inst, omp->instances)
+    {
+      if (!inst->is_active)
+	continue;
+
+      /* Filter by interface if specified */
+      if (sw_if_index != ~0 && inst->sw_if_index != sw_if_index)
+	continue;
+
+      ovpn_peer_db_t *peer_db = &inst->multi_context.peer_db;
+      ovpn_peer_t *peer = ovpn_peer_get (peer_db, peer_id);
+
+      if (peer)
+	{
+	  found = 1;
+	  vlib_cli_output (vm, "Killing peer %u on instance %u", peer_id,
+			   inst->instance_id);
+
+	  /* Mark as dead and let periodic process clean up */
+	  peer->state = OVPN_PEER_STATE_DEAD;
+	  ovpn_peer_delete (peer_db, peer_id);
+	  break;
+	}
+    }
+
+  if (!found)
+    {
+      error = clib_error_return (0, "peer %u not found", peer_id);
+    }
+
+done:
+  unformat_free (line_input);
+  return error;
+}
+
+/*?
+ * Kill (disconnect) an OpenVPN peer
+ *
+ * @cliexpar
+ * @cliexstart{ovpn peer kill}
+ * ovpn peer kill <peer-id> [interface <interface>]
+ * @cliexend
+ ?*/
+VLIB_CLI_COMMAND (ovpn_peer_kill_command, static) = {
+  .path = "ovpn peer kill",
+  .short_help = "ovpn peer kill <peer-id> [interface <interface>]",
+  .function = ovpn_peer_kill_command_fn,
+};
+
+/*
+ * CLI: show ovpn stats [interface <interface>]
+ * Display OpenVPN statistics.
+ */
+static clib_error_t *
+ovpn_show_stats_command_fn (vlib_main_t *vm, unformat_input_t *input,
+			    vlib_cli_command_t *cmd)
+{
+  ovpn_main_t *omp = &ovpn_main;
+  unformat_input_t _line_input, *line_input = &_line_input;
+  u32 sw_if_index = ~0;
+
+  if (unformat_user (input, unformat_line_input, line_input))
+    {
+      while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
+	{
+	  if (unformat (line_input, "interface %U", unformat_vnet_sw_interface,
+			omp->vnm, &sw_if_index))
+	    ;
+	  else
+	    {
+	      unformat_free (line_input);
+	      return clib_error_return (0, "unknown input: %U",
+					format_unformat_error, line_input);
+	    }
+	}
+      unformat_free (line_input);
+    }
+
+  ovpn_instance_t *inst;
+  u64 total_rx_bytes = 0, total_tx_bytes = 0;
+  u64 total_rx_packets = 0, total_tx_packets = 0;
+  u32 total_peers = 0, total_established = 0;
+
+  pool_foreach (inst, omp->instances)
+    {
+      if (!inst->is_active)
+	continue;
+
+      /* Filter by interface if specified */
+      if (sw_if_index != ~0 && inst->sw_if_index != sw_if_index)
+	continue;
+
+      ovpn_peer_db_t *peer_db = &inst->multi_context.peer_db;
+      u32 num_peers = pool_elts (peer_db->peers);
+      u32 num_established = 0;
+      u64 inst_rx_bytes = 0, inst_tx_bytes = 0;
+      u64 inst_rx_packets = 0, inst_tx_packets = 0;
+
+      ovpn_peer_t *peer;
+      pool_foreach (peer, peer_db->peers)
+	{
+	  inst_rx_bytes += peer->rx_bytes;
+	  inst_tx_bytes += peer->tx_bytes;
+	  inst_rx_packets += peer->rx_packets;
+	  inst_tx_packets += peer->tx_packets;
+
+	  if (peer->state == OVPN_PEER_STATE_ESTABLISHED)
+	    num_established++;
+	}
+
+      vlib_cli_output (vm, "Instance %u (sw_if_index %u, port %u):",
+		       inst->instance_id, inst->sw_if_index, inst->local_port);
+      vlib_cli_output (vm, "  Peers: %u total, %u established", num_peers,
+		       num_established);
+      vlib_cli_output (vm, "  RX: %llu bytes, %llu packets", inst_rx_bytes,
+		       inst_rx_packets);
+      vlib_cli_output (vm, "  TX: %llu bytes, %llu packets", inst_tx_bytes,
+		       inst_tx_packets);
+      vlib_cli_output (vm, "  Pending Connections: %u",
+		       pool_elts (inst->multi_context.pending_db.connections));
+
+      total_peers += num_peers;
+      total_established += num_established;
+      total_rx_bytes += inst_rx_bytes;
+      total_tx_bytes += inst_tx_bytes;
+      total_rx_packets += inst_rx_packets;
+      total_tx_packets += inst_tx_packets;
+    }
+
+  if (sw_if_index == ~0 && pool_elts (omp->instances) > 1)
+    {
+      vlib_cli_output (vm, "");
+      vlib_cli_output (vm, "Total:");
+      vlib_cli_output (vm, "  Instances: %u", pool_elts (omp->instances));
+      vlib_cli_output (vm, "  Peers: %u total, %u established", total_peers,
+		       total_established);
+      vlib_cli_output (vm, "  RX: %llu bytes, %llu packets", total_rx_bytes,
+		       total_rx_packets);
+      vlib_cli_output (vm, "  TX: %llu bytes, %llu packets", total_tx_bytes,
+		       total_tx_packets);
+    }
+
+  return 0;
+}
+
+/*?
+ * Show OpenVPN statistics
+ *
+ * @cliexpar
+ * @cliexstart{show ovpn stats}
+ * show ovpn stats [interface <interface>]
+ * @cliexend
+ ?*/
+VLIB_CLI_COMMAND (ovpn_show_stats_command, static) = {
+  .path = "show ovpn stats",
+  .short_help = "show ovpn stats [interface <interface>]",
+  .function = ovpn_show_stats_command_fn,
+};
+
+/*
+ * CLI: clear ovpn stats [interface <interface>]
+ * Clear OpenVPN statistics.
+ */
+static clib_error_t *
+ovpn_clear_stats_command_fn (vlib_main_t *vm, unformat_input_t *input,
+			     vlib_cli_command_t *cmd)
+{
+  ovpn_main_t *omp = &ovpn_main;
+  unformat_input_t _line_input, *line_input = &_line_input;
+  u32 sw_if_index = ~0;
+
+  if (unformat_user (input, unformat_line_input, line_input))
+    {
+      while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
+	{
+	  if (unformat (line_input, "interface %U", unformat_vnet_sw_interface,
+			omp->vnm, &sw_if_index))
+	    ;
+	  else
+	    {
+	      unformat_free (line_input);
+	      return clib_error_return (0, "unknown input: %U",
+					format_unformat_error, line_input);
+	    }
+	}
+      unformat_free (line_input);
+    }
+
+  u32 cleared_peers = 0;
+  ovpn_instance_t *inst;
+
+  pool_foreach (inst, omp->instances)
+    {
+      if (!inst->is_active)
+	continue;
+
+      /* Filter by interface if specified */
+      if (sw_if_index != ~0 && inst->sw_if_index != sw_if_index)
+	continue;
+
+      ovpn_peer_db_t *peer_db = &inst->multi_context.peer_db;
+      ovpn_peer_t *peer;
+
+      pool_foreach (peer, peer_db->peers)
+	{
+	  peer->rx_bytes = 0;
+	  peer->tx_bytes = 0;
+	  peer->rx_packets = 0;
+	  peer->tx_packets = 0;
+	  peer->bytes_since_rekey = 0;
+	  peer->packets_since_rekey = 0;
+	  cleared_peers++;
+	}
+    }
+
+  vlib_cli_output (vm, "Cleared statistics for %u peers", cleared_peers);
+  return 0;
+}
+
+/*?
+ * Clear OpenVPN statistics
+ *
+ * @cliexpar
+ * @cliexstart{clear ovpn stats}
+ * clear ovpn stats [interface <interface>]
+ * @cliexend
+ ?*/
+VLIB_CLI_COMMAND (ovpn_clear_stats_command, static) = {
+  .path = "clear ovpn stats",
+  .short_help = "clear ovpn stats [interface <interface>]",
+  .function = ovpn_clear_stats_command_fn,
+};
+
+/*
  * Plugin initialization
  */
 static clib_error_t *

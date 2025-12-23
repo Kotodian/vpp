@@ -1251,7 +1251,6 @@ ovpn_handshake_node_fn (vlib_main_t *vm, vlib_node_runtime_t *node,
       if (rv >= 0)
 	{
 	  n_processed++;
-	  /* TODO: If we need to send a response, queue it here */
 	}
 
       /* Always drop the incoming control packet after processing */

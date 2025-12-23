@@ -1296,22 +1296,6 @@ ovpn_tls_crypt_unwrap (ovpn_tls_crypt_t *ctx, const u8 *opcode_session,
    */
   if (CRYPTO_memcmp (hdr->hmac, computed_hmac, OVPN_TLS_CRYPT_HMAC_SIZE) != 0)
     {
-      clib_warning ("HMAC mismatch!");
-      clib_warning ("  received[0..15]:  %02x%02x%02x%02x%02x%02x%02x%02x "
-		    "%02x%02x%02x%02x%02x%02x%02x%02x",
-		    hdr->hmac[0], hdr->hmac[1], hdr->hmac[2], hdr->hmac[3],
-		    hdr->hmac[4], hdr->hmac[5], hdr->hmac[6], hdr->hmac[7],
-		    hdr->hmac[8], hdr->hmac[9], hdr->hmac[10], hdr->hmac[11],
-		    hdr->hmac[12], hdr->hmac[13], hdr->hmac[14],
-		    hdr->hmac[15]);
-      clib_warning ("  computed[0..15]:  %02x%02x%02x%02x%02x%02x%02x%02x "
-		    "%02x%02x%02x%02x%02x%02x%02x%02x",
-		    computed_hmac[0], computed_hmac[1], computed_hmac[2],
-		    computed_hmac[3], computed_hmac[4], computed_hmac[5],
-		    computed_hmac[6], computed_hmac[7], computed_hmac[8],
-		    computed_hmac[9], computed_hmac[10], computed_hmac[11],
-		    computed_hmac[12], computed_hmac[13], computed_hmac[14],
-		    computed_hmac[15]);
       /* Clear plaintext on HMAC failure for security */
       clib_memset (plaintext, 0, plain_len);
       return -7; /* HMAC verification failed */
@@ -2001,18 +1985,6 @@ ovpn_handshake_send_peer_packets (vlib_main_t *vm, ovpn_peer_t *peer,
   /* Schedule packets for immediate sending */
   ovpn_reliable_schedule_now (vm, tls_ctx->send_reliable);
 
-  /* Debug: check send_reliable state */
-  int dbg_active = 0;
-  for (int dbg_i = 0; dbg_i < tls_ctx->send_reliable->size; dbg_i++)
-    {
-      ovpn_reliable_entry_t *dbg_e = &tls_ctx->send_reliable->array[dbg_i];
-      if (dbg_e->active)
-	dbg_active++;
-    }
-  u8 can_send = ovpn_reliable_can_send (vm, tls_ctx->send_reliable);
-  clib_warning ("DEBUG: send_peer_packets: active=%d, can_send=%d, hold=%d",
-		dbg_active, can_send, tls_ctx->send_reliable->hold);
-
   /* Send all packets that are ready */
   while (ovpn_reliable_can_send (vm, tls_ctx->send_reliable))
     {
@@ -2096,16 +2068,6 @@ ovpn_handshake_send_peer_packets (vlib_main_t *vm, ovpn_peer_t *peer,
       clib_memcpy_fast (pkt_data, ctrl_hdr, ctrl_hdr_len);
       /* Copy TLS payload */
       clib_memcpy_fast (pkt_data + ctrl_hdr_len, OVPN_BPTR (buf), payload_len);
-
-      /* Debug: show first bytes of TLS data in buffer (after pkt_id) */
-      if (payload_len > 8)
-	{
-	  u8 *tls_data = OVPN_BPTR (buf) + 4; /* Skip packet_id */
-	  clib_warning ("DEBUG: Sending pkt_id=%u, TLS[0-4]: %02x %02x %02x "
-			"%02x %02x, payload_len=%u",
-			msg_pkt_id, tls_data[0], tls_data[1], tls_data[2],
-			tls_data[3], tls_data[4], payload_len);
-	}
 
       /* Apply TLS-Crypt or TLS-Auth wrapping */
       if (tls_crypt && tls_crypt->enabled)
@@ -2243,10 +2205,8 @@ ovpn_handshake_send_peer_packets (vlib_main_t *vm, ovpn_peer_t *peer,
 	}
 
       n_sent++;
-      clib_warning ("DEBUG: Sent control packet %u", n_sent);
     }
 
-  clib_warning ("DEBUG: send_peer_packets completed: n_sent=%u", n_sent);
   return n_sent;
 }
 
@@ -2435,11 +2395,6 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
       clib_memcpy_fast (data + 9, plaintext, plain_len);
       len = 9 + plain_len;
       b->current_length = len;
-
-      clib_warning ("TLS-Crypt reconstructed: opcode=0x%02x len=%d "
-		    "session_id=%02x%02x%02x%02x%02x%02x%02x%02x",
-		    opcode_byte, len, data[1], data[2], data[3], data[4],
-		    data[5], data[6], data[7], data[8]);
     }
   else if (inst->tls_auth.enabled)
     {
@@ -2488,7 +2443,6 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
   if (ovpn_parse_control_header (&buf, &opcode, &key_id, &session_id, &ack,
 				 &ack_session_id, &packet_id) < 0)
     {
-      clib_warning ("parse_control_header failed, len=%d", len);
       return -1;
     }
 
@@ -2882,11 +2836,6 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 	    ovpn_peer_tls_t *tls_ctx = peer->tls_ctx;
 	    ovpn_reliable_t *recv_rel = tls_ctx->recv_reliable;
 
-	    clib_warning ("CONTROL_V1: peer_state=%d, tls_state=%d, pkt_id=%u, "
-			  "rel_pkt_id=%u",
-			  peer->state, tls_ctx->state, packet_id,
-			  recv_rel->packet_id);
-
 	    /* Record packet ID for ACK */
 	    ovpn_reliable_ack_acknowledge_packet_id (&tls_ctx->recv_ack,
 						     packet_id);
@@ -2894,15 +2843,6 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 	    /* Check for replay/duplicate */
 	    if (!ovpn_reliable_not_replay (recv_rel, packet_id))
 	      {
-		clib_warning ("REPLAY detected: pkt_id=%u", packet_id);
-		/* Dump active entries for debugging */
-		for (int dbg_i = 0; dbg_i < recv_rel->size; dbg_i++)
-		  {
-		    ovpn_reliable_entry_t *dbg_e = &recv_rel->array[dbg_i];
-		    if (dbg_e->active)
-		      {
-		      }
-		  }
 		/* Duplicate or old packet - ignore but still ACK */
 		rv = 0;
 		break;
@@ -2968,23 +2908,10 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 		 * For ESTABLISHED peers, check if decrypted data is a
 		 * control message (PUSH_REQUEST, ping, etc.)
 		 */
-		clib_warning ("DEBUG: peer_state=%d (ESTABLISHED=%d), "
-			      "tls_state=%d, tls_process rv=%d",
-			      peer->state, OVPN_PEER_STATE_ESTABLISHED,
-			      tls_ctx->state, rv);
-
 		if (peer->state == OVPN_PEER_STATE_ESTABLISHED)
 		  {
 		    u8 *ctrl_data = OVPN_BPTR (&tls_ctx->plaintext_read_buf);
 		    u32 ctrl_len = OVPN_BLEN (&tls_ctx->plaintext_read_buf);
-
-		    clib_warning ("ESTABLISHED peer: plaintext_len=%u, "
-				  "first_bytes=%02x%02x%02x%02x",
-				  ctrl_len,
-				  ctrl_len > 0 ? ctrl_data[0] : 0,
-				  ctrl_len > 1 ? ctrl_data[1] : 0,
-				  ctrl_len > 2 ? ctrl_data[2] : 0,
-				  ctrl_len > 3 ? ctrl_data[3] : 0);
 
 		    if (ctrl_len > 0)
 		      {
@@ -2998,8 +2925,6 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 			/* Clear the read buffer - use reset_len to preserve capacity */
 			ovpn_reli_buf_reset_len (&tls_ctx->plaintext_read_buf);
 
-			clib_warning (
-			  "DEBUG: msg_rv=%d, response_len=%u", msg_rv, response_len);
 			if (msg_rv > 0 && response_len > 0)
 			  {
 			    /* Encrypt and send response */
@@ -3065,20 +2990,14 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 
 		    if (!tls_ctx->key_method_received && km_len > 0)
 		      {
-			clib_warning ("DEBUG: Parsing client Key Method 2: "
-				      "km_len=%u",
-				      km_len);
 			char *peer_opts = NULL;
 			int km_rv = ovpn_key_method_2_read (
 			  km_data, km_len, tls_ctx->key_src2,
 			  1 /* is_server */, &peer_opts);
-			clib_warning ("DEBUG: ovpn_key_method_2_read returned %d",
-				      km_rv);
 			if (km_rv > 0)
 			  {
 			    tls_ctx->key_method_received = 1;
 			    tls_ctx->peer_options = peer_opts;
-			    clib_warning ("DEBUG: Client Key Method 2 received!");
 
 			    /* Clear the buffer after consuming Key Method 2 */
 			    ovpn_reli_buf_reset_len (&tls_ctx->plaintext_read_buf);
@@ -3244,8 +3163,6 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 		    if (!tls_ctx->key_method_sent &&
 			tls_ctx->key_method_received)
 		      {
-			clib_warning ("DEBUG: Building and sending server "
-				      "Key Method 2...");
 			u8 km_buf[512];
 			char options_buf[512];
 
@@ -3269,38 +3186,6 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 			  km_buf, sizeof (km_buf), tls_ctx->key_src2,
 			  peer->session_id.id, 1 /* is_server */,
 			  opt_len > 0 ? options_buf : NULL);
-
-			clib_warning (
-			  "DEBUG: Key Method 2 write: km_len=%d, opt_len=%d, "
-			  "opts='%.40s'",
-			  km_len, opt_len, opt_len > 0 ? options_buf : "(none)");
-
-			/* Debug: print random material being sent */
-			if (km_len > 0)
-			  {
-			    clib_warning (
-			      "DEBUG: Server random1[0-7]: %02x%02x%02x%02x "
-			      "%02x%02x%02x%02x",
-			      tls_ctx->key_src2->server.random1[0],
-			      tls_ctx->key_src2->server.random1[1],
-			      tls_ctx->key_src2->server.random1[2],
-			      tls_ctx->key_src2->server.random1[3],
-			      tls_ctx->key_src2->server.random1[4],
-			      tls_ctx->key_src2->server.random1[5],
-			      tls_ctx->key_src2->server.random1[6],
-			      tls_ctx->key_src2->server.random1[7]);
-			    clib_warning (
-			      "DEBUG: Client pre_master[0-7]: %02x%02x%02x%02x "
-			      "%02x%02x%02x%02x",
-			      tls_ctx->key_src2->client.pre_master[0],
-			      tls_ctx->key_src2->client.pre_master[1],
-			      tls_ctx->key_src2->client.pre_master[2],
-			      tls_ctx->key_src2->client.pre_master[3],
-			      tls_ctx->key_src2->client.pre_master[4],
-			      tls_ctx->key_src2->client.pre_master[5],
-			      tls_ctx->key_src2->client.pre_master[6],
-			      tls_ctx->key_src2->client.pre_master[7]);
-			  }
 
 			if (km_len > 0)
 			  {
@@ -3390,57 +3275,11 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 			    ovpn_key_material_t keys;
 			    int key_rv;
 
-			    /* Derive keys using Key Method 2 with negotiated
-			     * cipher */
-			    clib_warning (
-			      "DEBUG: Key derivation starting: cipher=%d, "
-			      "use_tls_ekm=%d",
-			      cipher_alg, tls_ctx->use_tls_ekm);
-			    clib_warning (
-			      "DEBUG: client_sid[0-7]: %02x%02x%02x%02x "
-			      "%02x%02x%02x%02x",
-			      peer->remote_session_id.id[0],
-			      peer->remote_session_id.id[1],
-			      peer->remote_session_id.id[2],
-			      peer->remote_session_id.id[3],
-			      peer->remote_session_id.id[4],
-			      peer->remote_session_id.id[5],
-			      peer->remote_session_id.id[6],
-			      peer->remote_session_id.id[7]);
-			    clib_warning (
-			      "DEBUG: server_sid[0-7]: %02x%02x%02x%02x "
-			      "%02x%02x%02x%02x",
-			      peer->session_id.id[0], peer->session_id.id[1],
-			      peer->session_id.id[2], peer->session_id.id[3],
-			      peer->session_id.id[4], peer->session_id.id[5],
-			      peer->session_id.id[6], peer->session_id.id[7]);
-
 			    key_rv = ovpn_derive_data_channel_keys_v2 (
 			      tls_ctx->tls, tls_ctx->key_src2,
 			      peer->remote_session_id.id, peer->session_id.id,
 			      &keys, cipher_alg, 1 /* is_server */,
 			      tls_ctx->use_tls_ekm);
-
-			    clib_warning ("DEBUG: Key derivation returned: %d",
-					  key_rv);
-			    if (key_rv == 0)
-			      {
-				/* Print first 8 bytes of encrypt/decrypt keys */
-				clib_warning (
-				  "DEBUG: encrypt_key[0-7]: %02x%02x%02x%02x "
-				  "%02x%02x%02x%02x",
-				  keys.encrypt_key[0], keys.encrypt_key[1],
-				  keys.encrypt_key[2], keys.encrypt_key[3],
-				  keys.encrypt_key[4], keys.encrypt_key[5],
-				  keys.encrypt_key[6], keys.encrypt_key[7]);
-				clib_warning (
-				  "DEBUG: decrypt_key[0-7]: %02x%02x%02x%02x "
-				  "%02x%02x%02x%02x",
-				  keys.decrypt_key[0], keys.decrypt_key[1],
-				  keys.decrypt_key[2], keys.decrypt_key[3],
-				  keys.decrypt_key[4], keys.decrypt_key[5],
-				  keys.decrypt_key[6], keys.decrypt_key[7]);
-			      }
 
 			    if (key_rv == 0)
 			      {
@@ -3798,23 +3637,17 @@ ovpn_control_message_process (vlib_main_t *vm, ovpn_peer_t *peer,
 			      const u8 *data, u32 len, u8 *response,
 			      u32 *response_len)
 {
-  clib_warning ("DEBUG: ovpn_control_message_process: len=%u, data='%.*s'",
-		len, len > 32 ? 32 : len, data);
-
   /* Check for PUSH_REQUEST */
   if (len >= sizeof (OVPN_MSG_PUSH_REQUEST) - 1 &&
       clib_memcmp (data, OVPN_MSG_PUSH_REQUEST,
 		   sizeof (OVPN_MSG_PUSH_REQUEST) - 1) == 0)
     {
-      clib_warning ("DEBUG: PUSH_REQUEST detected! Building PUSH_REPLY...");
       /*
        * Client is requesting pushed configuration options
        * Build and send PUSH_REPLY
        */
       int reply_len =
 	ovpn_build_push_reply (peer, (char *) response, *response_len);
-      clib_warning ("DEBUG: ovpn_build_push_reply returned %d, response='%.*s'",
-		    reply_len, reply_len > 64 ? 64 : reply_len, response);
       if (reply_len > 0)
 	{
 	  /* Include null terminator - OpenVPN expects it */
