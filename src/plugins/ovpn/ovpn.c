@@ -19,6 +19,7 @@
 #include <ovpn/ovpn_if.h>
 #include <ovpn/ovpn_crypto.h>
 #include <ovpn/ovpn_handshake.h>
+#include <ovpn/ovpn_mgmt.h>
 #include <vlib/vlib.h>
 #include <vnet/vnet.h>
 #include <vnet/plugin/plugin.h>
@@ -445,6 +446,38 @@ ovpn_instance_create (vlib_main_t *vm, ip_address_t *local_addr,
 
   inst->is_active = 1;
 
+  /*
+   * Enable management interface if configured (UDP only via VPP session layer)
+   */
+  if (inst->options.management_enabled)
+    {
+      int mgmt_rv;
+      /* UDP mode via VPP session layer */
+      mgmt_rv = ovpn_mgmt_enable (vm, inst->instance_id,
+				  &inst->options.management_ip,
+				  inst->options.management_port,
+				  inst->options.management_password);
+
+      if (mgmt_rv == 0)
+	{
+	  /* Configure management options */
+	  ovpn_mgmt_t *mgmt = ovpn_mgmt_get_by_instance (inst->instance_id);
+	  if (mgmt)
+	    {
+	      if (inst->options.management_hold)
+		ovpn_mgmt_set_hold (mgmt, 1);
+	      if (inst->options.management_log_cache > 0)
+		{
+		  /* Resize log history buffer */
+		  mgmt->log_history_size = inst->options.management_log_cache;
+		  vec_free (mgmt->log_history);
+		  vec_validate (mgmt->log_history, mgmt->log_history_size - 1);
+		}
+	    }
+	}
+      /* Note: management failure is not fatal to instance creation */
+    }
+
   *instance_id_out = inst->instance_id;
   *sw_if_index_out = sw_if_index;
 
@@ -460,6 +493,10 @@ ovpn_instance_delete (vlib_main_t *vm, u32 sw_if_index)
   inst = ovpn_instance_get_by_sw_if_index (sw_if_index);
   if (!inst)
     return VNET_API_ERROR_NO_SUCH_ENTRY;
+
+  /* Disable management interface if enabled */
+  if (inst->options.management_enabled)
+    ovpn_mgmt_disable (vm, inst->instance_id);
 
   /* Unregister UDP port */
   udp_unregister_dst_port (vm, inst->local_port, UDP_IP4);
@@ -1469,6 +1506,9 @@ ovpn_init (vlib_main_t *vm)
   if (error)
     return error;
 
+  /* Initialize management interface subsystem */
+  ovpn_mgmt_init (vm);
+
   return 0;
 }
 
@@ -1628,6 +1668,11 @@ ovpn_periodic_process (vlib_main_t *vm, vlib_node_runtime_t *rt,
 				peers_to_delete[i]);
 	    }
 	  vec_free (peers_to_delete);
+
+	  /* Process management interface bytecount notifications */
+	  ovpn_mgmt_t *mgmt = ovpn_mgmt_get_by_instance (inst->instance_id);
+	  if (mgmt && mgmt->is_active)
+	    ovpn_mgmt_process_bytecount (mgmt, now);
 	}
     }
 

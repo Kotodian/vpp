@@ -775,17 +775,22 @@ ovpn_test_tls_auth_replay (vlib_main_t *vm)
   clib_memset (&ctx, 0, sizeof (ctx));
   ctx.enabled = 1;
   ctx.replay_bitmap = 0;
-  ctx.replay_packet_id_floor = 1;
-  ctx.time_backtrack = 30; /* 30 second window */
+  ctx.replay_packet_id_floor = 0; /* Start at 0 as in normal initialization */
+  ctx.time_backtrack = 30;	  /* 30 second window */
   ctx.replay_time_floor = 0;
 
   u32 now = 1000;
 
-  /* Packet ID 0 is always invalid */
-  OVPN_TEST (!ovpn_tls_auth_check_replay (&ctx, 0, now, now),
-	     "Packet ID 0 should be rejected");
+  /* Packet ID 0 is valid (first control packet in OpenVPN uses packet_id 0) */
+  OVPN_TEST (ovpn_tls_auth_check_replay (&ctx, 0, now, now),
+	     "Packet ID 0 should be valid for first packet");
+  ovpn_tls_auth_update_replay (&ctx, 0, now);
 
-  /* First packet should be valid */
+  /* Replay of packet ID 0 should be detected */
+  OVPN_TEST (!ovpn_tls_auth_check_replay (&ctx, 0, now, now),
+	     "Replay of packet ID 0 should be detected");
+
+  /* Packet ID 1 should be valid */
   OVPN_TEST (ovpn_tls_auth_check_replay (&ctx, 1, now, now),
 	     "Packet ID 1 should be valid");
   ovpn_tls_auth_update_replay (&ctx, 1, now);

@@ -155,6 +155,21 @@ typedef struct ovpn_options_t_
    */
   u8 client_to_client; /* Allow clients to reach each other */
 
+  /*
+   * Management interface (--management)
+   * Enables external control via UDP using VPP session layer
+   */
+  u8 management_enabled;      /* 1 if management is configured */
+  ip_address_t management_ip; /* IP to bind (default 0.0.0.0) */
+  u16 management_port;	      /* UDP port (default 7505) */
+  u8 *management_password;    /* Management password (optional) */
+  u8 management_hold;	      /* Start in hold state (--management-hold) */
+  u32 management_log_cache;   /* Number of log lines to cache (--management-log-cache) */
+  u8 management_client;	      /* Act as management client (--management-client) */
+  u8 management_up_down;      /* Report up/down events (--management-up-down) */
+  u8 management_query_passwords; /* Query passwords via management
+				    (--management-query-passwords) */
+
 } ovpn_options_t;
 
 /* Static key size: 256 bytes (2048 bits) */

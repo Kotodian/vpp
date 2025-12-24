@@ -316,6 +316,49 @@ ovpn_peer_set_virtual_ip (ovpn_peer_db_t *db, ovpn_peer_t *peer,
 }
 
 /*
+ * Allocate virtual IP from pool for a peer
+ * Iterates through the pool range and finds the first available IP
+ */
+int
+ovpn_peer_allocate_virtual_ip_from_pool (ovpn_peer_db_t *db, ovpn_peer_t *peer,
+					 const ip_address_t *pool_start,
+					 const ip_address_t *pool_end)
+{
+  if (!db || !peer || !pool_start || !pool_end)
+    return -1;
+
+  /* Only support IPv4 for now - check if IPv4 address is set */
+  if (pool_start->ip.ip4.as_u32 == 0 || pool_end->ip.ip4.as_u32 == 0)
+    return -1;
+
+  u32 start_val = clib_net_to_host_u32 (pool_start->ip.ip4.as_u32);
+  u32 end_val = clib_net_to_host_u32 (pool_end->ip.ip4.as_u32);
+
+  if (start_val > end_val)
+    return -1;
+
+  /* Iterate through the pool looking for an available IP */
+  for (u32 ip_val = start_val; ip_val <= end_val; ip_val++)
+    {
+      ip_address_t candidate;
+      candidate.version = AF_IP4;
+      candidate.ip.ip4.as_u32 = clib_host_to_net_u32 (ip_val);
+
+      /* Check if this IP is already assigned */
+      u64 vip_key = candidate.ip.ip4.as_u32;
+      uword *p = hash_get (db->peer_index_by_virtual_ip, vip_key);
+      if (p == NULL)
+	{
+	  /* IP is available, assign it to this peer */
+	  return ovpn_peer_set_virtual_ip (db, peer, &candidate);
+	}
+    }
+
+  /* Pool exhausted */
+  return -2;
+}
+
+/*
  * Add peer to session ID hash
  */
 void

@@ -26,6 +26,7 @@
 
 #include <ovpn/ovpn.h>
 #include <ovpn/ovpn_if.h>
+#include <ovpn/ovpn_mgmt.h>
 
 #define REPLY_MSG_ID_BASE omp->msg_id_base
 #include <vlibapi/api_helper_macros.h>
@@ -431,6 +432,142 @@ done:
   BAD_SW_IF_INDEX_LABEL;
 
   REPLY_MACRO (VL_API_OVPN_PEER_REMOVE_REPLY);
+}
+
+/*
+ * Handler for ovpn_mgmt_enable_tcp
+ */
+static void
+vl_api_ovpn_mgmt_enable_tcp_t_handler (vl_api_ovpn_mgmt_enable_tcp_t *mp)
+{
+  vl_api_ovpn_mgmt_enable_tcp_reply_t *rmp;
+  ovpn_api_main_t *omp = &ovpn_api_main;
+  ip_address_t bind_addr;
+  u8 *password = NULL;
+  int rv = 0;
+
+  u32 instance_id = clib_net_to_host_u32 (mp->instance_id);
+  u16 bind_port = clib_net_to_host_u16 (mp->bind_port);
+
+  ip_address_decode2 (&mp->bind_addr, &bind_addr);
+
+  /* Extract password if provided */
+  if (mp->password[0] != 0)
+    password = (u8 *) mp->password;
+
+  rv = ovpn_mgmt_enable_tcp (vlib_get_main (), instance_id, &bind_addr,
+			     bind_port, password);
+
+  REPLY_MACRO (VL_API_OVPN_MGMT_ENABLE_TCP_REPLY);
+}
+
+/*
+ * Handler for ovpn_mgmt_enable_unix
+ * Note: Unix socket mode is no longer supported. This handler always returns
+ * an error. Use ovpn_mgmt_enable_tcp (UDP mode via VPP session layer) instead.
+ */
+static void
+vl_api_ovpn_mgmt_enable_unix_t_handler (vl_api_ovpn_mgmt_enable_unix_t *mp)
+{
+  vl_api_ovpn_mgmt_enable_unix_reply_t *rmp;
+  ovpn_api_main_t *omp = &ovpn_api_main;
+  int rv;
+
+  /* Unix socket mode not supported - use UDP mode instead */
+  (void) mp;
+  rv = VNET_API_ERROR_UNIMPLEMENTED;
+
+  REPLY_MACRO (VL_API_OVPN_MGMT_ENABLE_UNIX_REPLY);
+}
+
+/*
+ * Handler for ovpn_mgmt_disable
+ */
+static void
+vl_api_ovpn_mgmt_disable_t_handler (vl_api_ovpn_mgmt_disable_t *mp)
+{
+  vl_api_ovpn_mgmt_disable_reply_t *rmp;
+  ovpn_api_main_t *omp = &ovpn_api_main;
+  int rv = 0;
+
+  u32 instance_id = clib_net_to_host_u32 (mp->instance_id);
+
+  rv = ovpn_mgmt_disable (vlib_get_main (), instance_id);
+
+  REPLY_MACRO (VL_API_OVPN_MGMT_DISABLE_REPLY);
+}
+
+/*
+ * Walk context for management dump
+ */
+typedef struct ovpn_mgmt_dump_ctx_t_
+{
+  vl_api_registration_t *reg;
+  u32 context;
+} ovpn_mgmt_dump_ctx_t;
+
+/*
+ * Send management details
+ */
+static void
+ovpn_send_mgmt_details (ovpn_mgmt_t *mgmt, ovpn_mgmt_dump_ctx_t *ctx)
+{
+  vl_api_ovpn_mgmt_details_t *rmp;
+  ovpn_api_main_t *omp = &ovpn_api_main;
+
+  rmp = vl_msg_api_alloc_zero (sizeof (*rmp));
+  rmp->_vl_msg_id =
+    clib_host_to_net_u16 (VL_API_OVPN_MGMT_DETAILS + omp->msg_id_base);
+  rmp->context = ctx->context;
+
+  rmp->status.instance_id = clib_host_to_net_u32 (mgmt->instance_id);
+  ip_address_encode2 (&mgmt->bind_addr, &rmp->status.bind_addr);
+  rmp->status.bind_port = clib_host_to_net_u16 (mgmt->bind_port);
+  rmp->status.num_clients = clib_host_to_net_u32 (pool_elts (mgmt->clients));
+  rmp->status.password_required = (mgmt->password != NULL);
+  rmp->status.hold = mgmt->hold;
+
+  vl_api_send_msg (ctx->reg, (u8 *) rmp);
+}
+
+/*
+ * Handler for ovpn_mgmt_dump
+ */
+static void
+vl_api_ovpn_mgmt_dump_t_handler (vl_api_ovpn_mgmt_dump_t *mp)
+{
+  vl_api_registration_t *reg;
+  ovpn_mgmt_main_t *mm = &ovpn_mgmt_main;
+  ovpn_mgmt_t *mgmt;
+  u32 instance_id;
+
+  reg = vl_api_client_index_to_registration (mp->client_index);
+  if (reg == NULL)
+    return;
+
+  ovpn_mgmt_dump_ctx_t ctx = {
+    .reg = reg,
+    .context = mp->context,
+  };
+
+  instance_id = clib_net_to_host_u32 (mp->instance_id);
+
+  if (instance_id == ~0)
+    {
+      /* Dump all management interfaces */
+      pool_foreach (mgmt, mm->contexts)
+	{
+	  if (mgmt->is_active)
+	    ovpn_send_mgmt_details (mgmt, &ctx);
+	}
+    }
+  else
+    {
+      /* Dump specific instance */
+      mgmt = ovpn_mgmt_get_by_instance (instance_id);
+      if (mgmt && mgmt->is_active)
+	ovpn_send_mgmt_details (mgmt, &ctx);
+    }
 }
 
 /* Setup API message handlers */

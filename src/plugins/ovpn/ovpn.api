@@ -221,6 +221,96 @@ autoreply define ovpn_peer_remove
 };
 
 /*
+ * Management Interface API
+ */
+
+/** \brief Enable OpenVPN management interface (TCP)
+    @param client_index - opaque cookie to identify the sender
+    @param context - sender context, to match reply w/ request
+    @param instance_id - OpenVPN instance ID
+    @param bind_addr - IP address to bind to (typically 127.0.0.1)
+    @param bind_port - TCP port to listen on (default 7505)
+    @param password - Optional management password
+*/
+autoreply define ovpn_mgmt_enable_tcp
+{
+  u32 client_index;
+  u32 context;
+  u32 instance_id;
+  vl_api_address_t bind_addr;
+  u16 bind_port [default=7505];
+  string password[64];
+};
+
+/** \brief Enable OpenVPN management interface (Unix socket)
+    @param client_index - opaque cookie to identify the sender
+    @param context - sender context, to match reply w/ request
+    @param instance_id - OpenVPN instance ID
+    @param socket_path - Path to Unix domain socket
+    @param password - Optional management password
+*/
+autoreply define ovpn_mgmt_enable_unix
+{
+  u32 client_index;
+  u32 context;
+  u32 instance_id;
+  string socket_path[256];
+  string password[64];
+};
+
+/** \brief Disable OpenVPN management interface
+    @param client_index - opaque cookie to identify the sender
+    @param context - sender context, to match reply w/ request
+    @param instance_id - OpenVPN instance ID
+*/
+autoreply define ovpn_mgmt_disable
+{
+  u32 client_index;
+  u32 context;
+  u32 instance_id;
+};
+
+/** \brief OpenVPN management interface status
+    @param instance_id - Instance ID
+    @param bind_addr - UDP bind address
+    @param bind_port - UDP bind port
+    @param num_clients - Number of connected management clients
+    @param password_required - 1 if password is required
+    @param hold - 1 if hold is enabled
+*/
+typedef ovpn_mgmt_status
+{
+  u32 instance_id;
+  vl_api_address_t bind_addr;
+  u16 bind_port;
+  u32 num_clients;
+  bool password_required;
+  bool hold;
+};
+
+/** \brief Dump OpenVPN management interfaces
+    @param client_index - opaque cookie to identify the sender
+    @param context - sender context, to match reply w/ request
+    @param instance_id - Instance ID to dump (~0 for all)
+*/
+define ovpn_mgmt_dump
+{
+  u32 client_index;
+  u32 context;
+  u32 instance_id [default=0xffffffff];
+};
+
+/** \brief OpenVPN management interface details
+    @param context - sender context, to match reply w/ request
+    @param status - Management status
+*/
+define ovpn_mgmt_details
+{
+  u32 context;
+  vl_api_ovpn_mgmt_status_t status;
+};
+
+/*
  * Local Variables:
  * eval: (c-set-style "gnu")
  * End:

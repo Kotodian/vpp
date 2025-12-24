@@ -442,6 +442,79 @@ parse_option (u8 *line_start, u8 *line_end, const char *base_dir,
     }
   else if (unformat (&input, "client-to-client"))
     {
+      config->options.client_to_client = 1;
+    }
+  /*
+   * Management interface options (UDP only via VPP session layer)
+   */
+  else if (unformat (&input, "management %U %u %s", unformat_ip_address,
+		     &config->options.management_ip,
+		     &config->options.management_port, &str_val))
+    {
+      /* management IP port [pw-file] */
+      config->options.management_enabled = 1;
+      /* Read password from file */
+      if (str_val)
+	{
+	  u8 *pw = 0;
+	  clib_error_t *err = read_file_contents ((char *) str_val, &pw);
+	  if (!err && pw)
+	    {
+	      /* Remove trailing newline */
+	      while (vec_len (pw) > 0 &&
+		     (pw[vec_len (pw) - 1] == '\n' ||
+		      pw[vec_len (pw) - 1] == '\r'))
+		vec_dec_len (pw, 1);
+	      vec_add1 (pw, 0);
+	      config->options.management_password = pw;
+	    }
+	  else if (err)
+	    clib_error_free (err);
+	  vec_free (str_val);
+	}
+    }
+  else if (unformat (&input, "management %U %u", unformat_ip_address,
+		     &config->options.management_ip,
+		     &config->options.management_port))
+    {
+      /* management IP port */
+      config->options.management_enabled = 1;
+    }
+  else if (unformat (&input, "management-hold"))
+    {
+      config->options.management_hold = 1;
+    }
+  else if (unformat (&input, "management-log-cache %u", &u32_val))
+    {
+      config->options.management_log_cache = u32_val;
+    }
+  else if (unformat (&input, "management-client"))
+    {
+      config->options.management_client = 1;
+    }
+  else if (unformat (&input, "management-up-down"))
+    {
+      config->options.management_up_down = 1;
+    }
+  else if (unformat (&input, "management-query-passwords"))
+    {
+      config->options.management_query_passwords = 1;
+    }
+  else if (unformat (&input, "management-query-remote"))
+    {
+      /* Ignored - not applicable to VPP server mode */
+    }
+  else if (unformat (&input, "management-query-proxy"))
+    {
+      /* Ignored - not applicable to VPP server mode */
+    }
+  else if (unformat (&input, "management-forget-disconnect"))
+    {
+      /* Ignored - not applicable to VPP */
+    }
+  else if (unformat (&input, "management-signal"))
+    {
+      /* Ignored - not applicable to VPP */
     }
   else if (unformat (&input, "duplicate-cn"))
     {
@@ -684,6 +757,7 @@ ovpn_config_parse_buffer (const u8 *config_data, u32 config_len,
     }
 
   /* Setup server mode IP pool if server directive was used */
+  clib_warning ("ovpn config: server_mode=%d", config->server_mode);
   if (config->server_mode)
     {
       /* OpenVPN server mode: server 10.8.0.0 255.255.255.0
@@ -716,6 +790,13 @@ ovpn_config_parse_buffer (const u8 *config_data, u32 config_len,
 	    pool_end = network + 253;
 	  config->options.pool_end.ip.ip4.as_u32 =
 	    clib_host_to_net_u32 (pool_end);
+
+	  clib_warning (
+	    "ovpn config: server mode pool setup: start.version=%d, "
+	    "start=0x%x, end=0x%x",
+	    config->options.pool_start.version,
+	    clib_net_to_host_u32 (config->options.pool_start.ip.ip4.as_u32),
+	    clib_net_to_host_u32 (config->options.pool_end.ip.ip4.as_u32));
 	}
     }
 
@@ -1207,6 +1288,43 @@ ovpn_parse_inline_instance (vlib_main_t *vm, const char *instance_name,
 				     format_unformat_error, input);
 	  ovpn_config_free (&config);
 	  return error;
+	}
+    }
+
+  /* Setup server mode IP pool if server directive was used */
+  if (config.server_mode)
+    {
+      u32 network = clib_net_to_host_u32 (config.server_network.as_u32);
+      u32 mask = clib_net_to_host_u32 (config.server_netmask.as_u32);
+      u32 host_bits = ~mask;
+
+      /* Server address is network + 1 */
+      ip4_address_t server_ip;
+      server_ip.as_u32 = clib_host_to_net_u32 (network + 1);
+
+      /* Set local address if not already set */
+      if (ip_address_is_zero (&config.local_addr))
+	{
+	  ip_address_set (&config.local_addr, &server_ip, AF_IP4);
+	}
+
+      /* Setup pool from .2 to .254 (or end of subnet) */
+      if (config.options.pool_start.version == 0)
+	{
+	  config.options.pool_start.version = AF_IP4;
+	  config.options.pool_start.ip.ip4.as_u32 =
+	    clib_host_to_net_u32 (network + 2);
+
+	  config.options.pool_end.version = AF_IP4;
+	  u32 pool_end = (network | host_bits) - 1;
+	  if (pool_end > network + 253)
+	    pool_end = network + 253;
+	  config.options.pool_end.ip.ip4.as_u32 =
+	    clib_host_to_net_u32 (pool_end);
+
+	  clib_warning (
+	    "ovpn inline config: server mode pool setup: start.version=%d",
+	    config.options.pool_start.version);
 	}
     }
 

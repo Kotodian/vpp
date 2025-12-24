@@ -455,6 +455,24 @@ int ovpn_peer_set_virtual_ip (ovpn_peer_db_t *db, ovpn_peer_t *peer,
 			      const ip_address_t *virtual_ip);
 
 /*
+ * Allocate virtual IP from pool for a peer
+ * Finds the next available IP in the range [pool_start, pool_end]
+ * and assigns it to the peer.
+ *
+ * @param db Peer database
+ * @param peer Peer to assign IP to
+ * @param pool_start Start of IP pool (inclusive)
+ * @param pool_end End of IP pool (inclusive)
+ * @return 0 on success, <0 on error:
+ *   -1: invalid parameters
+ *   -2: pool exhausted (no available IPs)
+ */
+int ovpn_peer_allocate_virtual_ip_from_pool (ovpn_peer_db_t *db,
+					     ovpn_peer_t *peer,
+					     const ip_address_t *pool_start,
+					     const ip_address_t *pool_end);
+
+/*
  * Lookup peer by session ID (for NAT/float support)
  * Used when address-based lookup fails due to NAT rebinding
  */

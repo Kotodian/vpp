@@ -179,9 +179,11 @@ ovpn_tls_auth_check_replay (const ovpn_tls_auth_t *ctx, u32 packet_id,
 {
   u32 diff;
 
-  /* packet_id 0 is never valid */
-  if (packet_id == 0)
-    return 0;
+  /*
+   * Note: packet_id 0 is valid for the first control packet
+   * (HARD_RESET_CLIENT_V2). We use the sliding window mechanism
+   * below to detect replays rather than rejecting packet_id 0.
+   */
 
   /* Check timestamp if time_backtrack is enabled (non-zero) */
   if (ctx->time_backtrack > 0)

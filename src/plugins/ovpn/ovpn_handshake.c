@@ -3141,8 +3141,46 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 					  }
 					/* If set_rv < 0, IP is already in use
 					 * - will fall back to pool allocation
-					 * or no IP */
+					 * below */
 				      }
+				  }
+			      }
+
+			    /*
+			     * If peer doesn't have a virtual IP yet (client
+			     * didn't request one, or request was
+			     * invalid/unavailable), allocate from pool
+			     */
+			    /* Check if pool is configured (IP address is non-zero) */
+			    int pool_configured =
+			      (inst->options.pool_start.ip.ip4.as_u32 != 0 ||
+			       !ip6_address_is_zero (
+				 &inst->options.pool_start.ip.ip6));
+			    clib_warning (
+			      "ovpn: peer %u virtual_ip_set=%d pool_configured=%d",
+			      peer->peer_id, peer->virtual_ip_set, pool_configured);
+			    if (!peer->virtual_ip_set && pool_configured)
+			      {
+				int alloc_rv =
+				  ovpn_peer_allocate_virtual_ip_from_pool (
+				    peer_db, peer, &inst->options.pool_start,
+				    &inst->options.pool_end);
+				if (alloc_rv < 0)
+				  {
+				    clib_warning (
+				      "ovpn: failed to allocate virtual IP "
+				      "from pool for peer %u (rv=%d)",
+				      peer->peer_id, alloc_rv);
+				  }
+				else
+				  {
+				    u8 ip_str[INET_ADDRSTRLEN];
+				    inet_ntop (AF_INET, &peer->virtual_ip.ip.ip4,
+					       (char *) ip_str, sizeof (ip_str));
+				    clib_warning (
+				      "ovpn: allocated virtual IP %s for peer "
+				      "%u",
+				      ip_str, peer->peer_id);
 				  }
 			      }
 

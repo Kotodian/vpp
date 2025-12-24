@@ -37,6 +37,7 @@ add_vpp_plugin(ovpn
   ovpn_input.c
   ovpn_output.c
   ovpn_api.c
+  ovpn_mgmt.c
 
   API_FILES
   ovpn.api
@@ -54,6 +55,7 @@ add_vpp_plugin(ovpn
   ovpn_crypto.h
   ovpn_peer.h
   ovpn_handshake.h
+  ovpn_mgmt.h
 
   LINK_LIBRARIES ${PICOTLS_LINK_LIBRARIES} ${OPENSSL_LIBRARIES}
 
