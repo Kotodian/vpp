@@ -756,7 +756,10 @@ ovpn_peer_tls_init (ovpn_peer_t *peer, ptls_context_t *ptls_ctx, u8 key_id)
 
 error:
   if (tls_ctx->key_src2)
-    ovpn_key_source2_free (tls_ctx->key_src2);
+    {
+      ovpn_key_source2_free (tls_ctx->key_src2);
+      tls_ctx->key_src2 = NULL;
+    }
   if (tls_ctx->send_reliable)
     {
       ovpn_reliable_free (tls_ctx->send_reliable);
@@ -790,7 +793,10 @@ ovpn_peer_tls_free (ovpn_peer_t *peer)
 
   /* Free key source */
   if (tls_ctx->key_src2)
-    ovpn_key_source2_free (tls_ctx->key_src2);
+    {
+      ovpn_key_source2_free (tls_ctx->key_src2);
+      tls_ctx->key_src2 = NULL;
+    }
 
   /* Free peer options string */
   if (tls_ctx->peer_options)

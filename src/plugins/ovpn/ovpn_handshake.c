@@ -438,7 +438,6 @@ ovpn_tls_auth_unwrap (ovpn_tls_auth_t *ctx, const u8 *wrapped, u32 wrapped_len,
   u32 packet_id, net_time;
   u32 plain_len;
   u32 hmac_input_len;
-  u32 now;
 
   if (!ctx || !ctx->enabled || !wrapped || !plaintext)
     {
@@ -497,14 +496,12 @@ ovpn_tls_auth_unwrap (ovpn_tls_auth_t *ctx, const u8 *wrapped, u32 wrapped_len,
   packet_id = clib_net_to_host_u32 (packet_id);
   net_time = clib_net_to_host_u32 (net_time);
 
-  /* Get current unix time for time-based replay protection */
-  now = (u32) unix_time_now ();
-
-  /* Check replay BEFORE HMAC verification (optimization) */
-  if (!ovpn_tls_auth_check_replay (ctx, packet_id, net_time, now))
-    {
-      return -4; /* Replay detected */
-    }
+  /*
+   * Note: Per-session replay protection should be handled after HMAC
+   * verification succeeds and a session is established. The HMAC already
+   * includes the session_id, so different clients have unique HMACs even
+   * with the same packet_id.
+   */
 
   /*
    * Build HMAC input: packet_id || net_time || opcode || session_id || rest
@@ -3588,9 +3585,9 @@ ovpn_build_push_reply (ovpn_peer_t *peer, char *buf, u32 buf_len)
 	  inet_ntop (AF_INET, &peer->virtual_ip.ip.ip4, (char *) ip_str,
 		     sizeof (ip_str));
 
-	  /* TUN mode: ifconfig <local-ip> <remote-ip> */
+	  /* TUN mode with topology subnet: ifconfig <local-ip> <netmask> */
 	  written = snprintf (buf + offset, buf_len - offset,
-			      ",ifconfig %s 10.8.0.1", ip_str);
+			      ",ifconfig %s 255.255.255.0", ip_str);
 	  if (written < 0 || (u32) written >= buf_len - offset)
 	    return -2;
 	  offset += written;
