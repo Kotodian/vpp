@@ -1282,6 +1282,14 @@ ovpn_parse_inline_instance (vlib_main_t *vm, const char *instance_name,
 	{
 	  config.options.client_to_client = 1;
 	}
+      /* Management interface (UDP via VPP session layer) */
+      else if (unformat (input, "management %U %u", unformat_ip4_address,
+			 &ip4_addr, &u32_val))
+	{
+	  ip_address_set (&config.options.management_ip, &ip4_addr, AF_IP4);
+	  config.options.management_port = (u16) u32_val;
+	  config.options.management_enabled = 1;
+	}
       else
 	{
 	  error = clib_error_return (0, "unknown instance option '%U'",

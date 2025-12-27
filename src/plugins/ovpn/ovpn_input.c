@@ -422,42 +422,27 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  u16 remote_port = 0;
 
 	  /*
-	   * Find the IP header using save_rewrite_length.
-	   * This field is set by the VPP input nodes to indicate
-	   * the original position of the IP header before buffer
-	   * advancement.
+	   * Use node type to determine outer IP version (is_ip6 parameter).
 	   */
-	  u32 ip_offset = vnet_buffer (b0)->ip.save_rewrite_length;
-	  u8 *ip_hdr = NULL;
-
-	  if (ip_offset > 0 && ip_offset <= b0->current_data)
+	  u8 *ip_hdr;
+	  if (is_ip6)
 	    {
-	      /* Calculate IP header position from saved offset */
+	      /* IPv6 transport */
 	      ip_hdr = (u8 *) vlib_buffer_get_current (b0) -
-		       (b0->current_data - ip_offset);
-	    }
-	  else
-	    {
-	      /* Fallback: buffer should point to payload, go back by
-	       * IP + UDP header size */
-	      ip_hdr = (u8 *) vlib_buffer_get_current (b0) -
-		       (sizeof (ip4_header_t) + sizeof (udp_header_t));
-	    }
-
-	  u8 version = (ip_hdr[0] >> 4) & 0xf;
-
-	  if (version == 4)
-	    {
-	      ip4_header_t *ip4 = (ip4_header_t *) ip_hdr;
-	      udp_header_t *udp = (udp_header_t *) (ip4 + 1);
-	      ip_address_set (&remote_addr, &ip4->src_address, AF_IP4);
-	      remote_port = clib_net_to_host_u16 (udp->src_port);
-	    }
-	  else if (version == 6)
-	    {
+		       (sizeof (ip6_header_t) + sizeof (udp_header_t));
 	      ip6_header_t *ip6 = (ip6_header_t *) ip_hdr;
 	      udp_header_t *udp = (udp_header_t *) (ip6 + 1);
 	      ip_address_set (&remote_addr, &ip6->src_address, AF_IP6);
+	      remote_port = clib_net_to_host_u16 (udp->src_port);
+	    }
+	  else
+	    {
+	      /* IPv4 transport */
+	      ip_hdr = (u8 *) vlib_buffer_get_current (b0) -
+		       (sizeof (ip4_header_t) + sizeof (udp_header_t));
+	      ip4_header_t *ip4 = (ip4_header_t *) ip_hdr;
+	      udp_header_t *udp = (udp_header_t *) (ip4 + 1);
+	      ip_address_set (&remote_addr, &ip4->src_address, AF_IP4);
 	      remote_port = clib_net_to_host_u16 (udp->src_port);
 	    }
 
@@ -540,16 +525,24 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
 	  if (b0->current_length >= 1)
 	    {
-	      u8 ip_version = (payload[0] >> 4);
-	      if (ip_version == 4)
-		next0 = OVPN_INPUT_NEXT_IP4_INPUT;
-	      else if (ip_version == 6)
+	      /* Check for ping packet first */
+	      if (ovpn_is_ping_packet (payload, b0->current_length))
+		{
+		  /* Respond to keepalive ping */
+		  ovpn_peer_send_ping (vm, peer);
+		  /* Drop the incoming ping packet */
+		  next0 = OVPN_INPUT_NEXT_DROP;
+		  goto done;
+		}
+
+	      /*
+	       * Determine IP version from instance configuration (pool_start),
+	       * not from payload inspection.
+	       */
+	      if (inst->options.pool_start.version == AF_IP6)
 		next0 = OVPN_INPUT_NEXT_IP6_INPUT;
 	      else
-		{
-		  error = OVPN_INPUT_ERROR_BAD_IP_VERSION;
-		  goto trace;
-		}
+		next0 = OVPN_INPUT_NEXT_IP4_INPUT;
 	    }
 
 	  /* Store peer and rx bytes for batched counter update */
@@ -594,35 +587,28 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
 	      /*
 	       * NAT/float: Extract remote address for address change
-	       * detection. This is done even for DATA_V2 to support NAT
-	       * rebinding.
+	       * detection. Use instance configuration for IP version.
 	       */
-	      u32 ip_offset = vnet_buffer (b0)->ip.save_rewrite_length;
-	      if (ip_offset > 0 && ip_offset < b0->current_data)
+	      u32 buf_idx = b - bufs;
+	      if (is_ip6)
 		{
 		  u8 *ip_hdr = vlib_buffer_get_current (b0) -
-			       (b0->current_data - ip_offset);
-		  u8 version = (ip_hdr[0] >> 4) & 0xf;
-		  u32 buf_idx = b - bufs;
-
-		  if (version == 4)
-		    {
-		      ip4_header_t *ip4 = (ip4_header_t *) ip_hdr;
-		      udp_header_t *udp = (udp_header_t *) (ip4 + 1);
-		      ip_address_set (&remote_addrs[buf_idx],
-				      &ip4->src_address, AF_IP4);
-		      remote_ports[buf_idx] =
-			clib_net_to_host_u16 (udp->src_port);
-		    }
-		  else if (version == 6)
-		    {
-		      ip6_header_t *ip6 = (ip6_header_t *) ip_hdr;
-		      udp_header_t *udp = (udp_header_t *) (ip6 + 1);
-		      ip_address_set (&remote_addrs[buf_idx],
-				      &ip6->src_address, AF_IP6);
-		      remote_ports[buf_idx] =
-			clib_net_to_host_u16 (udp->src_port);
-		    }
+			       (sizeof (ip6_header_t) + sizeof (udp_header_t));
+		  ip6_header_t *ip6 = (ip6_header_t *) ip_hdr;
+		  udp_header_t *udp = (udp_header_t *) (ip6 + 1);
+		  ip_address_set (&remote_addrs[buf_idx], &ip6->src_address,
+				  AF_IP6);
+		  remote_ports[buf_idx] = clib_net_to_host_u16 (udp->src_port);
+		}
+	      else
+		{
+		  u8 *ip_hdr = vlib_buffer_get_current (b0) -
+			       (sizeof (ip4_header_t) + sizeof (udp_header_t));
+		  ip4_header_t *ip4 = (ip4_header_t *) ip_hdr;
+		  udp_header_t *udp = (udp_header_t *) (ip4 + 1);
+		  ip_address_set (&remote_addrs[buf_idx], &ip4->src_address,
+				  AF_IP4);
+		  remote_ports[buf_idx] = clib_net_to_host_u16 (udp->src_port);
 		}
 	    }
 	  else
@@ -647,43 +633,17 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
 	      /*
 	       * Extract remote address from outer IP header.
-	       * The buffer was advanced past UDP, use saved offset to find IP.
+	       * Use instance configuration for IP version.
 	       */
 	      ip_address_t remote_addr;
 	      u16 remote_port = 0;
-	      u32 ip_offset = vnet_buffer (b0)->ip.save_rewrite_length;
 	      u32 buf_idx = b - bufs;
-
-	      /*
-	       * Find the IP header. VPP may or may not set
-	       * save_rewrite_length. If not set (ip_offset=0), we assume
-	       * standard IP + UDP layout and go back by the header sizes.
-	       */
 	      u8 *ip_hdr;
-	      if (ip_offset > 0 && ip_offset < b0->current_data)
+
+	      if (is_ip6)
 		{
-		  ip_hdr = vlib_buffer_get_current (b0) -
-			   (b0->current_data - ip_offset);
-		}
-	      else
-		{
-		  /* Fallback: buffer is at OpenVPN payload, go back by IP+UDP
-		   */
 		  ip_hdr = (u8 *) vlib_buffer_get_current (b0) -
-			   (sizeof (ip4_header_t) + sizeof (udp_header_t));
-		}
-
-	      u8 version = (ip_hdr[0] >> 4) & 0xf;
-
-	      if (version == 4)
-		{
-		  ip4_header_t *ip4 = (ip4_header_t *) ip_hdr;
-		  udp_header_t *udp = (udp_header_t *) (ip4 + 1);
-		  ip_address_set (&remote_addr, &ip4->src_address, AF_IP4);
-		  remote_port = clib_net_to_host_u16 (udp->src_port);
-		}
-	      else if (version == 6)
-		{
+			   (sizeof (ip6_header_t) + sizeof (udp_header_t));
 		  ip6_header_t *ip6 = (ip6_header_t *) ip_hdr;
 		  udp_header_t *udp = (udp_header_t *) (ip6 + 1);
 		  ip_address_set (&remote_addr, &ip6->src_address, AF_IP6);
@@ -691,8 +651,12 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		}
 	      else
 		{
-		  error = OVPN_INPUT_ERROR_PEER_NOT_FOUND;
-		  goto trace;
+		  ip_hdr = (u8 *) vlib_buffer_get_current (b0) -
+			   (sizeof (ip4_header_t) + sizeof (udp_header_t));
+		  ip4_header_t *ip4 = (ip4_header_t *) ip_hdr;
+		  udp_header_t *udp = (udp_header_t *) (ip4 + 1);
+		  ip_address_set (&remote_addr, &ip4->src_address, AF_IP4);
+		  remote_port = clib_net_to_host_u16 (udp->src_port);
 		}
 
 	      /* Store remote address for NAT/float detection */
@@ -830,16 +794,24 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      u8 *payload = vlib_buffer_get_current (b0);
 	      if (b0->current_length >= 1)
 		{
-		  u8 ip_version = (payload[0] >> 4);
-		  if (ip_version == 4)
-		    next0 = OVPN_INPUT_NEXT_IP4_INPUT;
-		  else if (ip_version == 6)
+		  /* Check for ping packet first */
+		  if (ovpn_is_ping_packet (payload, b0->current_length))
+		    {
+		      /* Respond to keepalive ping */
+		      ovpn_peer_send_ping (vm, peer);
+		      /* Drop the incoming ping packet */
+		      next0 = OVPN_INPUT_NEXT_DROP;
+		      goto done;
+		    }
+
+		  /*
+		   * Determine IP version from instance configuration (pool_start),
+		   * not from payload inspection.
+		   */
+		  if (inst->options.pool_start.version == AF_IP6)
 		    next0 = OVPN_INPUT_NEXT_IP6_INPUT;
 		  else
-		    {
-		      error = OVPN_INPUT_ERROR_BAD_IP_VERSION;
-		      goto trace;
-		    }
+		    next0 = OVPN_INPUT_NEXT_IP4_INPUT;
 		}
 	      else
 		{
@@ -1023,17 +995,25 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  data = vlib_buffer_get_current (b0);
 	  if (PREDICT_TRUE (b0->current_length >= 1))
 	    {
-	      u8 ip_version = (data[0] >> 4);
-	      if (ip_version == 4)
-		nexts[i] = OVPN_INPUT_NEXT_IP4_INPUT;
-	      else if (ip_version == 6)
+	      /* Check for ping packet first */
+	      if (ovpn_is_ping_packet (data, b0->current_length))
+		{
+		  /* Respond to keepalive ping */
+		  ovpn_peer_send_ping (vm, peer);
+		  /* Drop the incoming ping packet */
+		  nexts[i] = OVPN_INPUT_NEXT_DROP;
+		  continue;
+		}
+
+	      /*
+	       * Determine IP version from instance configuration (pool_start),
+	       * not from payload inspection.
+	       */
+	      ovpn_instance_t *pkt_inst = instances[i];
+	      if (pkt_inst && pkt_inst->options.pool_start.version == AF_IP6)
 		nexts[i] = OVPN_INPUT_NEXT_IP6_INPUT;
 	      else
-		{
-		  b0->error = node->errors[OVPN_INPUT_ERROR_DECRYPT_FAILED];
-		  nexts[i] = OVPN_INPUT_NEXT_DROP;
-		  error_counts[OVPN_INPUT_ERROR_DECRYPT_FAILED]++;
-		}
+		nexts[i] = OVPN_INPUT_NEXT_IP4_INPUT;
 	    }
 	}
     }
@@ -1182,65 +1162,36 @@ ovpn_handshake_node_fn (vlib_main_t *vm, vlib_node_runtime_t *node,
 	}
 
       /*
-       * Extract IP addresses and ports from the original packet
-       * The buffer was advanced past UDP, so we need to go back
-       * to find the IP header
+       * Extract IP addresses and ports from the original packet.
+       * Use instance configuration for IP version.
        */
       {
-	/*
-	 * Extract IP addresses from the buffer.
-	 *
-	 * When UDP delivers the packet, the buffer is positioned at the UDP
-	 * payload (OpenVPN data). The current_data field indicates the offset
-	 * from b0->data to the current position.
-	 *
-	 * For IPv4: header size = 20 + 8 (UDP) = 28
-	 * For IPv6: header size = 40 + 8 (UDP) = 48
-	 *
-	 * The IP header is at (current_position - header_size), or we can
-	 * check by going back and looking at the IP version field.
-	 *
-	 * Since we know the current position is at the UDP payload, and
-	 * UDP header is 8 bytes, the UDP header is at (current - 8).
-	 * The IP header is before the UDP header.
-	 */
 	u8 *current = vlib_buffer_get_current (b0);
 	u8 *udp_start = current - sizeof (udp_header_t);
 	udp_header_t *udp = (udp_header_t *) udp_start;
 
-	/* Go back to IP header - try IPv4 first (20 byte header) */
-	u8 *ip4_start = udp_start - sizeof (ip4_header_t);
-	u8 version = (ip4_start[0] >> 4) & 0xf;
+	/* Get ports from UDP header */
+	dst_port = clib_net_to_host_u16 (udp->dst_port);
+	src_port = clib_net_to_host_u16 (udp->src_port);
 
-	if (version == 4)
+	/* Use node type to determine IP version (is_ip4 parameter) */
+	if (!is_ip4)
 	  {
-	    ip4_header_t *ip4 = (ip4_header_t *) ip4_start;
-
-	    ip_address_set (&src_addr, &ip4->src_address, AF_IP4);
-	    ip_address_set (&dst_addr, &ip4->dst_address, AF_IP4);
-	    src_port = clib_net_to_host_u16 (udp->src_port);
-	    dst_port = clib_net_to_host_u16 (udp->dst_port);
-	    is_ip6 = 0;
-	  }
-	else if (version == 6)
-	  {
-	    /* For IPv6, the header is 40 bytes before UDP */
 	    u8 *ip6_start = udp_start - sizeof (ip6_header_t);
 	    ip6_header_t *ip6 = (ip6_header_t *) ip6_start;
 
 	    ip_address_set (&src_addr, &ip6->src_address, AF_IP6);
 	    ip_address_set (&dst_addr, &ip6->dst_address, AF_IP6);
-	    src_port = clib_net_to_host_u16 (udp->src_port);
-	    dst_port = clib_net_to_host_u16 (udp->dst_port);
 	    is_ip6 = 1;
 	  }
 	else
 	  {
-	    /* Cannot determine - fallback */
-	    clib_memset (&src_addr, 0, sizeof (src_addr));
-	    clib_memset (&dst_addr, 0, sizeof (dst_addr));
-	    src_port = 0;
-	    dst_port = 0;
+	    u8 *ip4_start = udp_start - sizeof (ip4_header_t);
+	    ip4_header_t *ip4 = (ip4_header_t *) ip4_start;
+
+	    ip_address_set (&src_addr, &ip4->src_address, AF_IP4);
+	    ip_address_set (&dst_addr, &ip4->dst_address, AF_IP4);
+	    is_ip6 = 0;
 	  }
       }
 

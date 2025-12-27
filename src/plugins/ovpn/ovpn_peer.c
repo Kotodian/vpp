@@ -1381,7 +1381,9 @@ ovpn_peer_send_ping (vlib_main_t *vm, ovpn_peer_t *peer)
   else
     vlib_put_frame_to_node (vm, ip4_lookup_node.index, f);
 
-  /* Update TX timestamp */
+  /* Update TX statistics and timestamp */
+  peer->tx_packets++;
+  peer->tx_bytes += total_len;
   peer->last_tx_time = vlib_time_now (vm);
 }
 

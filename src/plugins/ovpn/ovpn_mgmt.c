@@ -206,6 +206,27 @@ ovpn_mgmt_session_cleanup_callback (session_t *s, session_cleanup_ntf_t ntf)
 }
 
 /*
+ * Session callback: connected (required but not used for UDP server)
+ */
+static int
+ovpn_mgmt_session_connected_callback (u32 app_index, u32 api_context,
+				      session_t *s, session_error_t err)
+{
+  /* Not used for UDP server - we only listen */
+  return 0;
+}
+
+/*
+ * Session callback: add segment (for shared memory allocation)
+ */
+static int
+ovpn_mgmt_add_segment_callback (u32 client_index, u64 segment_handle)
+{
+  /* Accept new segments */
+  return 0;
+}
+
+/*
  * Send UDP datagram response
  */
 static void
@@ -1300,7 +1321,11 @@ ovpn_mgmt_session_rx_callback (session_t *s)
       pool_foreach (mgmt, mm->contexts)
 	{
 	  if (mgmt->bind_port == lcl_port)
-	    break;
+	    {
+	      /* Update session handle from actual session with FIFOs */
+	      mgmt->udp_session_handle = session_handle (s);
+	      break;
+	    }
 	}
 
       if (!mgmt || !mgmt->is_active)
@@ -1373,8 +1398,10 @@ ovpn_mgmt_session_rx_callback (session_t *s)
 static session_cb_vft_t ovpn_mgmt_session_cb_vft = {
   .session_accept_callback = ovpn_mgmt_session_accept_callback,
   .session_disconnect_callback = ovpn_mgmt_session_disconnect_callback,
+  .session_connected_callback = ovpn_mgmt_session_connected_callback,
   .session_reset_callback = ovpn_mgmt_session_reset_callback,
   .session_cleanup_callback = ovpn_mgmt_session_cleanup_callback,
+  .add_segment_callback = ovpn_mgmt_add_segment_callback,
   .builtin_app_rx_callback = ovpn_mgmt_session_rx_callback,
 };
 
@@ -1390,6 +1417,13 @@ ovpn_mgmt_app_attach (void)
 
   if (mm->app_attached)
     return 0;
+
+  /* Enable session layer first */
+  session_enable_disable_args_t session_args = {
+    .is_en = 1,
+    .rt_engine_type = RT_BACKEND_ENGINE_RULE_TABLE
+  };
+  vnet_session_enable_disable (mm->vm, &session_args);
 
   clib_memset (a, 0, sizeof (*a));
   clib_memset (options, 0, sizeof (options));
@@ -1507,16 +1541,14 @@ ovpn_mgmt_enable (vlib_main_t *vm, u32 instance_id, const ip_address_t *bind_add
   session_endpoint_cfg_t *sep = &a->sep_ext;
   clib_memset (sep, 0, sizeof (*sep));
 
-  if (ip_addr_version (&mgmt->bind_addr) == AF_IP4)
-    {
-      sep->is_ip4 = 1;
-      sep->ip.ip4.as_u32 = mgmt->bind_addr.ip.ip4.as_u32;
-    }
-  else
-    {
-      sep->is_ip4 = 0;
-      clib_memcpy (&sep->ip.ip6, &mgmt->bind_addr.ip.ip6, sizeof (ip6_address_t));
-    }
+  /*
+   * Always bind to 0.0.0.0 (any address) for UDP management interface.
+   * The session layer requires the IP to be assigned to an interface,
+   * but during startup the tap interface may not exist yet. Using 0.0.0.0
+   * allows the session layer to accept packets on any VPP interface.
+   */
+  sep->is_ip4 = 1;
+  sep->ip.ip4.as_u32 = 0; /* 0.0.0.0 - listen on any address */
   sep->port = clib_host_to_net_u16 (bind_port);
   sep->transport_proto = TRANSPORT_PROTO_UDP;
 
