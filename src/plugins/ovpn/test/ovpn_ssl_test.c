@@ -416,7 +416,8 @@ ovpn_test_derive_data_channel_keys (vlib_main_t *vm)
   rv = ovpn_derive_data_channel_keys_v2 (NULL /* no TLS */, ks2, client_sid.id,
 					 server_sid.id, &server_keys,
 					 OVPN_CIPHER_ALG_AES_256_GCM,
-					 1 /* is_server */, 0 /* use_prf */);
+					 1 /* is_server */, 0 /* use_prf */,
+					 1 /* client_keydir */);
   OVPN_TEST (rv == 0, "Server key derivation should succeed");
   OVPN_TEST (server_keys.key_len == OVPN_KEY_SIZE_256,
 	     "Key length should be 32 for AES-256-GCM");
@@ -429,7 +430,8 @@ ovpn_test_derive_data_channel_keys (vlib_main_t *vm)
   rv = ovpn_derive_data_channel_keys_v2 (NULL /* no TLS */, ks2, client_sid.id,
 					 server_sid.id, &client_keys,
 					 OVPN_CIPHER_ALG_AES_256_GCM,
-					 0 /* is_server */, 0 /* use_prf */);
+					 0 /* is_server */, 0 /* use_prf */,
+					 1 /* client_keydir */);
   OVPN_TEST (rv == 0, "Client key derivation should succeed");
   OVPN_TEST (client_keys.key_len == OVPN_KEY_SIZE_256,
 	     "Key length should be 32 for AES-256-GCM");
@@ -449,7 +451,7 @@ ovpn_test_derive_data_channel_keys (vlib_main_t *vm)
   rv = ovpn_derive_data_channel_keys_v2 (NULL, ks2, client_sid.id,
 					 server_sid.id, &server_keys,
 					 OVPN_CIPHER_ALG_AES_128_GCM,
-					 1 /* is_server */, 0);
+					 1 /* is_server */, 0, 1);
   OVPN_TEST (rv == 0, "Key derivation with AES-128-GCM should succeed");
   OVPN_TEST (server_keys.key_len == OVPN_KEY_SIZE_128,
 	     "Key length should be 16 for AES-128-GCM");
@@ -457,7 +459,7 @@ ovpn_test_derive_data_channel_keys (vlib_main_t *vm)
   /* Test with invalid cipher */
   rv = ovpn_derive_data_channel_keys_v2 (NULL, ks2, client_sid.id,
 					 server_sid.id, &server_keys,
-					 OVPN_CIPHER_ALG_NONE, 1, 0);
+					 OVPN_CIPHER_ALG_NONE, 1, 0, 1);
   OVPN_TEST (rv < 0, "Should fail with NONE cipher");
 
   /* Clean up */

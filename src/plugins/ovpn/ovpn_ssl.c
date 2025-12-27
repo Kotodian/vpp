@@ -212,6 +212,46 @@ ovpn_generate_key_expansion_prf (const ovpn_key_source2_t *key_src2,
 
   clib_memset (key2, 0, sizeof (*key2));
 
+  /* Debug: Print input random values */
+  clib_warning (
+    "PRF inputs: client.pre_master[0..7]=%02x%02x%02x%02x%02x%02x%02x%02x",
+    key_src2->client.pre_master[0], key_src2->client.pre_master[1],
+    key_src2->client.pre_master[2], key_src2->client.pre_master[3],
+    key_src2->client.pre_master[4], key_src2->client.pre_master[5],
+    key_src2->client.pre_master[6], key_src2->client.pre_master[7]);
+  clib_warning (
+    "PRF inputs: client.random1[0..7]=%02x%02x%02x%02x%02x%02x%02x%02x",
+    key_src2->client.random1[0], key_src2->client.random1[1],
+    key_src2->client.random1[2], key_src2->client.random1[3],
+    key_src2->client.random1[4], key_src2->client.random1[5],
+    key_src2->client.random1[6], key_src2->client.random1[7]);
+  clib_warning (
+    "PRF inputs: server.random1[0..7]=%02x%02x%02x%02x%02x%02x%02x%02x",
+    key_src2->server.random1[0], key_src2->server.random1[1],
+    key_src2->server.random1[2], key_src2->server.random1[3],
+    key_src2->server.random1[4], key_src2->server.random1[5],
+    key_src2->server.random1[6], key_src2->server.random1[7]);
+  clib_warning (
+    "PRF inputs: client.random2[0..7]=%02x%02x%02x%02x%02x%02x%02x%02x",
+    key_src2->client.random2[0], key_src2->client.random2[1],
+    key_src2->client.random2[2], key_src2->client.random2[3],
+    key_src2->client.random2[4], key_src2->client.random2[5],
+    key_src2->client.random2[6], key_src2->client.random2[7]);
+  clib_warning (
+    "PRF inputs: server.random2[0..7]=%02x%02x%02x%02x%02x%02x%02x%02x",
+    key_src2->server.random2[0], key_src2->server.random2[1],
+    key_src2->server.random2[2], key_src2->server.random2[3],
+    key_src2->server.random2[4], key_src2->server.random2[5],
+    key_src2->server.random2[6], key_src2->server.random2[7]);
+  if (client_sid)
+    clib_warning ("PRF inputs: client_sid=%02x%02x%02x%02x%02x%02x%02x%02x",
+		  client_sid[0], client_sid[1], client_sid[2], client_sid[3],
+		  client_sid[4], client_sid[5], client_sid[6], client_sid[7]);
+  if (server_sid)
+    clib_warning ("PRF inputs: server_sid=%02x%02x%02x%02x%02x%02x%02x%02x",
+		  server_sid[0], server_sid[1], server_sid[2], server_sid[3],
+		  server_sid[4], server_sid[5], server_sid[6], server_sid[7]);
+
   /*
    * Step 1: Derive master secret
    * PRF(client.pre_master, "OpenVPN master secret",
@@ -241,6 +281,28 @@ ovpn_generate_key_expansion_prf (const ovpn_key_source2_t *key_src2,
 		  client_sid ? OVPN_SID_SIZE : 0, server_sid,
 		  server_sid ? OVPN_SID_SIZE : 0, (u8 *) key2->keys,
 		  OVPN_KEY_EXPANSION_SIZE);
+
+  /* Debug: Print PRF output */
+  clib_warning (
+    "PRF output: key2[0].cipher[0..7]=%02x%02x%02x%02x%02x%02x%02x%02x",
+    key2->keys[0].cipher[0], key2->keys[0].cipher[1], key2->keys[0].cipher[2],
+    key2->keys[0].cipher[3], key2->keys[0].cipher[4], key2->keys[0].cipher[5],
+    key2->keys[0].cipher[6], key2->keys[0].cipher[7]);
+  clib_warning (
+    "PRF output: key2[0].hmac[0..7]=%02x%02x%02x%02x%02x%02x%02x%02x",
+    key2->keys[0].hmac[0], key2->keys[0].hmac[1], key2->keys[0].hmac[2],
+    key2->keys[0].hmac[3], key2->keys[0].hmac[4], key2->keys[0].hmac[5],
+    key2->keys[0].hmac[6], key2->keys[0].hmac[7]);
+  clib_warning (
+    "PRF output: key2[1].cipher[0..7]=%02x%02x%02x%02x%02x%02x%02x%02x",
+    key2->keys[1].cipher[0], key2->keys[1].cipher[1], key2->keys[1].cipher[2],
+    key2->keys[1].cipher[3], key2->keys[1].cipher[4], key2->keys[1].cipher[5],
+    key2->keys[1].cipher[6], key2->keys[1].cipher[7]);
+  clib_warning (
+    "PRF output: key2[1].hmac[0..7]=%02x%02x%02x%02x%02x%02x%02x%02x",
+    key2->keys[1].hmac[0], key2->keys[1].hmac[1], key2->keys[1].hmac[2],
+    key2->keys[1].hmac[3], key2->keys[1].hmac[4], key2->keys[1].hmac[5],
+    key2->keys[1].hmac[6], key2->keys[1].hmac[7]);
 
   /* Securely clear master secret */
   ovpn_secure_zero_memory (master, sizeof (master));
@@ -473,10 +535,14 @@ ovpn_derive_data_channel_keys_v2 (ptls_t *tls,
 				  const u8 *client_sid, const u8 *server_sid,
 				  ovpn_key_material_t *keys,
 				  ovpn_cipher_alg_t cipher_alg, int is_server,
-				  int use_tls_ekm)
+				  int use_tls_ekm, int client_keydir)
 {
   u8 key_len;
   int ret;
+
+  clib_warning ("ovpn_derive_data_channel_keys_v2: use_tls_ekm=%d is_server=%d "
+		"cipher=%d client_keydir=%d",
+		use_tls_ekm, is_server, cipher_alg, client_keydir);
 
   /* Determine key length based on cipher */
   key_len = ovpn_crypto_key_size (cipher_alg);
@@ -556,40 +622,68 @@ ovpn_derive_data_channel_keys_v2 (ptls_t *tls,
 	return -5;
 
       /*
-       * Key assignment based on role:
-       * - keys[0] = client-to-server (c2s)
-       * - keys[1] = server-to-client (s2c)
+       * Key assignment based on key direction:
        *
-       * Server: encrypt with keys[1], decrypt with keys[0]
-       * Client: encrypt with keys[0], decrypt with keys[1]
+       * OpenVPN key direction (keydir option):
+       * - keydir 0 (NORMAL): encrypt keys[0], decrypt keys[1]
+       * - keydir 1 (INVERSE): encrypt keys[1], decrypt keys[0]
+       *
+       * In client/server mode:
+       * - Client uses keydir 0 (NORMAL) for data channel
+       * - Server uses keydir 1 (INVERSE) for data channel
+       *
+       * This ensures bidirectional communication works:
+       * - Client encrypts with key2[0] → Server decrypts with key2[0]
+       * - Server encrypts with key2[1] → Client decrypts with key2[1]
+       *
+       * Note: The "keydir" in client's options string refers to tls-auth
+       * direction, not data channel direction. For data channel, the
+       * server always uses INVERSE direction.
        */
+      int our_keydir;
       if (is_server)
 	{
-	  /* Server uses KEY_DIRECTION_INVERSE */
-	  clib_memcpy_fast (keys->encrypt_key, key2.keys[1].cipher, key_len);
-	  clib_memcpy_fast (keys->decrypt_key, key2.keys[0].cipher, key_len);
-	  /* Use hmac portion for implicit IV */
-	  clib_memcpy_fast (keys->encrypt_implicit_iv, key2.keys[1].hmac,
-			    OVPN_IMPLICIT_IV_LEN);
-	  clib_memcpy_fast (keys->decrypt_implicit_iv, key2.keys[0].hmac,
-			    OVPN_IMPLICIT_IV_LEN);
+	  /* Server always uses INVERSE direction for data channel */
+	  our_keydir = 1;
 	}
       else
 	{
-	  /* Client uses KEY_DIRECTION_NORMAL */
-	  clib_memcpy_fast (keys->encrypt_key, key2.keys[0].cipher, key_len);
-	  clib_memcpy_fast (keys->decrypt_key, key2.keys[1].cipher, key_len);
-	  clib_memcpy_fast (keys->encrypt_implicit_iv, key2.keys[0].hmac,
-			    OVPN_IMPLICIT_IV_LEN);
-	  clib_memcpy_fast (keys->decrypt_implicit_iv, key2.keys[1].hmac,
-			    OVPN_IMPLICIT_IV_LEN);
+	  /* Client uses its own keydir (typically NORMAL) */
+	  our_keydir = client_keydir;
 	}
+
+      clib_warning ("ovpn_derive_keys: client_keydir=%d our_keydir=%d",
+		    client_keydir, our_keydir);
+
+      int encrypt_idx = (our_keydir == 0) ? 0 : 1;
+      int decrypt_idx = (our_keydir == 0) ? 1 : 0;
+
+      clib_memcpy_fast (keys->encrypt_key, key2.keys[encrypt_idx].cipher,
+			key_len);
+      clib_memcpy_fast (keys->decrypt_key, key2.keys[decrypt_idx].cipher,
+			key_len);
+      /* Use hmac portion for implicit IV */
+      clib_memcpy_fast (keys->encrypt_implicit_iv, key2.keys[encrypt_idx].hmac,
+			OVPN_IMPLICIT_IV_LEN);
+      clib_memcpy_fast (keys->decrypt_implicit_iv, key2.keys[decrypt_idx].hmac,
+			OVPN_IMPLICIT_IV_LEN);
 
       /* Debug: Print derived keys (full 32 bytes for comparison with OpenVPN) */
 
       /* Securely clear key2 */
       ovpn_secure_zero_memory (&key2, sizeof (key2));
     }
+
+  /* Debug: Print derived keys/IVs */
+  clib_warning ("ovpn_derive_keys: decrypt_key[0..7]=%02x%02x%02x%02x%02x%02x%02x%02x "
+		"decrypt_iv[0..7]=%02x%02x%02x%02x%02x%02x%02x%02x",
+		keys->decrypt_key[0], keys->decrypt_key[1], keys->decrypt_key[2],
+		keys->decrypt_key[3], keys->decrypt_key[4], keys->decrypt_key[5],
+		keys->decrypt_key[6], keys->decrypt_key[7],
+		keys->decrypt_implicit_iv[0], keys->decrypt_implicit_iv[1],
+		keys->decrypt_implicit_iv[2], keys->decrypt_implicit_iv[3],
+		keys->decrypt_implicit_iv[4], keys->decrypt_implicit_iv[5],
+		keys->decrypt_implicit_iv[6], keys->decrypt_implicit_iv[7]);
 
   return 0;
 }
@@ -602,9 +696,11 @@ int
 ovpn_derive_data_channel_keys (ptls_t *tls, ovpn_key_material_t *keys,
 			       ovpn_cipher_alg_t cipher_alg, int is_server)
 {
+  /* For TLS-EKM mode, client_keydir is not used, pass default value */
   return ovpn_derive_data_channel_keys_v2 (tls, NULL, NULL, NULL, keys,
 					   cipher_alg, is_server,
-					   1 /* use_tls_ekm */);
+					   1 /* use_tls_ekm */,
+					   1 /* client_keydir (unused for TLS-EKM) */);
 }
 
 /*

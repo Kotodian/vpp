@@ -156,6 +156,9 @@ ovpn_peer_delete (ovpn_peer_db_t *db, u32 peer_id)
   clib_bihash_kv_8_8_t kv;
   clib_bihash_kv_24_8_t kv24;
 
+  clib_warning ("ovpn_peer_delete: DELETING peer_id=%u db=%p pool_elts=%u",
+		peer_id, db, db ? pool_elts (db->peers) : 0);
+
   peer = ovpn_peer_get (db, peer_id);
   if (!peer)
     return;
@@ -558,6 +561,16 @@ ovpn_peer_get_crypto_by_key_id (ovpn_peer_db_t *db, u32 peer_id, u8 key_id)
       ovpn_peer_key_t *pkey = (ovpn_peer_key_t *) (uword) value.value;
       if (pkey->is_active && pkey->crypto.is_valid)
 	return &pkey->crypto;
+      clib_warning (
+	"ovpn_peer_get_crypto_by_key_id: peer=%u key=%u found but "
+	"is_active=%d is_valid=%d",
+	peer_id, key_id, pkey->is_active, pkey->crypto.is_valid);
+    }
+  else
+    {
+      clib_warning (
+	"ovpn_peer_get_crypto_by_key_id: peer=%u key=%u bihash lookup failed",
+	peer_id, key_id);
     }
 
   return NULL;
@@ -1006,9 +1019,10 @@ ovpn_peer_start_rekey (vlib_main_t *vm, ovpn_peer_t *peer,
   if (peer->state != OVPN_PEER_STATE_ESTABLISHED)
     return -1;
 
-  /* Cannot start rekey if one is already in progress */
-  if (peer->tls_ctx)
-    return -2;
+  /*
+   * Note: tls_ctx may still exist from initial handshake (kept alive for
+   * control channel). ovpn_peer_tls_init() will free and reinitialize it.
+   */
 
   /* Initialize TLS context for rekey */
   rv = ovpn_peer_tls_init (peer, ptls_ctx, key_id);
@@ -1055,7 +1069,7 @@ ovpn_peer_complete_rekey (vlib_main_t *vm, ovpn_peer_db_t *db,
   rv = ovpn_derive_data_channel_keys_v2 (
     tls_ctx->tls, tls_ctx->key_src2, peer->remote_session_id.id,
     peer->session_id.id, &keys, cipher_alg, 1 /* is_server */,
-    tls_ctx->use_tls_ekm);
+    tls_ctx->use_tls_ekm, tls_ctx->client_keydir);
 
   if (rv < 0)
     {

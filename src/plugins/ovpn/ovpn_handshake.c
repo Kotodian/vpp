@@ -2993,6 +2993,9 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 			  1 /* is_server */, &peer_opts);
 			if (km_rv > 0)
 			  {
+			    clib_warning (
+			      "ovpn: Key Method 2 received, peer_opts: %s",
+			      peer_opts ? peer_opts : "(null)");
 			    tls_ctx->key_method_received = 1;
 			    tls_ctx->peer_options = peer_opts;
 
@@ -3099,6 +3102,23 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 				    if (strcmp (key_deriv, "tls-ekm") == 0)
 				      tls_ctx->use_tls_ekm = 1;
 				    clib_mem_free (key_deriv);
+				  }
+
+				/* Parse client's key direction */
+				char *keydir_str =
+				  ovpn_options_string_extract_option (
+				    peer_opts, "keydir");
+				if (keydir_str)
+				  {
+				    tls_ctx->client_keydir = atoi (keydir_str);
+				    clib_warning (
+				      "ovpn: client keydir=%d", tls_ctx->client_keydir);
+				    clib_mem_free (keydir_str);
+				  }
+				else
+				  {
+				    /* Default to keydir 1 (inverse) for TLS clients */
+				    tls_ctx->client_keydir = 1;
 				  }
 
 				/*
@@ -3314,7 +3334,7 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 			      tls_ctx->tls, tls_ctx->key_src2,
 			      peer->remote_session_id.id, peer->session_id.id,
 			      &keys, cipher_alg, 1 /* is_server */,
-			      tls_ctx->use_tls_ekm);
+			      tls_ctx->use_tls_ekm, tls_ctx->client_keydir);
 
 			    if (key_rv == 0)
 			      {
@@ -3413,7 +3433,16 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 				 * Keep TLS context alive for control messages
 				 * (PUSH_REQUEST/PUSH_REPLY, ping, etc.)
 				 * It will be freed when peer is deleted.
+				 *
+				 * However, key_src2 contains sensitive pre-master
+				 * secrets and is no longer needed after key
+				 * derivation - free it now to prevent memory leak.
 				 */
+				if (tls_ctx->key_src2)
+				  {
+				    ovpn_key_source2_free (tls_ctx->key_src2);
+				    tls_ctx->key_src2 = NULL;
+				  }
 
 				rv = 2; /* Handshake complete */
 

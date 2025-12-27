@@ -246,7 +246,8 @@ int ovpn_derive_data_channel_keys_v2 (ptls_t *tls,
 				      const u8 *server_sid,
 				      ovpn_key_material_t *keys,
 				      ovpn_cipher_alg_t cipher_alg,
-				      int is_server, int use_tls_ekm);
+				      int is_server, int use_tls_ekm,
+				      int client_keydir);
 
 /**
  * Derive data channel keys from TLS session (legacy interface)

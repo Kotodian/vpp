@@ -127,6 +127,12 @@ typedef struct ovpn_peer_tls_t_
   u8 use_tls_ekm : 1;	      /* Use TLS-EKM instead of PRF for key derivation */
 
   /*
+   * Client's key direction from options string (keydir option)
+   * 0 = normal, 1 = inverse, -1 = not specified (default to 1)
+   */
+  i8 client_keydir;
+
+  /*
    * Negotiated data channel cipher from client options
    * This is determined from the "cipher" option in the client's
    * Key Method 2 options string during negotiation.
@@ -363,8 +369,19 @@ void ovpn_peer_delete (ovpn_peer_db_t *db, u32 peer_id);
 always_inline ovpn_peer_t *
 ovpn_peer_get (ovpn_peer_db_t *db, u32 peer_id)
 {
+  if (!db || !db->peers)
+    {
+      clib_warning ("ovpn_peer_get: db=%p db->peers=%p peer_id=%u",
+		    db, db ? db->peers : NULL, peer_id);
+      return NULL;
+    }
   if (pool_is_free_index (db->peers, peer_id))
-    return NULL;
+    {
+      clib_warning (
+	"ovpn_peer_get: peer_id=%u is free (pool_elts=%u pool_len=%u)",
+	peer_id, pool_elts (db->peers), vec_len (db->peers));
+      return NULL;
+    }
   return pool_elt_at_index (db->peers, peer_id);
 }
 
@@ -529,6 +546,7 @@ ovpn_peer_get_crypto (ovpn_peer_t *peer)
 
 /*
  * Get crypto context by key_id using bihash lookup
+ * Returns pointer to crypto context or NULL if not found
  */
 ovpn_crypto_context_t *ovpn_peer_get_crypto_by_key_id (ovpn_peer_db_t *db,
 						       u32 peer_id, u8 key_id);
