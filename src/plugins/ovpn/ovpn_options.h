@@ -170,6 +170,22 @@ typedef struct ovpn_options_t_
   u8 management_query_passwords; /* Query passwords via management
 				    (--management-query-passwords) */
 
+  /*
+   * Data channel protocol options
+   */
+  u8 use_data_v2; /* Enable DATA_V2 format support (default 0) */
+  u8 data_channel_keydir; /* Key direction for data channel:
+			     0=NORMAL (client encrypts key2[0]),
+			     1=INVERSE (client encrypts key2[1]),
+			     255=auto (from client options, default 0) */
+
+  /*
+   * MSS fix - clamp TCP MSS to avoid fragmentation
+   * mssfix <max_mss> - Clamp TCP MSS to max_mss value
+   * Default: 0 (disabled), typical value: 1450
+   */
+  u16 mssfix;
+
 } ovpn_options_t;
 
 /* Static key size: 256 bytes (2048 bits) */

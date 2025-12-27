@@ -1580,6 +1580,13 @@ ovpn_periodic_process (vlib_main_t *vm, vlib_node_runtime_t *rt,
 	      }
 	  }
 
+	  /*
+	   * Process control channel retransmissions.
+	   * Check all pending connections and established peers for
+	   * control packets that need retransmitting (timeout expired).
+	   */
+	  ovpn_control_channel_retransmit (vm, inst);
+
 	  /* Get keepalive settings */
 	  f64 ping_interval = inst->options.keepalive_ping > 0 ?
 				(f64) inst->options.keepalive_ping :

@@ -355,6 +355,16 @@ parse_option (u8 *line_start, u8 *line_end, const char *base_dir,
     {
       /* We use tun-mtu primarily, but accept link-mtu */
     }
+  else if (unformat (&input, "mssfix %u", &u32_val))
+    {
+      /* MSS clamping to avoid tunnel fragmentation */
+      config->options.mssfix = (u16) u32_val;
+    }
+  else if (unformat (&input, "mssfix"))
+    {
+      /* Default mssfix value (1450 is typical for OpenVPN) */
+      config->options.mssfix = 1450;
+    }
   else if (unformat (&input, "reneg-sec %u", &u32_val))
     {
       config->options.renegotiate_seconds = u32_val;
@@ -1194,6 +1204,14 @@ ovpn_parse_inline_instance (vlib_main_t *vm, const char *instance_name,
       else if (unformat (input, "tun-mtu %u", &u32_val))
 	{
 	  config.options.mtu = (u16) u32_val;
+	}
+      else if (unformat (input, "mssfix %u", &u32_val))
+	{
+	  config.options.mssfix = (u16) u32_val;
+	}
+      else if (unformat (input, "mssfix"))
+	{
+	  config.options.mssfix = 1450;
 	}
       else if (unformat (input, "reneg-sec %u", &u32_val))
 	{

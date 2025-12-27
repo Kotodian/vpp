@@ -493,12 +493,17 @@ ovpn_crypto_encrypt_prepare (vlib_main_t *vm, ovpn_per_thread_crypto_t *ptd,
   packet_id = ovpn_crypto_get_next_packet_id (ctx);
 
   /*
-   * OpenVPN AEAD wire format: [header][tag][ciphertext]
-   * Reserve space for header + tag at front, then payload follows naturally.
+   * OpenVPN AEAD wire format (same for both DATA_V1 and DATA_V2):
+   *   [header][tag:16][ciphertext]
+   * Tag is ALWAYS after header, before ciphertext.
    */
   if (ctx->use_data_v2)
     {
-      /* DATA_V2 format: opcode(1) + peer_id(3) + packet_id(4) + tag(16) */
+      /*
+       * DATA_V2 AEAD format: [header:8][tag:16][ciphertext]
+       * Tag is AFTER header, BEFORE ciphertext (same as DATA_V1)
+       * AAD = full 8-byte header
+       */
       u8 *hdr_start;
       ovpn_data_v2_header_t *hdr_v2;
 
@@ -511,9 +516,9 @@ ovpn_crypto_encrypt_prepare (vlib_main_t *vm, ovpn_per_thread_crypto_t *ptd,
       ovpn_data_v2_set_peer_id (hdr_v2, peer_id);
       hdr_v2->packet_id = clib_host_to_net_u32 (packet_id);
 
-      /* AAD is full header (8 bytes) for DATA_V2 */
+      /* AAD = full 8-byte header */
       aad = hdr_start;
-      aad_len = sizeof (*hdr_v2);
+      aad_len = 8;
 
       /* Tag is right after header */
       tag = hdr_start + sizeof (*hdr_v2);
@@ -663,16 +668,12 @@ ovpn_crypto_decrypt_prepare (vlib_main_t *vm, ovpn_per_thread_crypto_t *ptd,
 
   if (opcode == OVPN_OP_DATA_V2)
     {
-      /*
-       * DATA_V2: AAD includes the full header (opcode + peer_id + packet_id).
-       * OpenVPN AEAD mode authenticates: [opcode:1][peer_id:3][packet_id:4]
-       * Total AAD = 8 bytes
-       */
+      /* DATA_V2: AAD = full 8-byte header (opcode_keyid + peer_id + packet_id) */
       if (total_len < OVPN_DATA_V2_MIN_SIZE + OVPN_TAG_SIZE)
 	return -3;
       ovpn_data_v2_header_t *hdr_v2 = (ovpn_data_v2_header_t *) pkt_start;
-      aad = pkt_start;
-      aad_len = sizeof (ovpn_data_v2_header_t);
+      aad = pkt_start;  /* Full header from opcode */
+      aad_len = 8;  /* Complete header */
       hdr_len = sizeof (ovpn_data_v2_header_t);
       packet_id = clib_net_to_host_u32 (hdr_v2->packet_id);
     }
@@ -702,16 +703,20 @@ ovpn_crypto_decrypt_prepare (vlib_main_t *vm, ovpn_per_thread_crypto_t *ptd,
     return -4; /* Replay detected */
 
   /*
-   * Wire format for AEAD (same for both DATA_V1 and DATA_V2):
-   * DATA_V1: [opcode:1][packet_id:4][tag:16][ciphertext:N]
-   * DATA_V2: [opcode:1][peer_id:3][packet_id:4][tag:16][ciphertext:N]
-   *
-   * The authentication tag is always placed AFTER the packet_id and
-   * BEFORE the ciphertext, regardless of DATA_V1 or DATA_V2.
+   * Wire format for AEAD (both DATA_V1 and DATA_V2):
+   *   DATA_V1: [opcode:1][packet_id:4][tag:16][ciphertext:N]
+   *   DATA_V2: [opcode:1][peer_id:3][packet_id:4][tag:16][ciphertext:N]
+   * Tag is ALWAYS after header, before ciphertext in OpenVPN AEAD mode.
    */
   tag = pkt_start + hdr_len;
   src = pkt_start + hdr_len + OVPN_TAG_SIZE;
   src_len = total_len - hdr_len - OVPN_TAG_SIZE;
+
+  clib_warning (
+    "ovpn_crypto_decrypt_prepare: opcode=%u total_len=%u hdr_len=%u "
+    "tag_offset=%lu src_offset=%lu src_len=%u",
+    opcode, total_len, hdr_len, (uword) (tag - pkt_start),
+    (uword) (src - pkt_start), src_len);
 
   /* Allocate IV storage */
   vec_add2 (ptd->ivs, iv, OVPN_NONCE_SIZE);

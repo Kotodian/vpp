@@ -64,6 +64,14 @@ static int ovpn_handshake_send_peer_packets (vlib_main_t *vm,
 					     ovpn_tls_auth_t *auth,
 					     ovpn_tls_crypt_t *tls_crypt);
 
+static int ovpn_handshake_send_peer_packets_ex (vlib_main_t *vm,
+						ovpn_peer_t *peer,
+						const ip_address_t *local_addr,
+						u16 local_port, u8 is_ip6,
+						ovpn_tls_auth_t *auth,
+						ovpn_tls_crypt_t *tls_crypt,
+						u8 force_send);
+
 /*
  * Initialize pending connection database
  */
@@ -1678,12 +1686,13 @@ ovpn_tls_crypt_v2_extract_wkc (const u8 *packet, u32 packet_len,
  * lookup
  */
 static int
-ovpn_handshake_send_pending_packets (vlib_main_t *vm,
-				     ovpn_pending_connection_t *pending,
-				     const ip_address_t *local_addr,
-				     u16 local_port, u8 is_ip6,
-				     ovpn_tls_auth_t *auth,
-				     ovpn_tls_crypt_t *tls_crypt)
+ovpn_handshake_send_pending_packets_ex (vlib_main_t *vm,
+					ovpn_pending_connection_t *pending,
+					const ip_address_t *local_addr,
+					u16 local_port, u8 is_ip6,
+					ovpn_tls_auth_t *auth,
+					ovpn_tls_crypt_t *tls_crypt,
+					u8 force_send)
 {
   ovpn_reli_buffer_t *buf;
   u8 opcode;
@@ -1691,8 +1700,9 @@ ovpn_handshake_send_pending_packets (vlib_main_t *vm,
   u32 bi;
   u32 n_sent = 0;
 
-  /* Schedule packets for immediate sending */
-  ovpn_reliable_schedule_now (vm, pending->send_reliable);
+  /* Schedule packets for immediate sending only if force_send is set */
+  if (force_send)
+    ovpn_reliable_schedule_now (vm, pending->send_reliable);
 
   /* Send all packets that are ready */
   while (ovpn_reliable_can_send (vm, pending->send_reliable))
@@ -1959,15 +1969,31 @@ ovpn_handshake_send_pending_packets (vlib_main_t *vm,
 }
 
 /*
+ * Wrapper for backwards compatibility - always forces immediate send
+ */
+static int
+ovpn_handshake_send_pending_packets (vlib_main_t *vm,
+				     ovpn_pending_connection_t *pending,
+				     const ip_address_t *local_addr,
+				     u16 local_port, u8 is_ip6,
+				     ovpn_tls_auth_t *auth,
+				     ovpn_tls_crypt_t *tls_crypt)
+{
+  return ovpn_handshake_send_pending_packets_ex (vm, pending, local_addr,
+						 local_port, is_ip6, auth,
+						 tls_crypt, 1 /* force_send */);
+}
+
+/*
  * Send control packets from peer's TLS reliable buffer
  * Similar to pending packets but uses peer's TLS context
  */
 static int
-ovpn_handshake_send_peer_packets (vlib_main_t *vm, ovpn_peer_t *peer,
-				  const ip_address_t *local_addr,
-				  u16 local_port, u8 is_ip6,
-				  ovpn_tls_auth_t *auth,
-				  ovpn_tls_crypt_t *tls_crypt)
+ovpn_handshake_send_peer_packets_ex (vlib_main_t *vm, ovpn_peer_t *peer,
+				     const ip_address_t *local_addr,
+				     u16 local_port, u8 is_ip6,
+				     ovpn_tls_auth_t *auth,
+				     ovpn_tls_crypt_t *tls_crypt, u8 force_send)
 {
   ovpn_peer_tls_t *tls_ctx = peer->tls_ctx;
   ovpn_reli_buffer_t *buf;
@@ -1979,8 +2005,9 @@ ovpn_handshake_send_peer_packets (vlib_main_t *vm, ovpn_peer_t *peer,
   if (!tls_ctx || !tls_ctx->send_reliable)
     return 0;
 
-  /* Schedule packets for immediate sending */
-  ovpn_reliable_schedule_now (vm, tls_ctx->send_reliable);
+  /* Schedule packets for immediate sending only if force_send is set */
+  if (force_send)
+    ovpn_reliable_schedule_now (vm, tls_ctx->send_reliable);
 
   /* Send all packets that are ready */
   while (ovpn_reliable_can_send (vm, tls_ctx->send_reliable))
@@ -2205,6 +2232,21 @@ ovpn_handshake_send_peer_packets (vlib_main_t *vm, ovpn_peer_t *peer,
     }
 
   return n_sent;
+}
+
+/*
+ * Wrapper for backwards compatibility - always forces immediate send
+ */
+static int
+ovpn_handshake_send_peer_packets (vlib_main_t *vm, ovpn_peer_t *peer,
+				  const ip_address_t *local_addr,
+				  u16 local_port, u8 is_ip6,
+				  ovpn_tls_auth_t *auth,
+				  ovpn_tls_crypt_t *tls_crypt)
+{
+  return ovpn_handshake_send_peer_packets_ex (vm, peer, local_addr, local_port,
+					      is_ip6, auth, tls_crypt,
+					      1 /* force_send */);
 }
 
 /*
@@ -3117,8 +3159,17 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 				  }
 				else
 				  {
-				    /* Default to keydir 1 (inverse) for TLS clients */
-				    tls_ctx->client_keydir = 1;
+				    /* Use configured keydir or default */
+				    if (inst->options.data_channel_keydir == 255)
+				      {
+					/* Auto: default to keydir 1 (inverse) */
+					tls_ctx->client_keydir = 1;
+				      }
+				    else
+				      {
+					tls_ctx->client_keydir =
+					  inst->options.data_channel_keydir;
+				      }
 				  }
 
 				/*
@@ -3343,6 +3394,12 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 				  vm, peer_db, peer, OVPN_KEY_SLOT_PRIMARY,
 				  cipher_alg, &keys, tls_ctx->key_id,
 				  inst->options.replay_window);
+
+				/* Enable DATA_V2 format for TLS mode - OpenVPN clients expect it */
+				if (key_rv == 0)
+				  {
+				    peer->keys[OVPN_KEY_SLOT_PRIMARY].crypto.use_data_v2 = 1;
+				  }
 			      }
 
 			    if (key_rv == 0)
@@ -3747,6 +3804,69 @@ ovpn_control_message_process (vlib_main_t *vm, ovpn_peer_t *peer,
 
   /* Unknown message - no response */
   return 0;
+}
+
+/*
+ * Process control channel retransmission for an instance.
+ * Checks all pending connections and established peers for control
+ * packets that need retransmitting (timeout expired).
+ *
+ * This function uses force_send=0 so packets are only sent if their
+ * retransmission timeout has naturally expired (exponential backoff).
+ *
+ * Returns total number of packets retransmitted.
+ */
+int
+ovpn_control_channel_retransmit (vlib_main_t *vm, ovpn_instance_t *inst)
+{
+  int total_sent = 0;
+  ovpn_pending_connection_t *pending;
+  ovpn_peer_t *peer;
+
+  if (!inst)
+    return 0;
+
+  /* Get TLS-Auth and TLS-Crypt pointers from instance */
+  ovpn_tls_auth_t *tls_auth_ptr =
+    inst->tls_auth.enabled ? &inst->tls_auth : NULL;
+  ovpn_tls_crypt_t *tls_crypt_ptr =
+    inst->tls_crypt.enabled ? &inst->tls_crypt : NULL;
+
+  /* Determine IP version from instance configuration */
+  u8 is_ip6 = (inst->local_addr.version == AF_IP6);
+
+  /* Process all pending connections */
+  pool_foreach (pending, inst->multi_context.pending_db.connections)
+    {
+      /* Use per-client TLS-Crypt if available (TLS-Crypt-V2) */
+      ovpn_tls_crypt_t *pending_tls_crypt =
+	pending->client_tls_crypt ? pending->client_tls_crypt : tls_crypt_ptr;
+
+      /* Check if this pending connection has packets to retransmit */
+      int sent = ovpn_handshake_send_pending_packets_ex (
+	vm, pending, &inst->local_addr, inst->local_port, is_ip6, tls_auth_ptr,
+	pending_tls_crypt, 0 /* don't force - only send if timeout expired */);
+
+      if (sent > 0)
+	{
+	  total_sent += sent;
+	  pending->last_activity = vlib_time_now (vm);
+	}
+    }
+
+  /* Process all established peers */
+  pool_foreach (peer, inst->multi_context.peer_db.peers)
+    {
+      /* Check if this peer has control packets to retransmit */
+      int sent = ovpn_handshake_send_peer_packets_ex (
+	vm, peer, &inst->local_addr, inst->local_port, is_ip6, tls_auth_ptr,
+	tls_crypt_ptr, 0 /* don't force - only send if timeout expired */);
+
+      if (sent > 0)
+	total_sent += sent;
+    }
+
+  return total_sent;
 }
 
 /*

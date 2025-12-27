@@ -183,6 +183,16 @@ ovpn_if_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai)
 
   adj = adj_get (ai);
 
+  clib_warning ("ovpn_if_update_adj: sw_if_index=%u ai=%u nh_proto=%d lookup_next=%d",
+		sw_if_index, ai, adj->ia_nh_proto, adj->lookup_next_index);
+
+  if (adj->ia_nh_proto == FIB_PROTOCOL_IP4)
+    clib_warning ("  adj nh_ip4=%U", format_ip4_address,
+		  &adj->sub_type.nbr.next_hop.ip4);
+  else if (adj->ia_nh_proto == FIB_PROTOCOL_IP6)
+    clib_warning ("  adj nh_ip6=%U", format_ip6_address,
+		  &adj->sub_type.nbr.next_hop.ip6);
+
   /* Get instance by sw_if_index */
   inst = ovpn_instance_get_by_sw_if_index (sw_if_index);
   if (!inst)
@@ -191,6 +201,7 @@ ovpn_if_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai)
        * No instance found - convert to midchain with NULL fixup to avoid
        * sending ARP/ND to resolve the next-hop via the ovpn interface.
        */
+      clib_warning ("  no instance found");
       adj_nbr_midchain_update_rewrite (ai, NULL, NULL, ADJ_FLAG_NONE, NULL);
       return;
     }
@@ -200,8 +211,16 @@ ovpn_if_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai)
    * For OpenVPN, we look for an established peer on this interface
    */
   int peer_found = 0;
+  int n_peers = 0;
   pool_foreach (peer, inst->multi_context.peer_db.peers)
     {
+      n_peers++;
+      clib_warning ("  peer %u: sw_if_index=%u state=%d vip_set=%d vip_ver=%d",
+		    peer->peer_id, peer->sw_if_index, peer->state,
+		    peer->virtual_ip_set, peer->virtual_ip.version);
+      if (peer->virtual_ip_set && peer->virtual_ip.version == AF_IP4)
+	clib_warning ("    virtual_ip=%U", format_ip4_address,
+		      &peer->virtual_ip.ip.ip4);
       if (peer->sw_if_index != sw_if_index)
 	continue;
       if (peer->state != OVPN_PEER_STATE_ESTABLISHED)
@@ -217,14 +236,14 @@ ovpn_if_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai)
 	{
 	  /* Check if next-hop matches virtual IP */
 	  if (adj->ia_nh_proto == FIB_PROTOCOL_IP4 &&
-	      !peer->virtual_ip.version)
+	      peer->virtual_ip.version == AF_IP4)
 	    {
 	      if (ip4_address_compare (&adj->sub_type.nbr.next_hop.ip4,
 				       &peer->virtual_ip.ip.ip4) == 0)
 		match = 1;
 	    }
 	  else if (adj->ia_nh_proto == FIB_PROTOCOL_IP6 &&
-		   peer->virtual_ip.version)
+		   peer->virtual_ip.version == AF_IP6)
 	    {
 	      if (ip6_address_compare (&adj->sub_type.nbr.next_hop.ip6,
 				       &peer->virtual_ip.ip.ip6) == 0)
@@ -241,6 +260,9 @@ ovpn_if_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai)
 	{
 	  /* Associate this adjacency with the peer */
 	  ovpn_peer_adj_index_add (peer->peer_id, ai);
+
+	  clib_warning ("  setting up midchain for peer %u, rewrite_len=%u",
+			peer->peer_id, vec_len (peer->rewrite));
 
 	  /*
 	   * Convert to midchain with proper fixup and rewrite.
@@ -259,10 +281,27 @@ ovpn_if_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai)
 	  u32 output_node_index = (adj->ia_nh_proto == FIB_PROTOCOL_IP4) ?
 				    ovpn4_output_node.index :
 				    ovpn6_output_node.index;
+	  clib_warning ("  setting next_node to %u (ovpn%d-output)",
+			output_node_index, adj->ia_nh_proto == FIB_PROTOCOL_IP4 ? 4 : 6);
 	  adj_nbr_midchain_update_next_node (ai, output_node_index);
 
 	  /* Stack the adjacency on the path to reach the peer's endpoint */
+	  clib_warning ("  stacking adjacency on peer remote_addr");
 	  ovpn_peer_adj_stack (peer, ai);
+
+	  /* Verify the adjacency was updated correctly */
+	  adj = adj_get (ai);
+	  clib_warning ("  AFTER: lookup_next=%d ia_link=%d ia_node_index=%u next_index=%u",
+			adj->lookup_next_index, adj->ia_link, adj->ia_node_index,
+			adj->rewrite_header.next_index);
+	  clib_warning ("  AFTER: rewrite_header.flags=0x%x (HAS_FEATURES=%d)",
+			adj->rewrite_header.flags,
+			!!(adj->rewrite_header.flags & VNET_REWRITE_HAS_FEATURES));
+
+	  /* Also check what ip4-midchain node index would be */
+	  extern vlib_node_registration_t ip4_midchain_node;
+	  clib_warning ("  ip4_midchain_node.index=%u", ip4_midchain_node.index);
+
 	  peer_found = 1;
 	  break;
 	}
@@ -274,7 +313,12 @@ ovpn_if_update_adj (vnet_main_t *vnm, u32 sw_if_index, adj_index_t ai)
        * No matching peer found - convert to midchain with NULL fixup to avoid
        * sending ARP/ND to resolve the next-hop via the ovpn interface.
        */
+      clib_warning ("  no matching peer found (n_peers=%d)", n_peers);
       adj_nbr_midchain_update_rewrite (ai, NULL, NULL, ADJ_FLAG_NONE, NULL);
+    }
+  else
+    {
+      clib_warning ("  peer_found!");
     }
 }
 

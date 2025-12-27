@@ -27,6 +27,7 @@
 #include <ovpn/ovpn_packet.h>
 #include <ovpn/ovpn_peer.h>
 #include <ovpn/ovpn_crypto.h>
+#include <ovpn/ovpn_mssfix.h>
 
 /* Output node next indices */
 typedef enum
@@ -142,6 +143,8 @@ ovpn_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
   /* Reset per-thread crypto state for batch processing */
   ovpn_crypto_reset_ptd (ptd);
 
+  clib_warning ("ovpn_output_inline: n_left_from=%u is_ip4=%d", n_left_from, is_ip4);
+
   while (n_left_from > 0)
     {
       vlib_buffer_t *b0 = b[0];
@@ -158,6 +161,7 @@ ovpn_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
       /* Get adjacency index from buffer */
       adj_index = vnet_buffer (b0)->ip.adj_index[VLIB_TX];
+      clib_warning ("  adj_index=%u", adj_index);
 
       /*
        * Lookup peer and instance by adjacency index (cached).
@@ -241,6 +245,16 @@ ovpn_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       /* Advance past outer headers to inner packet */
       vlib_buffer_advance (b0, outer_hdr_len);
       inner_len = b0->current_length;
+
+      /*
+       * Apply MSS clamping if configured.
+       * This must be done before encryption while we have access to the
+       * plaintext inner packet.
+       */
+      if (PREDICT_FALSE (inst->options.mssfix > 0))
+	{
+	  ovpn_mssfix_inner_packet (vm, b0, inst->options.mssfix);
+	}
 
       /*
        * Encrypt the packet based on cipher mode

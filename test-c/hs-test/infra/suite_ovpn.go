@@ -216,6 +216,23 @@ func (s *OvpnSuite) GetOvpnStaticKeyWithDataCiphersConfig(instanceName, keyPath 
 	return config
 }
 
+// GetOvpnStaticKeyWithMssfixConfig returns a Stanza for OpenVPN with mssfix option
+func (s *OvpnSuite) GetOvpnStaticKeyWithMssfixConfig(instanceName, keyPath string, mssfixValue int) Stanza {
+	var config Stanza
+	config.NewStanza("openvpn").
+		NewStanza(fmt.Sprintf("instance %s", instanceName)).
+		Append(fmt.Sprintf("local %s", s.VppOvpnAddr())).
+		Append(fmt.Sprintf("port %s", s.Ports.Ovpn)).
+		Append("dev ovpn0").
+		Append("dev-type tun").
+		Append(fmt.Sprintf("secret %s", keyPath)).
+		Append("cipher AES-256-CBC").
+		Append(fmt.Sprintf("mssfix %d", mssfixValue)).
+		Close().
+		Close()
+	return config
+}
+
 // GetOvpnFullFeaturedConfig returns a Stanza with all new options enabled
 func (s *OvpnSuite) GetOvpnFullFeaturedConfig(instanceName, keyPath string) Stanza {
 	var config Stanza
@@ -276,6 +293,15 @@ func (s *OvpnSuite) SetupVppOvpnFullFeatured(keyFile string) {
 	s.CopyStaticKeyToVpp()
 	ovpnConfig := s.GetOvpnFullFeaturedConfig("full-featured-server", keyFile)
 	s.Log("OpenVPN startup config (full featured):\n" + ovpnConfig.ToString())
+	s.StartVppWithOvpnConfig(ovpnConfig)
+	s.ConfigureOvpnInterface()
+}
+
+// SetupVppOvpnWithMssfix sets up VPP with OpenVPN mssfix option via startup.conf
+func (s *OvpnSuite) SetupVppOvpnWithMssfix(keyFile string, mssfixValue int) {
+	s.CopyStaticKeyToVpp()
+	ovpnConfig := s.GetOvpnStaticKeyWithMssfixConfig("mssfix-server", keyFile, mssfixValue)
+	s.Log("OpenVPN startup config with mssfix:\n" + ovpnConfig.ToString())
 	s.StartVppWithOvpnConfig(ovpnConfig)
 	s.ConfigureOvpnInterface()
 }

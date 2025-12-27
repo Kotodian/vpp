@@ -28,6 +28,7 @@
 #include <ovpn/ovpn_handshake.h>
 #include <ovpn/ovpn_options.h>
 #include <ovpn/ovpn_if.h>
+#include <ovpn/ovpn_mssfix.h>
 #include <vnet/ip-neighbor/ip_neighbor.h>
 #include <vnet/adj/adj_nbr.h>
 #include <vnet/fib/fib_table.h>
@@ -520,6 +521,12 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  /* Successfully decrypted - set up for IP stack */
 	  vnet_buffer (b0)->sw_if_index[VLIB_RX] = peer->sw_if_index;
 
+	  /* Apply MSS clamping if configured */
+	  if (PREDICT_FALSE (inst->options.mssfix > 0))
+	    {
+	      ovpn_mssfix_inner_packet (vm, b0, inst->options.mssfix);
+	    }
+
 	  /* Determine inner packet type */
 	  u8 *payload = vlib_buffer_get_current (b0);
 
@@ -790,6 +797,12 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
 	      vnet_buffer (b0)->sw_if_index[VLIB_RX] = peer->sw_if_index;
 
+	      /* Apply MSS clamping if configured */
+	      if (PREDICT_FALSE (inst->options.mssfix > 0))
+		{
+		  ovpn_mssfix_inner_packet (vm, b0, inst->options.mssfix);
+		}
+
 	      /* Determine inner packet type */
 	      u8 *payload = vlib_buffer_get_current (b0);
 	      if (b0->current_length >= 1)
@@ -960,10 +973,10 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	    lb = vlib_get_buffer (vm, lb->next_buffer);
 
 	  /*
-	   * Advance buffer past header and tag (for DATA_V1) to plaintext.
-	   * DATA_V1: [opcode:1][packet_id:4][tag:16][ciphertext/plaintext:N]
-	   * DATA_V2:
-	   * [opcode:1][peer_id:3][packet_id:4][ciphertext/plaintext:N][tag:16]
+	   * Advance buffer past header and tag to plaintext.
+	   * Both DATA_V1 and DATA_V2 have tag AFTER header in AEAD mode:
+	   * DATA_V1: [opcode:1][packet_id:4][tag:16][plaintext:N]
+	   * DATA_V2: [opcode:1][peer_id:3][packet_id:4][tag:16][plaintext:N]
 	   */
 	  data = vlib_buffer_get_current (b0);
 	  u8 opcode = data[0] >> 3;
@@ -975,10 +988,9 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	    }
 	  else
 	    {
-	      /* DATA_V2: advance past header, tag is at end */
-	      vlib_buffer_advance (b0, sizeof (ovpn_data_v2_header_t));
-	      /* Remove tag from chain length */
-	      vlib_buffer_chain_increase_length (b0, lb, -OVPN_TAG_SIZE);
+	      /* DATA_V2: advance past header + tag (same as DATA_V1) */
+	      vlib_buffer_advance (b0, sizeof (ovpn_data_v2_header_t) +
+					 OVPN_TAG_SIZE);
 	    }
 
 	  /* Update peer statistics and store rx bytes for batched counter */
@@ -990,6 +1002,13 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
 	  /* Set sw_if_index for the tunnel interface */
 	  vnet_buffer (b0)->sw_if_index[VLIB_RX] = peer->sw_if_index;
+
+	  /* Apply MSS clamping if configured */
+	  ovpn_instance_t *pkt_inst = instances[i];
+	  if (PREDICT_FALSE (pkt_inst && pkt_inst->options.mssfix > 0))
+	    {
+	      ovpn_mssfix_inner_packet (vm, b0, pkt_inst->options.mssfix);
+	    }
 
 	  /* Determine inner packet type and route to IP input */
 	  data = vlib_buffer_get_current (b0);
@@ -1009,7 +1028,6 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	       * Determine IP version from instance configuration (pool_start),
 	       * not from payload inspection.
 	       */
-	      ovpn_instance_t *pkt_inst = instances[i];
 	      if (pkt_inst && pkt_inst->options.pool_start.version == AF_IP6)
 		nexts[i] = OVPN_INPUT_NEXT_IP6_INPUT;
 	      else

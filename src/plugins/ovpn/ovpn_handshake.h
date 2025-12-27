@@ -830,6 +830,18 @@ ovpn_is_ping_packet (const u8 *data, u32 len)
   return clib_memcmp (data, ovpn_ping_string, OVPN_PING_STRING_SIZE) == 0;
 }
 
+/*
+ * Process control channel retransmission for an instance.
+ * Checks all pending connections and established peers for control
+ * packets that need retransmitting (timeout expired).
+ *
+ * Should be called periodically from the timer process.
+ * Returns total number of packets retransmitted.
+ */
+struct ovpn_instance_t_;
+int ovpn_control_channel_retransmit (vlib_main_t *vm,
+				     struct ovpn_instance_t_ *inst);
+
 #endif /* __included_ovpn_handshake_h__ */
 
 /*
