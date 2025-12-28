@@ -306,7 +306,7 @@ The VPP OpenVPN plugin achieves significantly higher throughput than userspace O
 
 - ✅ Static key mode (`--secret`)
 - ✅ TLS mode with X.509 certificates
-- ✅ `--tls-auth` (HMAC authentication)
+- ✅ `--tls-auth` (HMAC authentication with SHA256)
 - ✅ `--tls-crypt` (control channel encryption)
 - ✅ AES-128-GCM, AES-256-GCM ciphers
 - ✅ ChaCha20-Poly1305 cipher
@@ -321,6 +321,19 @@ The VPP OpenVPN plugin achieves significantly higher throughput than userspace O
 - ❌ TAP mode (Layer 2)
 - ❌ Client mode (server only)
 - ❌ Push/pull configuration
+
+### Client Configuration Requirements
+
+When using `--tls-auth` mode, clients **must** use SHA256 for HMAC authentication:
+
+```
+# Required client options for tls-auth mode
+tls-auth /path/to/ta.key 1
+auth SHA256
+cipher AES-256-GCM
+```
+
+OpenVPN's default auth digest is SHA1, which is incompatible with this plugin.
 
 ### Tested Clients
 
@@ -340,6 +353,18 @@ show interface <ovpn-interface>
 
 # Enable debug logging
 set ovpn debug on
+```
+
+**TLS-Auth handshake fails (HMAC mismatch):**
+
+The VPP OpenVPN plugin uses SHA256 for tls-auth HMAC, but OpenVPN clients default to SHA1.
+Add `auth SHA256` to your client configuration:
+
+```
+# Client config (.ovpn file)
+tls-auth /path/to/ta.key 1
+auth SHA256                    # Required - VPP uses SHA256
+cipher AES-256-GCM
 ```
 
 **No peer appearing:**

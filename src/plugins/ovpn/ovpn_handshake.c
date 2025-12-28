@@ -3030,14 +3030,109 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 		    if (!tls_ctx->key_method_received && km_len > 0)
 		      {
 			char *peer_opts = NULL;
-			int km_rv = ovpn_key_method_2_read (
+			char *username = NULL;
+			char *password = NULL;
+			int km_rv = ovpn_key_method_2_read_with_auth (
 			  km_data, km_len, tls_ctx->key_src2,
-			  1 /* is_server */, &peer_opts);
+			  1 /* is_server */, &peer_opts, &username, &password);
 			if (km_rv > 0)
 			  {
+			    int auth_ok = 1; /* Assume auth ok by default */
+
 			    clib_warning (
-			      "ovpn: Key Method 2 received, peer_opts: %s",
-			      peer_opts ? peer_opts : "(null)");
+			      "ovpn: Key Method 2 received, peer_opts: %s, "
+			      "user: %s",
+			      peer_opts ? peer_opts : "(null)",
+			      username ? username : "(none)");
+
+			    /*
+			     * Authenticate user if auth-user-pass is required
+			     */
+			    if (inst->options.auth_user_pass_required)
+			      {
+				auth_ok = 0;
+
+				if (username && password)
+				  {
+				    /* Verify against password file if
+				     * configured */
+				    if (inst->options.auth_user_pass_file)
+				      {
+					int auth_rv = ovpn_verify_user_pass (
+					  (const char *)
+					    inst->options.auth_user_pass_file,
+					  username, password);
+					if (auth_rv == 0)
+					  auth_ok = 1;
+				      }
+				    else
+				      {
+					/* No verification method configured -
+					 * accept all */
+					clib_warning (
+					  "ovpn: auth-user-pass required but "
+					  "no verify method configured, "
+					  "accepting");
+					auth_ok = 1;
+				      }
+				  }
+				else if (inst->options.auth_user_pass_optional)
+				  {
+				    /* Client didn't send credentials but
+				     * they're optional */
+				    clib_warning (
+				      "ovpn: no credentials from client, "
+				      "auth-user-pass-optional set");
+				    auth_ok = 1;
+				  }
+				else
+				  {
+				    /* Auth required but not provided */
+				    clib_warning (
+				      "ovpn: auth-user-pass required but "
+				      "client didn't provide credentials");
+				  }
+			      }
+
+			    if (!auth_ok)
+			      {
+				/* Authentication failed - reject */
+				clib_warning (
+				  "ovpn: authentication failed for peer %u",
+				  peer->peer_id);
+				if (username)
+				  clib_mem_free (username);
+				if (password)
+				  {
+				    ovpn_secure_zero_memory (password,
+							     strlen (password));
+				    clib_mem_free (password);
+				  }
+				if (peer_opts)
+				  clib_mem_free (peer_opts);
+				peer->state = OVPN_PEER_STATE_DEAD;
+				rv = -14; /* Authentication failed */
+				break;	  /* Exit while loop */
+			      }
+
+			    /* Store username for later use (e.g., CCD lookup)
+			     */
+			    if (username)
+			      {
+				/* Store in peer for later reference */
+				vec_free (peer->username);
+				peer->username = (u8 *) username;
+				username = NULL; /* Ownership transferred */
+			      }
+
+			    /* Clear sensitive password from memory */
+			    if (password)
+			      {
+				ovpn_secure_zero_memory (password,
+							 strlen (password));
+				clib_mem_free (password);
+			      }
+
 			    tls_ctx->key_method_received = 1;
 			    tls_ctx->peer_options = peer_opts;
 
@@ -3410,6 +3505,87 @@ ovpn_handshake_process_packet (vlib_main_t *vm, vlib_buffer_t *b,
 				peer->established_time = now;
 				peer->current_key_slot = OVPN_KEY_SLOT_PRIMARY;
 
+				/*
+				 * Load per-client config from client-config-dir
+				 * if configured. Use the Common Name (CN)
+				 * extracted from client certificate for lookup.
+				 */
+				if (inst->options.client_config_dir)
+				  {
+				    const char *client_id = NULL;
+				    char fallback_id[32];
+
+				    /*
+				     * Try to get CN from TLS certificate
+				     * (stored in ptls user data during
+				     * verification)
+				     */
+				    if (peer->tls_ctx && peer->tls_ctx->tls)
+				      {
+					void **data_ptr =
+					  ptls_get_data_ptr (peer->tls_ctx->tls);
+					if (data_ptr && *data_ptr)
+					  {
+					    client_id = (const char *) *data_ptr;
+					    /* Store CN in peer for later use */
+					    if (peer->tls_ctx->client_common_name)
+					      clib_mem_free (
+						peer->tls_ctx->client_common_name);
+					    peer->tls_ctx->client_common_name =
+					      clib_mem_alloc (
+						strlen (client_id) + 1);
+					    if (peer->tls_ctx->client_common_name)
+					      strcpy (
+						peer->tls_ctx->client_common_name,
+						client_id);
+					    clib_warning (
+					      "Using CN '%s' for CCD lookup",
+					      client_id);
+					  }
+				      }
+
+				    /* Fallback to peer_X if no CN available */
+				    if (!client_id)
+				      {
+					snprintf (fallback_id,
+						  sizeof (fallback_id),
+						  "peer_%u", peer->peer_id);
+					client_id = fallback_id;
+					clib_warning (
+					  "No CN available, using '%s' for CCD",
+					  client_id);
+				      }
+
+				    peer->client_push_opts =
+				      ovpn_peer_load_client_config (
+					(const char *)
+					  inst->options.client_config_dir,
+					client_id);
+
+				    /* Check if client is disabled */
+				    if (peer->client_push_opts &&
+					peer->client_push_opts->disable)
+				      {
+					clib_warning (
+					  "Client %s is disabled by CCD",
+					  client_id);
+					ovpn_peer_push_options_free (
+					  peer->client_push_opts);
+					peer->client_push_opts = NULL;
+					/* TODO: Reject connection */
+				      }
+
+				    /* Apply ifconfig-push if set */
+				    if (peer->client_push_opts &&
+					peer->client_push_opts->has_ifconfig_push)
+				      {
+					peer->virtual_ip =
+					  peer->client_push_opts
+					    ->ifconfig_push_ip;
+					peer->virtual_ip_set = 1;
+				      }
+				  }
+
 				/* Set up rekey timer from options */
 				if (inst->options.renegotiate_seconds > 0)
 				  {
@@ -3652,6 +3828,7 @@ ovpn_build_push_reply (ovpn_peer_t *peer, char *buf, u32 buf_len)
   ovpn_instance_t *inst = ovpn_instance_get_by_sw_if_index (peer->sw_if_index);
   int offset = 0;
   int written;
+  ovpn_peer_push_options_t *client_opts = peer->client_push_opts;
 
   if (!buf || buf_len < 64 || !inst)
     return -1;
@@ -3662,9 +3839,31 @@ ovpn_build_push_reply (ovpn_peer_t *peer, char *buf, u32 buf_len)
     return -1;
   offset += written;
 
-  /* Add ifconfig if virtual IP is assigned */
-  if (peer->virtual_ip_set && !ip_address_is_zero (&peer->virtual_ip))
+  /*
+   * Add ifconfig - prioritize in this order:
+   * 1. ifconfig-push from client-config-dir
+   * 2. Virtual IP assigned from pool
+   */
+  if (client_opts && client_opts->has_ifconfig_push)
     {
+      /* Use ifconfig-push from per-client config */
+      u8 ip_str[INET_ADDRSTRLEN];
+      u8 mask_str[INET_ADDRSTRLEN];
+
+      inet_ntop (AF_INET, &client_opts->ifconfig_push_ip.ip.ip4,
+		 (char *) ip_str, sizeof (ip_str));
+      inet_ntop (AF_INET, &client_opts->ifconfig_push_netmask.ip.ip4,
+		 (char *) mask_str, sizeof (mask_str));
+
+      written = snprintf (buf + offset, buf_len - offset, ",ifconfig %s %s",
+			  ip_str, mask_str);
+      if (written < 0 || (u32) written >= buf_len - offset)
+	return -2;
+      offset += written;
+    }
+  else if (peer->virtual_ip_set && !ip_address_is_zero (&peer->virtual_ip))
+    {
+      /* Use pool-assigned virtual IP */
       if (peer->virtual_ip.version == AF_IP4)
 	{
 	  u8 ip_str[INET_ADDRSTRLEN];
@@ -3719,6 +3918,11 @@ ovpn_build_push_reply (ovpn_peer_t *peer, char *buf, u32 buf_len)
 
   /*
    * Add configured push options from instance options
+   * Now uses per-client push options for filtering/overriding:
+   *   - push-reset: Skip all inherited global options
+   *   - push-remove: Filter out matching global options
+   *   - Per-client push options are appended
+   *
    * This includes:
    *   - DHCP options (DNS, WINS, DOMAIN, etc.)
    *   - Push routes
@@ -3726,11 +3930,12 @@ ovpn_build_push_reply (ovpn_peer_t *peer, char *buf, u32 buf_len)
    *   - Custom push options
    */
   if (inst->options.n_dhcp_options > 0 || inst->options.n_push_routes > 0 ||
-      inst->options.n_push_options > 0 || inst->options.redirect_gateway)
+      inst->options.n_push_options > 0 || inst->options.redirect_gateway ||
+      (client_opts && client_opts->n_push_options > 0))
     {
       char push_buf[2048];
-      int push_len = ovpn_options_build_push_reply (&inst->options, push_buf,
-						    sizeof (push_buf));
+      int push_len = ovpn_options_build_push_reply_for_peer (
+	&inst->options, client_opts, push_buf, sizeof (push_buf));
       if (push_len > 0)
 	{
 	  written = snprintf (buf + offset, buf_len - offset, ",%s", push_buf);

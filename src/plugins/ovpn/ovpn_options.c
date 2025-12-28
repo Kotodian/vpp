@@ -17,6 +17,7 @@
 
 #include <ovpn/ovpn_options.h>
 #include <ovpn/ovpn_crypto.h>
+#include <ovpn/ovpn_peer.h>
 #include <vnet/ip/ip.h>
 #include <arpa/inet.h>
 
@@ -976,6 +977,204 @@ ovpn_options_build_push_reply (const ovpn_options_t *opts, char *buf,
 			  offset > 0 ? "," : "", opts->push_options[i]);
       if (written > 0 && (u32) written < buf_len - offset)
 	offset += written;
+    }
+
+  if ((u32) offset < buf_len)
+    buf[offset] = '\0';
+
+  return offset;
+}
+
+/*
+ * Helper to check if an option string should be filtered by push-remove
+ */
+static int
+ovpn_option_should_remove (const ovpn_peer_push_options_t *client_opts,
+			   const char *option)
+{
+  if (!client_opts || client_opts->n_push_remove_patterns == 0)
+    return 0;
+
+  return ovpn_peer_push_options_should_remove (client_opts, option);
+}
+
+/*
+ * Build push options string with per-client overrides
+ */
+int
+ovpn_options_build_push_reply_for_peer (const ovpn_options_t *opts,
+					const ovpn_peer_push_options_t *client_opts,
+					char *buf, u32 buf_len)
+{
+  int offset = 0;
+  int written;
+  char option_buf[256];
+
+  if (!opts || !buf || buf_len < 16)
+    return -1;
+
+  /* If no client options or no push-reset, include global options */
+  if (!client_opts || !client_opts->push_reset)
+    {
+      /* Add DHCP options as push directives */
+      for (u32 i = 0; i < opts->n_dhcp_options; i++)
+	{
+	  const ovpn_dhcp_option_t *dhcp = &opts->dhcp_options[i];
+	  char ip_str[INET6_ADDRSTRLEN];
+
+	  switch (dhcp->type)
+	    {
+	    case OVPN_DHCP_OPTION_DNS:
+	      if (dhcp->ip.version == AF_IP4)
+		{
+		  inet_ntop (AF_INET, &dhcp->ip.ip.ip4, ip_str, sizeof (ip_str));
+		  snprintf (option_buf, sizeof (option_buf), "dhcp-option DNS %s",
+			    ip_str);
+		}
+	      else
+		{
+		  inet_ntop (AF_INET6, &dhcp->ip.ip.ip6, ip_str,
+			     sizeof (ip_str));
+		  snprintf (option_buf, sizeof (option_buf),
+			    "dhcp-option DNS6 %s", ip_str);
+		}
+
+	      /* Check push-remove filter */
+	      if (!ovpn_option_should_remove (client_opts, option_buf))
+		{
+		  written = snprintf (buf + offset, buf_len - offset, "%s%s",
+				      offset > 0 ? "," : "", option_buf);
+		  if (written > 0 && (u32) written < buf_len - offset)
+		    offset += written;
+		}
+	      break;
+
+	    case OVPN_DHCP_OPTION_WINS:
+	      inet_ntop (AF_INET, &dhcp->ip.ip.ip4, ip_str, sizeof (ip_str));
+	      snprintf (option_buf, sizeof (option_buf), "dhcp-option WINS %s",
+			ip_str);
+
+	      if (!ovpn_option_should_remove (client_opts, option_buf))
+		{
+		  written = snprintf (buf + offset, buf_len - offset, "%s%s",
+				      offset > 0 ? "," : "", option_buf);
+		  if (written > 0 && (u32) written < buf_len - offset)
+		    offset += written;
+		}
+	      break;
+
+	    case OVPN_DHCP_OPTION_DOMAIN:
+	      snprintf (option_buf, sizeof (option_buf), "dhcp-option DOMAIN %s",
+			dhcp->string);
+
+	      if (!ovpn_option_should_remove (client_opts, option_buf))
+		{
+		  written = snprintf (buf + offset, buf_len - offset, "%s%s",
+				      offset > 0 ? "," : "", option_buf);
+		  if (written > 0 && (u32) written < buf_len - offset)
+		    offset += written;
+		}
+	      break;
+
+	    case OVPN_DHCP_OPTION_DOMAIN_SEARCH:
+	      snprintf (option_buf, sizeof (option_buf),
+			"dhcp-option DOMAIN-SEARCH %s", dhcp->string);
+
+	      if (!ovpn_option_should_remove (client_opts, option_buf))
+		{
+		  written = snprintf (buf + offset, buf_len - offset, "%s%s",
+				      offset > 0 ? "," : "", option_buf);
+		  if (written > 0 && (u32) written < buf_len - offset)
+		    offset += written;
+		}
+	      break;
+
+	    default:
+	      break;
+	    }
+	}
+
+      /* Add routes (check push-remove filter) */
+      for (u32 i = 0; i < opts->n_push_routes; i++)
+	{
+	  const fib_prefix_t *route = &opts->push_routes[i];
+	  char ip_str[INET6_ADDRSTRLEN];
+	  char mask_str[INET_ADDRSTRLEN];
+
+	  if (route->fp_proto == FIB_PROTOCOL_IP4)
+	    {
+	      ip4_address_t netmask;
+	      ip4_preflen_to_mask (route->fp_len, &netmask);
+
+	      inet_ntop (AF_INET, &route->fp_addr.ip4, ip_str, sizeof (ip_str));
+	      inet_ntop (AF_INET, &netmask, mask_str, sizeof (mask_str));
+
+	      snprintf (option_buf, sizeof (option_buf), "route %s %s", ip_str,
+			mask_str);
+	    }
+	  else
+	    {
+	      inet_ntop (AF_INET6, &route->fp_addr.ip6, ip_str, sizeof (ip_str));
+	      snprintf (option_buf, sizeof (option_buf), "route-ipv6 %s/%u",
+			ip_str, route->fp_len);
+	    }
+
+	  if (!ovpn_option_should_remove (client_opts, option_buf))
+	    {
+	      written = snprintf (buf + offset, buf_len - offset, "%s%s",
+				  offset > 0 ? "," : "", option_buf);
+	      if (written > 0 && (u32) written < buf_len - offset)
+		offset += written;
+	    }
+	}
+
+      /* Add redirect-gateway if set (check push-remove filter) */
+      if (opts->redirect_gateway)
+	{
+	  snprintf (option_buf, sizeof (option_buf), "redirect-gateway");
+
+	  if (!ovpn_option_should_remove (client_opts, option_buf))
+	    {
+	      written = snprintf (buf + offset, buf_len - offset,
+				  "%sredirect-gateway", offset > 0 ? "," : "");
+	      if (written > 0 && (u32) written < buf_len - offset)
+		offset += written;
+
+	      /* Add flags */
+	      if (opts->redirect_gateway_flags & 0x01) /* def1 */
+		{
+		  written = snprintf (buf + offset, buf_len - offset, " def1");
+		  if (written > 0 && (u32) written < buf_len - offset)
+		    offset += written;
+		}
+	    }
+	}
+
+      /* Add custom push options (check push-remove filter) */
+      for (u32 i = 0; i < opts->n_push_options; i++)
+	{
+	  const char *opt = (const char *) opts->push_options[i];
+	  if (!ovpn_option_should_remove (client_opts, opt))
+	    {
+	      written = snprintf (buf + offset, buf_len - offset, "%s%s",
+				  offset > 0 ? "," : "", opt);
+	      if (written > 0 && (u32) written < buf_len - offset)
+		offset += written;
+	    }
+	}
+    }
+
+  /* Add per-client push options */
+  if (client_opts)
+    {
+      for (u32 i = 0; i < client_opts->n_push_options; i++)
+	{
+	  const char *opt = (const char *) client_opts->push_options[i];
+	  written = snprintf (buf + offset, buf_len - offset, "%s%s",
+			      offset > 0 ? "," : "", opt);
+	  if (written > 0 && (u32) written < buf_len - offset)
+	    offset += written;
+	}
     }
 
   if ((u32) offset < buf_len)

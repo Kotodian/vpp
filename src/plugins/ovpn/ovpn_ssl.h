@@ -221,6 +221,40 @@ int ovpn_key_method_2_read (const u8 *buf, u32 buf_len, ovpn_key_source2_t *ks2,
 			    int is_server, char **options_out);
 
 /**
+ * Read Key Method 2 data including username/password
+ *
+ * Extended version that also extracts username and password fields
+ * for authentication. The username/password are only present when
+ * the client is configured with --auth-user-pass.
+ *
+ * @param buf Input buffer
+ * @param buf_len Buffer length
+ * @param ks2 Key source structure to populate
+ * @param is_server 1 if we are server (reading client data), 0 if client
+ * @param options_out Output pointer for parsed options string (caller frees)
+ * @param username_out Output pointer for username (caller frees, may be NULL)
+ * @param password_out Output pointer for password (caller frees, may be NULL)
+ * @return Number of bytes consumed, or <0 on error
+ */
+int ovpn_key_method_2_read_with_auth (const u8 *buf, u32 buf_len,
+				      ovpn_key_source2_t *ks2, int is_server,
+				      char **options_out, char **username_out,
+				      char **password_out);
+
+/**
+ * Verify username/password against password file
+ *
+ * Password file format: one "username:password" per line
+ *
+ * @param password_file Path to password file
+ * @param username Username to verify
+ * @param password Password to verify
+ * @return 0 if credentials valid, <0 on error or invalid credentials
+ */
+int ovpn_verify_user_pass (const char *password_file, const char *username,
+			   const char *password);
+
+/**
  * Derive data channel keys from TLS session using Key Method 2
  *
  * This is the main entry point for key derivation. It supports two methods:

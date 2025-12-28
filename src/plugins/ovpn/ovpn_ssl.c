@@ -523,6 +523,203 @@ ovpn_key_method_2_read (const u8 *buf, u32 buf_len, ovpn_key_source2_t *ks2,
 }
 
 /*
+ * Read Key Method 2 data with username/password
+ */
+int
+ovpn_key_method_2_read_with_auth (const u8 *buf, u32 buf_len,
+				  ovpn_key_source2_t *ks2, int is_server,
+				  char **options_out, char **username_out,
+				  char **password_out)
+{
+  u32 offset = 0;
+  ovpn_key_source_t *remote_ks;
+
+  if (username_out)
+    *username_out = NULL;
+  if (password_out)
+    *password_out = NULL;
+
+  if (!buf || !ks2)
+    return -1;
+
+  if (options_out)
+    *options_out = NULL;
+
+  /* Select remote key source based on role */
+  remote_ks = is_server ? &ks2->client : &ks2->server;
+
+  /* Check minimum size */
+  u32 min_size = 4 + 1 + OVPN_RANDOM_SIZE * 2;
+  if (is_server)
+    min_size += OVPN_PRE_MASTER_SIZE;
+  if (buf_len < min_size)
+    return -2;
+
+  /* Skip 4-byte zero */
+  offset += 4;
+
+  /* Read and verify key method */
+  if (buf[offset++] != OVPN_KEY_METHOD_2)
+    return -3;
+
+  /* Client sends pre_master, server does not */
+  if (is_server)
+    {
+      clib_memcpy_fast (remote_ks->pre_master, buf + offset,
+			OVPN_PRE_MASTER_SIZE);
+      offset += OVPN_PRE_MASTER_SIZE;
+    }
+
+  /* Read random1 */
+  clib_memcpy_fast (remote_ks->random1, buf + offset, OVPN_RANDOM_SIZE);
+  offset += OVPN_RANDOM_SIZE;
+
+  /* Read random2 */
+  clib_memcpy_fast (remote_ks->random2, buf + offset, OVPN_RANDOM_SIZE);
+  offset += OVPN_RANDOM_SIZE;
+
+  /* Parse options string */
+  if (offset + 2 <= buf_len)
+    {
+      u16 opt_len = clib_net_to_host_u16 (*(u16 *) (buf + offset));
+      offset += 2;
+
+      if (opt_len > 0 && offset + opt_len <= buf_len)
+	{
+	  if (options_out)
+	    {
+	      char *opts = clib_mem_alloc (opt_len + 1);
+	      if (opts)
+		{
+		  clib_memcpy_fast (opts, buf + offset, opt_len);
+		  opts[opt_len] = '\0';
+		  *options_out = opts;
+		}
+	    }
+	  offset += opt_len;
+	}
+    }
+
+  /* Parse username (only if client sends it via auth-user-pass) */
+  if (offset + 2 <= buf_len)
+    {
+      u16 user_len = clib_net_to_host_u16 (*(u16 *) (buf + offset));
+      offset += 2;
+
+      if (user_len > 0 && offset + user_len <= buf_len)
+	{
+	  if (username_out)
+	    {
+	      char *user = clib_mem_alloc (user_len + 1);
+	      if (user)
+		{
+		  clib_memcpy_fast (user, buf + offset, user_len);
+		  user[user_len] = '\0';
+		  *username_out = user;
+		}
+	    }
+	  offset += user_len;
+	}
+    }
+
+  /* Parse password */
+  if (offset + 2 <= buf_len)
+    {
+      u16 pass_len = clib_net_to_host_u16 (*(u16 *) (buf + offset));
+      offset += 2;
+
+      if (pass_len > 0 && offset + pass_len <= buf_len)
+	{
+	  if (password_out)
+	    {
+	      char *pass = clib_mem_alloc (pass_len + 1);
+	      if (pass)
+		{
+		  clib_memcpy_fast (pass, buf + offset, pass_len);
+		  pass[pass_len] = '\0';
+		  *password_out = pass;
+		}
+	    }
+	  offset += pass_len;
+	}
+    }
+
+  return offset;
+}
+
+/*
+ * Verify username/password against password file
+ * File format: username:password (one per line)
+ */
+int
+ovpn_verify_user_pass (const char *password_file, const char *username,
+		       const char *password)
+{
+  FILE *f;
+  char line[512];
+  int found = 0;
+
+  if (!password_file || !username || !password)
+    return -1;
+
+  f = fopen (password_file, "r");
+  if (!f)
+    {
+      clib_warning ("ovpn: cannot open password file '%s'", password_file);
+      return -2;
+    }
+
+  while (fgets (line, sizeof (line), f))
+    {
+      char *p = line;
+      char *file_user, *file_pass;
+
+      /* Skip leading whitespace */
+      while (*p == ' ' || *p == '\t')
+	p++;
+
+      /* Skip comments and empty lines */
+      if (*p == '#' || *p == '\0' || *p == '\n')
+	continue;
+
+      /* Parse username:password */
+      file_user = p;
+      file_pass = strchr (p, ':');
+      if (!file_pass)
+	continue;
+
+      *file_pass++ = '\0';
+
+      /* Remove trailing newline from password */
+      char *end = file_pass;
+      while (*end && *end != '\n' && *end != '\r')
+	end++;
+      *end = '\0';
+
+      /* Compare */
+      if (strcmp (file_user, username) == 0 &&
+	  strcmp (file_pass, password) == 0)
+	{
+	  found = 1;
+	  break;
+	}
+    }
+
+  fclose (f);
+
+  if (found)
+    {
+      clib_warning ("ovpn: user '%s' authenticated successfully", username);
+      return 0;
+    }
+  else
+    {
+      clib_warning ("ovpn: authentication failed for user '%s'", username);
+      return -3;
+    }
+}
+
+/*
  * Derive data channel keys using Key Method 2 (v2 interface)
  *
  * Supports both:

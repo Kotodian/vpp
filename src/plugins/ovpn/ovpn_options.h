@@ -156,6 +156,13 @@ typedef struct ovpn_options_t_
   u8 client_to_client; /* Allow clients to reach each other */
 
   /*
+   * Client config directory (--client-config-dir)
+   * Directory containing per-client configuration files.
+   * Files are named after the client's Common Name (CN).
+   */
+  u8 *client_config_dir;
+
+  /*
    * Management interface (--management)
    * Enables external control via UDP using VPP session layer
    */
@@ -185,6 +192,15 @@ typedef struct ovpn_options_t_
    * Default: 0 (disabled), typical value: 1450
    */
   u16 mssfix;
+
+  /*
+   * Username/Password Authentication (--auth-user-pass-verify)
+   * Enables client authentication via username and password
+   */
+  u8 auth_user_pass_required;	   /* 1 if username/password auth is required */
+  u8 *auth_user_pass_verify_script; /* External script for verification */
+  u8 *auth_user_pass_file;	   /* Static file with username:password pairs */
+  u8 auth_user_pass_optional;	   /* Allow clients without credentials */
 
 } ovpn_options_t;
 
@@ -361,6 +377,27 @@ int ovpn_options_add_push_route (ovpn_options_t *opts,
  */
 int ovpn_options_build_push_reply (const ovpn_options_t *opts, char *buf,
 				   u32 buf_len);
+
+/* Forward declaration for per-client push options */
+struct ovpn_peer_push_options_t_;
+
+/**
+ * Build push options string with per-client overrides
+ *
+ * This function builds the push options considering:
+ * - push-reset: If set, skip all global push options
+ * - push-remove: Filter out matching global options
+ * - Per-client push options are appended
+ *
+ * @param opts Global options structure
+ * @param client_opts Per-client push options (can be NULL)
+ * @param buf Output buffer
+ * @param buf_len Buffer length
+ * @return Length written, or <0 on error
+ */
+int ovpn_options_build_push_reply_for_peer (
+  const ovpn_options_t *opts, const struct ovpn_peer_push_options_t_ *client_opts,
+  char *buf, u32 buf_len);
 
 /**
  * Free all dynamically allocated options (push, dhcp, ciphers, routes)

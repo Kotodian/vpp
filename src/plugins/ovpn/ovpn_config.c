@@ -638,6 +638,36 @@ parse_option (u8 *line_start, u8 *line_end, const char *base_dir,
     {
       config->options.client_to_client = 1;
     }
+  /* Username/Password authentication (auth-user-pass-verify script via-file)
+   * OpenVPN supports: auth-user-pass-verify <script> via-env|via-file
+   * We only support via-file method for simplicity */
+  else if (unformat (&input, "auth-user-pass-verify %s via-file", &str_val))
+    {
+      vec_free (config->options.auth_user_pass_verify_script);
+      config->options.auth_user_pass_verify_script = str_val;
+      config->options.auth_user_pass_required = 1;
+      str_val = NULL;
+    }
+  else if (unformat (&input, "auth-user-pass-verify %s", &str_val))
+    {
+      /* Default to via-file if not specified */
+      vec_free (config->options.auth_user_pass_verify_script);
+      config->options.auth_user_pass_verify_script = str_val;
+      config->options.auth_user_pass_required = 1;
+      str_val = NULL;
+    }
+  else if (unformat (&input, "auth-user-pass-file %s", &str_val))
+    {
+      /* VPP-specific: static password file (username:password per line) */
+      vec_free (config->options.auth_user_pass_file);
+      config->options.auth_user_pass_file = str_val;
+      config->options.auth_user_pass_required = 1;
+      str_val = NULL;
+    }
+  else if (unformat (&input, "auth-user-pass-optional"))
+    {
+      config->options.auth_user_pass_optional = 1;
+    }
   else if (unformat (&input, "client-config-dir %s", &str_val))
     {
       vec_free (str_val);
@@ -652,6 +682,13 @@ parse_option (u8 *line_start, u8 *line_end, const char *base_dir,
   else if (unformat (&input, "explicit-exit-notify"))
     {
     }
+  /* Check data-ciphers-fallback BEFORE data-ciphers to avoid prefix matching */
+  else if (unformat (&input, "data-ciphers-fallback %s", &str_val))
+    {
+      vec_free (config->options.data_ciphers_fallback);
+      config->options.data_ciphers_fallback = str_val;
+      str_val = NULL;
+    }
   else if (unformat (&input, "data-ciphers %s", &str_val))
     {
       /* Parse data-ciphers list (colon or comma separated) */
@@ -664,12 +701,6 @@ parse_option (u8 *line_start, u8 *line_end, const char *base_dir,
 	    (u8 *) format (0, "%s%c", config->options.data_ciphers[0], 0);
 	}
       vec_free (str_val);
-    }
-  else if (unformat (&input, "data-ciphers-fallback %s", &str_val))
-    {
-      vec_free (config->options.data_ciphers_fallback);
-      config->options.data_ciphers_fallback = str_val;
-      str_val = NULL;
     }
   else if (unformat (&input, "ncp-ciphers %s", &str_val))
     {
@@ -1278,7 +1309,15 @@ ovpn_parse_inline_instance (vlib_main_t *vm, const char *instance_name,
 	{
 	  config.options.redirect_gateway = 1;
 	}
-      /* Data ciphers */
+      /* Data ciphers - check data-ciphers-fallback BEFORE data-ciphers
+       * to avoid prefix matching issue where "data-ciphers" matches
+       * the beginning of "data-ciphers-fallback" */
+      else if (unformat (input, "data-ciphers-fallback %s", &str_val))
+	{
+	  vec_free (config.options.data_ciphers_fallback);
+	  config.options.data_ciphers_fallback = str_val;
+	  str_val = NULL;
+	}
       else if (unformat (input, "data-ciphers %s", &str_val))
 	{
 	  ovpn_options_set_data_ciphers (&config.options, (char *) str_val);
@@ -1288,12 +1327,6 @@ ovpn_parse_inline_instance (vlib_main_t *vm, const char *instance_name,
 		(u8 *) format (0, "%s%c", config.options.data_ciphers[0], 0);
 	    }
 	  vec_free (str_val);
-	}
-      else if (unformat (input, "data-ciphers-fallback %s", &str_val))
-	{
-	  vec_free (config.options.data_ciphers_fallback);
-	  config.options.data_ciphers_fallback = str_val;
-	  str_val = NULL;
 	}
       /* Client-to-client */
       else if (unformat (input, "client-to-client"))
@@ -1307,6 +1340,25 @@ ovpn_parse_inline_instance (vlib_main_t *vm, const char *instance_name,
 	  ip_address_set (&config.options.management_ip, &ip4_addr, AF_IP4);
 	  config.options.management_port = (u16) u32_val;
 	  config.options.management_enabled = 1;
+	}
+      /* Username/Password authentication */
+      else if (unformat (input, "auth-user-pass-verify %s", &str_val))
+	{
+	  vec_free (config.options.auth_user_pass_verify_script);
+	  config.options.auth_user_pass_verify_script = str_val;
+	  config.options.auth_user_pass_required = 1;
+	  str_val = NULL;
+	}
+      else if (unformat (input, "auth-user-pass-file %s", &str_val))
+	{
+	  vec_free (config.options.auth_user_pass_file);
+	  config.options.auth_user_pass_file = str_val;
+	  config.options.auth_user_pass_required = 1;
+	  str_val = NULL;
+	}
+      else if (unformat (input, "auth-user-pass-optional"))
+	{
+	  config.options.auth_user_pass_optional = 1;
 	}
       else
 	{

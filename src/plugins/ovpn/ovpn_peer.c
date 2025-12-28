@@ -27,7 +27,10 @@
 #include <vnet/ip/ip6_packet.h>
 #include <vnet/adj/adj_midchain.h>
 #include <vnet/fib/fib_table.h>
+#include <vnet/ip/ip_format_fns.h>
 #include <picotls/openssl.h>
+#include <stdio.h>
+#include <arpa/inet.h>
 
 /* Global mapping from adjacency index to peer index */
 u32 *ovpn_peer_by_adj_index;
@@ -212,6 +215,16 @@ ovpn_peer_delete (ovpn_peer_db_t *db, u32 peer_id)
 
   /* Free rewrite */
   vec_free (peer->rewrite);
+
+  /* Free per-client push options */
+  if (peer->client_push_opts)
+    {
+      ovpn_peer_push_options_free (peer->client_push_opts);
+      peer->client_push_opts = NULL;
+    }
+
+  /* Free username if stored */
+  vec_free (peer->username);
 
   /* Release adjacency */
   if (peer->adj_index != ADJ_INDEX_INVALID)
@@ -1385,6 +1398,376 @@ ovpn_peer_send_ping (vlib_main_t *vm, ovpn_peer_t *peer)
   peer->tx_packets++;
   peer->tx_bytes += total_len;
   peer->last_tx_time = vlib_time_now (vm);
+}
+
+/*
+ * Per-client push options implementation
+ */
+
+ovpn_peer_push_options_t *
+ovpn_peer_push_options_alloc (const char *common_name)
+{
+  ovpn_peer_push_options_t *opts;
+
+  opts = clib_mem_alloc_aligned (sizeof (*opts), CLIB_CACHE_LINE_BYTES);
+  if (!opts)
+    return NULL;
+
+  clib_memset (opts, 0, sizeof (*opts));
+
+  if (common_name)
+    opts->common_name = (u8 *) vec_dup ((u8 *) common_name);
+
+  return opts;
+}
+
+void
+ovpn_peer_push_options_free (ovpn_peer_push_options_t *opts)
+{
+  if (!opts)
+    return;
+
+  /* Free push-remove patterns */
+  for (u32 i = 0; i < opts->n_push_remove_patterns; i++)
+    vec_free (opts->push_remove_patterns[i]);
+  vec_free (opts->push_remove_patterns);
+
+  /* Free push options */
+  for (u32 i = 0; i < opts->n_push_options; i++)
+    vec_free (opts->push_options[i]);
+  vec_free (opts->push_options);
+
+  /* Free iroutes */
+  vec_free (opts->iroutes);
+
+  /* Free common name */
+  vec_free (opts->common_name);
+
+  clib_mem_free (opts);
+}
+
+int
+ovpn_peer_push_options_add_remove (ovpn_peer_push_options_t *opts,
+				   const char *pattern)
+{
+  if (!opts || !pattern)
+    return -1;
+
+  u8 *pattern_copy = (u8 *) vec_dup ((u8 *) pattern);
+  vec_add1 (opts->push_remove_patterns, pattern_copy);
+  opts->n_push_remove_patterns++;
+
+  return 0;
+}
+
+int
+ovpn_peer_push_options_add_push (ovpn_peer_push_options_t *opts,
+				 const char *option)
+{
+  if (!opts || !option)
+    return -1;
+
+  u8 *option_copy = (u8 *) vec_dup ((u8 *) option);
+  vec_add1 (opts->push_options, option_copy);
+  opts->n_push_options++;
+
+  return 0;
+}
+
+int
+ovpn_peer_push_options_add_iroute (ovpn_peer_push_options_t *opts,
+				   const fib_prefix_t *prefix)
+{
+  if (!opts || !prefix)
+    return -1;
+
+  vec_add1 (opts->iroutes, *prefix);
+  opts->n_iroutes++;
+
+  return 0;
+}
+
+int
+ovpn_peer_push_options_should_remove (const ovpn_peer_push_options_t *opts,
+				      const char *option)
+{
+  if (!opts || !option || opts->n_push_remove_patterns == 0)
+    return 0;
+
+  for (u32 i = 0; i < opts->n_push_remove_patterns; i++)
+    {
+      const char *pattern = (const char *) opts->push_remove_patterns[i];
+      size_t pattern_len = strlen (pattern);
+
+      /* Match if option starts with pattern */
+      if (strncmp (option, pattern, pattern_len) == 0)
+	{
+	  /* Pattern must match at word boundary */
+	  if (option[pattern_len] == '\0' || option[pattern_len] == ' ')
+	    return 1;
+	}
+    }
+
+  return 0;
+}
+
+/* Forward declaration for recursive config file parsing */
+static int ovpn_peer_parse_config_file (ovpn_peer_push_options_t *opts,
+					const char *path, int depth);
+
+/* Maximum config file include depth to prevent infinite recursion */
+#define OVPN_CCD_MAX_INCLUDE_DEPTH 10
+
+/*
+ * Parse a single line from client config file
+ * depth: current include depth (0 = top-level file)
+ */
+static int
+ovpn_peer_parse_client_config_line_depth (ovpn_peer_push_options_t *opts,
+					  const char *line, int depth)
+{
+  char *p = (char *) line;
+
+  /* Skip leading whitespace */
+  while (*p && (*p == ' ' || *p == '\t'))
+    p++;
+
+  /* Skip empty lines and comments */
+  if (*p == '\0' || *p == '#' || *p == ';')
+    return 0;
+
+  /* config <path> - include another config file */
+  if (strncmp (p, "config", 6) == 0 && (p[6] == ' ' || p[6] == '\t'))
+    {
+      p += 6;
+      while (*p == ' ' || *p == '\t')
+	p++;
+
+      /* Remove trailing whitespace/newline */
+      char *end = p;
+      while (*end && *end != '\n' && *end != '\r' && *end != ' ' && *end != '\t')
+	end++;
+      *end = '\0';
+
+      if (*p)
+	{
+	  if (depth >= OVPN_CCD_MAX_INCLUDE_DEPTH)
+	    {
+	      clib_warning ("ovpn: config include depth exceeded at '%s'", p);
+	      return -1;
+	    }
+	  return ovpn_peer_parse_config_file (opts, p, depth + 1);
+	}
+      return 0;
+    }
+
+  /* push-reset */
+  if (strncmp (p, "push-reset", 10) == 0 &&
+      (p[10] == '\0' || p[10] == ' ' || p[10] == '\t' || p[10] == '\n'))
+    {
+      opts->push_reset = 1;
+      return 0;
+    }
+
+  /* push-remove <pattern> */
+  if (strncmp (p, "push-remove", 11) == 0 && (p[11] == ' ' || p[11] == '\t'))
+    {
+      p += 11;
+      while (*p == ' ' || *p == '\t')
+	p++;
+
+      /* Remove trailing newline */
+      char *end = p;
+      while (*end && *end != '\n' && *end != '\r')
+	end++;
+      *end = '\0';
+
+      if (*p)
+	ovpn_peer_push_options_add_remove (opts, p);
+      return 0;
+    }
+
+  /* push "<option>" */
+  if (strncmp (p, "push", 4) == 0 && (p[4] == ' ' || p[4] == '\t'))
+    {
+      p += 4;
+      while (*p == ' ' || *p == '\t')
+	p++;
+
+      /* Expect quoted string */
+      if (*p == '"')
+	{
+	  p++;
+	  char *end = strchr (p, '"');
+	  if (end)
+	    {
+	      *end = '\0';
+	      ovpn_peer_push_options_add_push (opts, p);
+	    }
+	}
+      return 0;
+    }
+
+  /* ifconfig-push <ip> <netmask> */
+  if (strncmp (p, "ifconfig-push", 13) == 0 &&
+      (p[13] == ' ' || p[13] == '\t'))
+    {
+      p += 13;
+      while (*p == ' ' || *p == '\t')
+	p++;
+
+      char ip_str[64], mask_str[64];
+      if (sscanf (p, "%63s %63s", ip_str, mask_str) == 2)
+	{
+	  ip4_address_t ip4, mask4;
+	  if (inet_pton (AF_INET, ip_str, &ip4) == 1 &&
+	      inet_pton (AF_INET, mask_str, &mask4) == 1)
+	    {
+	      opts->ifconfig_push_ip.version = AF_IP4;
+	      opts->ifconfig_push_ip.ip.ip4 = ip4;
+	      opts->ifconfig_push_netmask.version = AF_IP4;
+	      opts->ifconfig_push_netmask.ip.ip4 = mask4;
+	      opts->has_ifconfig_push = 1;
+	    }
+	}
+      return 0;
+    }
+
+  /* iroute <network> <netmask> */
+  if (strncmp (p, "iroute", 6) == 0 && (p[6] == ' ' || p[6] == '\t'))
+    {
+      p += 6;
+      while (*p == ' ' || *p == '\t')
+	p++;
+
+      char net_str[64], mask_str[64];
+      if (sscanf (p, "%63s %63s", net_str, mask_str) == 2)
+	{
+	  ip4_address_t net4, mask4;
+	  if (inet_pton (AF_INET, net_str, &net4) == 1 &&
+	      inet_pton (AF_INET, mask_str, &mask4) == 1)
+	    {
+	      fib_prefix_t prefix;
+	      clib_memset (&prefix, 0, sizeof (prefix));
+	      prefix.fp_proto = FIB_PROTOCOL_IP4;
+	      prefix.fp_addr.ip4 = net4;
+	      /* Count bits set in netmask to get prefix length */
+	      prefix.fp_len = __builtin_popcount (mask4.as_u32);
+	      ovpn_peer_push_options_add_iroute (opts, &prefix);
+	    }
+	}
+      return 0;
+    }
+
+  /* disable */
+  if (strncmp (p, "disable", 7) == 0 &&
+      (p[7] == '\0' || p[7] == ' ' || p[7] == '\t' || p[7] == '\n'))
+    {
+      opts->disable = 1;
+      return 0;
+    }
+
+  return 0;
+}
+
+/*
+ * Wrapper for top-level parsing (depth = 0)
+ */
+static int
+ovpn_peer_parse_client_config_line (ovpn_peer_push_options_t *opts,
+				    const char *line)
+{
+  return ovpn_peer_parse_client_config_line_depth (opts, line, 0);
+}
+
+/*
+ * Parse an included config file with depth tracking
+ */
+static int
+ovpn_peer_parse_config_file (ovpn_peer_push_options_t *opts, const char *path,
+			     int depth)
+{
+  FILE *f;
+  char line[1024];
+
+  f = fopen (path, "r");
+  if (!f)
+    {
+      clib_warning ("ovpn: failed to open config file '%s'", path);
+      return -1;
+    }
+
+  clib_warning ("ovpn: including config file '%s' (depth %d)", path, depth);
+
+  while (fgets (line, sizeof (line), f))
+    {
+      if (ovpn_peer_parse_client_config_line_depth (opts, line, depth) < 0)
+	{
+	  fclose (f);
+	  return -1;
+	}
+    }
+
+  fclose (f);
+  return 0;
+}
+
+ovpn_peer_push_options_t *
+ovpn_peer_load_client_config (const char *config_dir, const char *common_name)
+{
+  FILE *f = NULL;
+  u8 *path = NULL;
+  int using_default = 0;
+
+  if (!config_dir || !common_name)
+    return NULL;
+
+  /* Build path: config_dir/common_name */
+  path = format (0, "%s/%s%c", config_dir, common_name, 0);
+
+  /* Try to open the file named after Common Name */
+  f = fopen ((char *) path, "r");
+  if (!f)
+    {
+      vec_free (path);
+
+      /*
+       * Per OpenVPN documentation:
+       * "If no matching file is found, OpenVPN will instead try to open
+       * and parse a default file called 'DEFAULT'"
+       */
+      path = format (0, "%s/DEFAULT%c", config_dir, 0);
+      f = fopen ((char *) path, "r");
+      if (!f)
+	{
+	  vec_free (path);
+	  return NULL;
+	}
+      using_default = 1;
+    }
+
+  ovpn_peer_push_options_t *opts = ovpn_peer_push_options_alloc (common_name);
+  if (!opts)
+    {
+      fclose (f);
+      vec_free (path);
+      return NULL;
+    }
+
+  clib_warning ("Loaded client config from %s for CN='%s'",
+		using_default ? "DEFAULT" : (char *) path, common_name);
+
+  /* Parse file line by line */
+  char line[1024];
+  while (fgets (line, sizeof (line), f))
+    {
+      ovpn_peer_parse_client_config_line (opts, line);
+    }
+
+  fclose (f);
+  vec_free (path);
+
+  return opts;
 }
 
 /*

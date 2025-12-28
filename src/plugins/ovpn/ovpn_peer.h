@@ -45,6 +45,73 @@
  * - Worker barrier for peer add/delete operations
  */
 
+/*
+ * Per-client push options (from client-config-dir)
+ *
+ * These override or extend the global push options for a specific client.
+ * Loaded from a file named after the client's Common Name (CN).
+ *
+ * Supported directives:
+ *   push-reset        - Clear all inherited push options
+ *   push-remove <opt> - Remove options matching pattern
+ *   push "<option>"   - Add client-specific push option
+ *   ifconfig-push <ip> <netmask> - Assign specific virtual IP
+ *   iroute <network> <netmask>   - Internal route for this client
+ */
+typedef struct ovpn_peer_push_options_t_
+{
+  /*
+   * push-reset flag
+   * If set, do not inherit any push options from global config.
+   * Only per-client push options will be sent.
+   */
+  u8 push_reset;
+
+  /*
+   * push-remove patterns
+   * Array of option prefixes to remove from inherited options.
+   * E.g., "route" removes all "route ..." options.
+   */
+  u8 **push_remove_patterns; /* vec of pattern strings */
+  u32 n_push_remove_patterns;
+
+  /*
+   * Per-client push options
+   * Additional options to push to this specific client.
+   */
+  u8 **push_options; /* vec of option strings */
+  u32 n_push_options;
+
+  /*
+   * Fixed virtual IP from ifconfig-push
+   * If set, overrides pool allocation.
+   */
+  ip_address_t ifconfig_push_ip;
+  ip_address_t ifconfig_push_netmask;
+  u8 has_ifconfig_push;
+
+  /*
+   * Internal routes (iroute)
+   * Networks behind this client that should be routed through it.
+   * These create routes in the server's routing table.
+   */
+  fib_prefix_t *iroutes;
+  u32 n_iroutes;
+
+  /*
+   * Client's Common Name (from certificate)
+   * Used for client-config-dir lookup.
+   */
+  u8 *common_name;
+
+  /*
+   * Disable flag (from client-config-dir)
+   * If set, reject this client's connection.
+   */
+  u8 disable;
+
+} ovpn_peer_push_options_t;
+
 /* Peer state */
 typedef enum
 {
@@ -142,6 +209,13 @@ typedef struct ovpn_peer_tls_t_
   /* Client's options string (parsed from Key Method 2 data) */
   char *peer_options;
 
+  /*
+   * Client's Common Name extracted from X.509 certificate
+   * Used for client-config-dir file lookup.
+   * Populated during certificate verification callback.
+   */
+  char *client_common_name;
+
 } ovpn_peer_tls_t;
 
 /*
@@ -186,6 +260,18 @@ typedef struct ovpn_peer_t_
   /* Virtual IP assigned to this peer (for server mode) */
   ip_address_t virtual_ip;
   u8 virtual_ip_set;
+
+  /*
+   * Per-client push options (from client-config-dir)
+   * NULL if no client-specific config exists.
+   * Allocated when client connects and CN is looked up.
+   */
+  ovpn_peer_push_options_t *client_push_opts;
+
+  /*
+   * Client authentication info
+   */
+  u8 *username; /* Username from auth-user-pass (NULL if not authenticated) */
 
   /* Timers */
   f64 last_rx_time;
@@ -725,6 +811,86 @@ ovpn_peer_remote_hash_make_key (clib_bihash_kv_24_8_t *kv,
  * Used for keepalive - sends encrypted ping magic pattern on data channel
  */
 void ovpn_peer_send_ping (vlib_main_t *vm, ovpn_peer_t *peer);
+
+/*
+ * Per-client push options management
+ */
+
+/**
+ * Allocate and initialize per-client push options structure
+ *
+ * @param common_name Client's Common Name from certificate (copied)
+ * @return Allocated structure, or NULL on error
+ */
+ovpn_peer_push_options_t *ovpn_peer_push_options_alloc (const char *common_name);
+
+/**
+ * Free per-client push options structure
+ *
+ * @param opts Structure to free (can be NULL)
+ */
+void ovpn_peer_push_options_free (ovpn_peer_push_options_t *opts);
+
+/**
+ * Load per-client config from client-config-dir
+ *
+ * Looks up a file named after the client's Common Name in the
+ * client-config-dir directory and parses it for push options.
+ *
+ * Supported directives:
+ *   push-reset               - Clear inherited push options
+ *   push-remove <pattern>    - Remove matching inherited options
+ *   push "<option>"          - Add client-specific option
+ *   ifconfig-push <ip> <mask> - Assign specific virtual IP
+ *   iroute <net> <mask>      - Add internal route
+ *   disable                  - Reject this client
+ *
+ * @param config_dir Path to client-config-dir
+ * @param common_name Client's Common Name
+ * @return Allocated and populated structure, or NULL if no config found
+ */
+ovpn_peer_push_options_t *
+ovpn_peer_load_client_config (const char *config_dir, const char *common_name);
+
+/**
+ * Add a push-remove pattern to per-client options
+ *
+ * @param opts Per-client options structure
+ * @param pattern Pattern to remove (e.g., "route", "dhcp-option")
+ * @return 0 on success, <0 on error
+ */
+int ovpn_peer_push_options_add_remove (ovpn_peer_push_options_t *opts,
+				       const char *pattern);
+
+/**
+ * Add a push option to per-client options
+ *
+ * @param opts Per-client options structure
+ * @param option Option string to push
+ * @return 0 on success, <0 on error
+ */
+int ovpn_peer_push_options_add_push (ovpn_peer_push_options_t *opts,
+				     const char *option);
+
+/**
+ * Add an internal route (iroute) to per-client options
+ *
+ * @param opts Per-client options structure
+ * @param prefix Route prefix
+ * @return 0 on success, <0 on error
+ */
+int ovpn_peer_push_options_add_iroute (ovpn_peer_push_options_t *opts,
+				       const fib_prefix_t *prefix);
+
+/**
+ * Check if an option should be removed based on push-remove patterns
+ *
+ * @param opts Per-client options structure (can be NULL)
+ * @param option Option string to check
+ * @return 1 if option should be removed, 0 otherwise
+ */
+int ovpn_peer_push_options_should_remove (const ovpn_peer_push_options_t *opts,
+					  const char *option);
 
 #endif /* __included_ovpn_peer_h__ */
 
