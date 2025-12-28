@@ -72,6 +72,7 @@ typedef ovpn_interface
     @param local_port - Local UDP port (default 1194)
     @param table_id - FIB table ID (0 for default)
     @param dev_name - Device name (optional, auto-generated if empty)
+    @param is_tun - 1 for TUN mode (L3, IP packets), 0 for TAP mode (L2, Ethernet frames)
     @param crypto_mode - Crypto mode
     @param static_key - Static key (256 bytes, for static key mode)
     @param static_key_direction - Key direction (0 or 1)
@@ -89,6 +90,7 @@ define ovpn_interface_create
   u16 local_port [default=1194];
   u32 table_id [default=0];
   string dev_name[32];
+  bool is_tun [default=true];
   vl_api_ovpn_crypto_mode_t crypto_mode;
   u8 static_key[256];
   u8 static_key_direction;

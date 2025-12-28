@@ -349,19 +349,139 @@ ovpn_if_update_adj_for_peer (u32 sw_if_index)
   }
 }
 
+/*
+ * TAP mode L2 output callback
+ * Called when packets are sent out via the TAP interface in L2 mode
+ * This is the tx_function for the device class when in TAP mode
+ *
+ * In TAP mode:
+ * - Incoming buffer contains an Ethernet frame (from bridge domain)
+ * - We need to prepend the outer IP+UDP headers (rewrite) before encryption
+ * - Then route to the OpenVPN output node for encryption
+ */
+VNET_DEVICE_CLASS_TX_FN (ovpn_device_class)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  u32 *from = vlib_frame_vector_args (frame);
+  u32 n_left = frame->n_vectors;
+  vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b = bufs;
+  u16 nexts[VLIB_FRAME_SIZE], *next = nexts;
+
+  vlib_get_buffers (vm, from, bufs, n_left);
+
+  while (n_left > 0)
+    {
+      vlib_buffer_t *b0 = b[0];
+      u32 sw_if_index = vnet_buffer (b0)->sw_if_index[VLIB_TX];
+
+      /*
+       * Get the instance for this interface.
+       * For TAP mode L2 output, we need to encrypt the Ethernet frame
+       * and send it via UDP to the peer.
+       */
+      ovpn_instance_t *inst = ovpn_instance_get_by_sw_if_index (sw_if_index);
+
+      if (PREDICT_FALSE (!inst))
+	{
+	  /* No instance - drop */
+	  next[0] = 0; /* error-drop */
+	  goto next;
+	}
+
+      /*
+       * For TAP mode, we need to find the peer for this frame.
+       * The destination MAC address in the Ethernet header can be used
+       * to look up the peer in multi-client scenarios.
+       *
+       * For now, in P2P mode, we just use the first established peer.
+       * TODO: Implement proper MAC-to-peer lookup for multi-client.
+       */
+      ovpn_peer_t *peer = NULL;
+      pool_foreach (peer, inst->multi_context.peer_db.peers)
+	{
+	  if (peer->state == OVPN_PEER_STATE_ESTABLISHED)
+	    break;
+	}
+
+      if (PREDICT_FALSE (!peer || peer->state != OVPN_PEER_STATE_ESTABLISHED))
+	{
+	  /* No established peer - drop */
+	  next[0] = 0; /* error-drop */
+	  goto next;
+	}
+
+      /*
+       * Prepend the outer IP+UDP headers (rewrite) to the buffer.
+       * The peer's rewrite contains the pre-built IP+UDP header template.
+       * The output node expects the buffer to start with the outer headers.
+       */
+      if (PREDICT_TRUE (vec_len (peer->rewrite) > 0))
+	{
+	  u32 rewrite_len = vec_len (peer->rewrite);
+
+	  /* Make room for the rewrite at the front of the buffer */
+	  vlib_buffer_advance (b0, -(i32) rewrite_len);
+
+	  /* Copy the rewrite template to the buffer */
+	  clib_memcpy_fast (vlib_buffer_get_current (b0), peer->rewrite,
+			    rewrite_len);
+	}
+      else
+	{
+	  /* No rewrite available - drop */
+	  next[0] = 0; /* error-drop */
+	  goto next;
+	}
+
+      /*
+       * Store the peer_id in vnet_buffer for the output node.
+       * The output node will look up the peer and encrypt the frame.
+       */
+      vnet_buffer (b0)->ip.adj_index[VLIB_TX] = peer->adj_index;
+
+      /*
+       * Route to the OpenVPN output node for encryption.
+       * Use ovpn4-output or ovpn6-output based on transport.
+       */
+      next[0] = inst->is_ipv6 ? 2 : 1; /* ovpn6-output : ovpn4-output */
+
+    next:
+      b++;
+      next++;
+      n_left--;
+    }
+
+  vlib_buffer_enqueue_to_next (vm, node, from, nexts, frame->n_vectors);
+  return frame->n_vectors;
+}
+
 /* Register OpenVPN device class */
 VNET_DEVICE_CLASS (ovpn_device_class) = {
   .name = "OpenVPN",
   .format_device_name = format_ovpn_if_name,
   .format_device = format_ovpn_if,
   .admin_up_down_function = ovpn_if_admin_up_down,
+  .tx_function_n_errors = 1,
+  .tx_function_error_strings = (char *[]){ "No peer found" },
 };
 
-/* Register OpenVPN hardware interface class */
+/* Register OpenVPN hardware interface class (TUN mode - L3) */
 VNET_HW_INTERFACE_CLASS (ovpn_hw_interface_class) = {
   .name = "OpenVPN",
   .update_adjacency = ovpn_if_update_adj,
   .flags = VNET_HW_INTERFACE_CLASS_FLAG_NBMA,
+};
+
+/*
+ * TAP mode hardware interface class.
+ * Uses Ethernet characteristics for L2 bridging support.
+ */
+VNET_HW_INTERFACE_CLASS (ovpn_tap_hw_interface_class) = {
+  .name = "OpenVPN-TAP",
+  .format_header = format_ethernet_header_with_length,
+  .build_rewrite = ethernet_build_rewrite,
+  .update_adjacency = ethernet_update_adjacency,
+  .flags = VNET_HW_INTERFACE_CLASS_FLAG_P2P,
 };
 
 /* Create OpenVPN interface */
@@ -421,15 +541,46 @@ ovpn_if_create (vlib_main_t *vm __attribute__ ((unused)), u8 *name, u8 is_tun,
     }
   else
     {
-      /* TAP mode - create as ethernet interface */
+      /*
+       * TAP mode - create as ethernet interface with L2 support.
+       * Uses vnet_eth_register_interface which creates a proper Ethernet
+       * interface that can participate in bridging and L2 switching.
+       */
+      vnet_hw_interface_t *hi;
+
       eir.dev_class_index = ovpn_device_class.index;
       eir.dev_instance = dev_instance;
       eir.address = address;
       hw_if_index = vnet_eth_register_interface (vnm, &eir);
 
-      vnet_hw_interface_t *hi = vnet_get_hw_interface (vnm, hw_if_index);
+      hi = vnet_get_hw_interface (vnm, hw_if_index);
       oif->hw_if_index = hw_if_index;
       oif->sw_if_index = hi->sw_if_index;
+
+      /*
+       * Set up the tx_function next nodes for L2 output path.
+       * The tx_function routes packets to OpenVPN output nodes.
+       */
+      vlib_node_t *tx_node =
+	vlib_get_node_by_name (vnm->vlib_main, (u8 *) "ovpn-device-class-tx");
+      if (tx_node)
+	{
+	  vlib_node_add_next_with_slot (vnm->vlib_main, tx_node->index,
+					vlib_get_node_by_name (
+					  vnm->vlib_main, (u8 *) "error-drop")
+					  ->index,
+					0);
+	  vlib_node_add_next_with_slot (
+	    vnm->vlib_main, tx_node->index,
+	    vlib_get_node_by_name (vnm->vlib_main, (u8 *) "ovpn4-output")
+	      ->index,
+	    1);
+	  vlib_node_add_next_with_slot (
+	    vnm->vlib_main, tx_node->index,
+	    vlib_get_node_by_name (vnm->vlib_main, (u8 *) "ovpn6-output")
+	      ->index,
+	    2);
+	}
     }
 
   /* Rename hardware interface to use custom name */

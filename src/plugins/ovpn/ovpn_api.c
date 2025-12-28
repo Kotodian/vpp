@@ -66,6 +66,9 @@ vl_api_ovpn_interface_create_t_handler (vl_api_ovpn_interface_create_t *mp)
       options.dev_name = (char *) format (0, "%s", mp->dev_name);
     }
 
+  /* Set TUN/TAP mode (default is TUN) */
+  options.is_tun = mp->is_tun;
+
   /* Handle crypto mode */
   switch (mp->crypto_mode)
     {

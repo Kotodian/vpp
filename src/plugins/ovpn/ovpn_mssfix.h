@@ -199,6 +199,103 @@ ovpn_mssfix_inner_packet (vlib_main_t *vm, vlib_buffer_t *b0, u16 max_mss)
   return 0;
 }
 
+/*
+ * Apply MSS clamping to a decrypted tunnel packet (TAP mode).
+ * Parses Ethernet header and handles VLAN tags.
+ *
+ * @param vm vlib_main_t pointer
+ * @param b0 Buffer pointer (data should point to Ethernet frame)
+ * @param max_mss Maximum MSS value
+ * @return 1 if MSS was clamped, 0 otherwise
+ */
+always_inline u32
+ovpn_mssfix_inner_packet_tap (vlib_main_t *vm, vlib_buffer_t *b0, u16 max_mss)
+{
+  /* Ethernet header: 6 bytes dst MAC + 6 bytes src MAC + 2 bytes EtherType */
+  const u32 eth_hdr_len = 14;
+  const u32 vlan_tag_len = 4;
+  u8 *data = vlib_buffer_get_current (b0);
+
+  if (b0->current_length < eth_hdr_len)
+    return 0;
+
+  /* Get EtherType (bytes 12-13, network byte order) */
+  u16 ethertype = clib_net_to_host_u16 (*(u16 *) (data + 12));
+  u32 l3_offset = eth_hdr_len;
+
+  /* Handle 802.1Q VLAN tag */
+  if (ethertype == 0x8100)
+    {
+      if (b0->current_length < eth_hdr_len + vlan_tag_len)
+	return 0;
+      /* Skip VLAN tag (4 bytes: 2 TCI + 2 inner EtherType) */
+      ethertype = clib_net_to_host_u16 (*(u16 *) (data + 16));
+      l3_offset = eth_hdr_len + vlan_tag_len;
+    }
+  /* Handle 802.1ad QinQ (double VLAN) */
+  else if (ethertype == 0x88a8)
+    {
+      if (b0->current_length < eth_hdr_len + 2 * vlan_tag_len)
+	return 0;
+      /* Check inner VLAN tag */
+      u16 inner_type = clib_net_to_host_u16 (*(u16 *) (data + 16));
+      if (inner_type == 0x8100)
+	{
+	  ethertype = clib_net_to_host_u16 (*(u16 *) (data + 20));
+	  l3_offset = eth_hdr_len + 2 * vlan_tag_len;
+	}
+      else
+	{
+	  ethertype = inner_type;
+	  l3_offset = eth_hdr_len + vlan_tag_len;
+	}
+    }
+
+  u8 *ip_data = data + l3_offset;
+  u32 ip_len = b0->current_length - l3_offset;
+
+  /* Process based on EtherType */
+  if (ethertype == 0x0800) /* IPv4 */
+    {
+      if (ip_len < sizeof (ip4_header_t))
+	return 0;
+      return ovpn_mssfix_ip4 ((ip4_header_t *) ip_data, max_mss);
+    }
+  else if (ethertype == 0x86DD) /* IPv6 */
+    {
+      if (ip_len < sizeof (ip6_header_t))
+	return 0;
+      /* For IPv6, we need to temporarily adjust buffer current pointer */
+      vlib_buffer_advance (b0, l3_offset);
+      u32 result = ovpn_mssfix_ip6 (vm, b0, (ip6_header_t *) ip_data, max_mss);
+      vlib_buffer_advance (b0, -(i32) l3_offset);
+      return result;
+    }
+
+  /* Not an IP packet (e.g., ARP, other protocols) */
+  return 0;
+}
+
+/*
+ * Apply MSS clamping to a decrypted tunnel packet.
+ * Handles both TUN (L3) and TAP (L2) modes.
+ *
+ * @param vm vlib_main_t pointer
+ * @param b0 Buffer pointer
+ * @param max_mss Maximum MSS value
+ * @param is_tun true for TUN mode, false for TAP mode
+ * @return 1 if MSS was clamped, 0 otherwise
+ */
+always_inline u32
+ovpn_mssfix_packet (vlib_main_t *vm, vlib_buffer_t *b0, u16 max_mss,
+		    u8 is_tun)
+{
+  if (is_tun)
+    return ovpn_mssfix_inner_packet (vm, b0, max_mss);
+  else
+    return ovpn_mssfix_inner_packet_tap (vm, b0, max_mss);
+}
+
 #endif /* __included_ovpn_mssfix_h__ */
 
 /*

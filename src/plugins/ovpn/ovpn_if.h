@@ -60,6 +60,8 @@ typedef struct ovpn_if_main_t_
 
 extern ovpn_if_main_t ovpn_if_main;
 extern vnet_device_class_t ovpn_device_class;
+extern vnet_hw_interface_class_t ovpn_hw_interface_class;
+extern vnet_hw_interface_class_t ovpn_tap_hw_interface_class;
 
 /* API functions */
 int ovpn_if_create (vlib_main_t *vm, u8 *name, u8 is_tun, u16 mtu,

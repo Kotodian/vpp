@@ -253,7 +253,8 @@ ovpn_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
        */
       if (PREDICT_FALSE (inst->options.mssfix > 0))
 	{
-	  ovpn_mssfix_inner_packet (vm, b0, inst->options.mssfix);
+	  ovpn_mssfix_packet (vm, b0, inst->options.mssfix,
+			      inst->options.is_tun);
 	}
 
       /*

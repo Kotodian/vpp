@@ -33,6 +33,7 @@
 #include <vnet/adj/adj_nbr.h>
 #include <vnet/fib/fib_table.h>
 #include <vlib/threads.h>
+#include <vnet/l2/l2_input.h>
 
 /*
  * Arguments for deferred peer setup on main thread.
@@ -227,6 +228,7 @@ typedef enum
   OVPN_INPUT_NEXT_HANDOFF_DATA,
   OVPN_INPUT_NEXT_IP4_INPUT,
   OVPN_INPUT_NEXT_IP6_INPUT,
+  OVPN_INPUT_NEXT_L2_INPUT, /* For TAP mode - Ethernet frames */
   OVPN_INPUT_NEXT_HANDSHAKE,
   OVPN_INPUT_NEXT_DROP,
   OVPN_INPUT_N_NEXT,
@@ -521,10 +523,11 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  /* Successfully decrypted - set up for IP stack */
 	  vnet_buffer (b0)->sw_if_index[VLIB_RX] = peer->sw_if_index;
 
-	  /* Apply MSS clamping if configured */
+	  /* Apply MSS clamping if configured (handles both TUN and TAP) */
 	  if (PREDICT_FALSE (inst->options.mssfix > 0))
 	    {
-	      ovpn_mssfix_inner_packet (vm, b0, inst->options.mssfix);
+	      ovpn_mssfix_packet (vm, b0, inst->options.mssfix,
+				  inst->options.is_tun);
 	    }
 
 	  /* Determine inner packet type */
@@ -543,10 +546,17 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		}
 
 	      /*
-	       * Determine IP version from instance configuration (pool_start),
-	       * not from payload inspection.
+	       * Route based on TUN/TAP mode:
+	       * - TUN mode: payload is IP packet, route to ip4/ip6-input
+	       * - TAP mode: payload is Ethernet frame, route to l2-input
 	       */
-	      if (inst->options.pool_start.version == AF_IP6)
+	      if (PREDICT_FALSE (!inst->options.is_tun))
+		{
+		  /* TAP mode - set up L2 buffer fields */
+		  vnet_update_l2_len (b0);
+		  next0 = OVPN_INPUT_NEXT_L2_INPUT;
+		}
+	      else if (inst->options.pool_start.version == AF_IP6)
 		next0 = OVPN_INPUT_NEXT_IP6_INPUT;
 	      else
 		next0 = OVPN_INPUT_NEXT_IP4_INPUT;
@@ -797,10 +807,11 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
 	      vnet_buffer (b0)->sw_if_index[VLIB_RX] = peer->sw_if_index;
 
-	      /* Apply MSS clamping if configured */
+	      /* Apply MSS clamping if configured (handles both TUN and TAP) */
 	      if (PREDICT_FALSE (inst->options.mssfix > 0))
 		{
-		  ovpn_mssfix_inner_packet (vm, b0, inst->options.mssfix);
+		  ovpn_mssfix_packet (vm, b0, inst->options.mssfix,
+				      inst->options.is_tun);
 		}
 
 	      /* Determine inner packet type */
@@ -818,10 +829,17 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		    }
 
 		  /*
-		   * Determine IP version from instance configuration (pool_start),
-		   * not from payload inspection.
+		   * Route based on TUN/TAP mode:
+		   * - TUN mode: payload is IP packet, route to ip4/ip6-input
+		   * - TAP mode: payload is Ethernet frame, route to l2-input
 		   */
-		  if (inst->options.pool_start.version == AF_IP6)
+		  if (PREDICT_FALSE (!inst->options.is_tun))
+		    {
+		      /* TAP mode - set up L2 buffer fields */
+		      vnet_update_l2_len (b0);
+		      next0 = OVPN_INPUT_NEXT_L2_INPUT;
+		    }
+		  else if (inst->options.pool_start.version == AF_IP6)
 		    next0 = OVPN_INPUT_NEXT_IP6_INPUT;
 		  else
 		    next0 = OVPN_INPUT_NEXT_IP4_INPUT;
@@ -1003,14 +1021,15 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  /* Set sw_if_index for the tunnel interface */
 	  vnet_buffer (b0)->sw_if_index[VLIB_RX] = peer->sw_if_index;
 
-	  /* Apply MSS clamping if configured */
+	  /* Apply MSS clamping if configured (handles both TUN and TAP) */
 	  ovpn_instance_t *pkt_inst = instances[i];
 	  if (PREDICT_FALSE (pkt_inst && pkt_inst->options.mssfix > 0))
 	    {
-	      ovpn_mssfix_inner_packet (vm, b0, pkt_inst->options.mssfix);
+	      ovpn_mssfix_packet (vm, b0, pkt_inst->options.mssfix,
+				  pkt_inst->options.is_tun);
 	    }
 
-	  /* Determine inner packet type and route to IP input */
+	  /* Determine inner packet type and route appropriately */
 	  data = vlib_buffer_get_current (b0);
 	  if (PREDICT_TRUE (b0->current_length >= 1))
 	    {
@@ -1025,10 +1044,18 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		}
 
 	      /*
-	       * Determine IP version from instance configuration (pool_start),
-	       * not from payload inspection.
+	       * Route based on TUN/TAP mode:
+	       * - TUN mode: payload is IP packet, route to ip4/ip6-input
+	       * - TAP mode: payload is Ethernet frame, route to l2-input
 	       */
-	      if (pkt_inst && pkt_inst->options.pool_start.version == AF_IP6)
+	      if (pkt_inst && PREDICT_FALSE (!pkt_inst->options.is_tun))
+		{
+		  /* TAP mode - set up L2 buffer fields */
+		  vnet_update_l2_len (b0);
+		  nexts[i] = OVPN_INPUT_NEXT_L2_INPUT;
+		}
+	      else if (pkt_inst &&
+		       pkt_inst->options.pool_start.version == AF_IP6)
 		nexts[i] = OVPN_INPUT_NEXT_IP6_INPUT;
 	      else
 		nexts[i] = OVPN_INPUT_NEXT_IP4_INPUT;
@@ -1331,6 +1358,7 @@ VLIB_REGISTER_NODE (ovpn4_input_node) = {
     [OVPN_INPUT_NEXT_HANDOFF_DATA] = "ovpn4-input-data-handoff",
     [OVPN_INPUT_NEXT_IP4_INPUT] = "ip4-input-no-checksum",
     [OVPN_INPUT_NEXT_IP6_INPUT] = "ip6-input",
+    [OVPN_INPUT_NEXT_L2_INPUT] = "l2-input",
     [OVPN_INPUT_NEXT_HANDSHAKE] = "ovpn4-handshake",
     [OVPN_INPUT_NEXT_DROP] = "error-drop",
   },
@@ -1349,6 +1377,7 @@ VLIB_REGISTER_NODE (ovpn6_input_node) = {
     [OVPN_INPUT_NEXT_HANDOFF_DATA] = "ovpn6-input-data-handoff",
     [OVPN_INPUT_NEXT_IP4_INPUT] = "ip4-input-no-checksum",
     [OVPN_INPUT_NEXT_IP6_INPUT] = "ip6-input",
+    [OVPN_INPUT_NEXT_L2_INPUT] = "l2-input",
     [OVPN_INPUT_NEXT_HANDSHAKE] = "ovpn6-handshake",
     [OVPN_INPUT_NEXT_DROP] = "error-drop",
   },
