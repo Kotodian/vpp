@@ -42,6 +42,10 @@ typedef struct ovpn_if_t_
   /* Interface flags */
   u8 is_tun;  /* TUN (IP) or TAP (Ethernet) mode */
   u8 is_ipv6; /* IPv4 or IPv6 */
+
+  /* L2 bridge domain for TAP mode */
+  u32 bd_index; /* Bridge domain index (~0 if not in BD) */
+  u32 bd_id;	/* Bridge domain ID */
 } ovpn_if_t;
 
 /* OpenVPN interface main */
@@ -52,6 +56,9 @@ typedef struct ovpn_if_main_t_
 
   /* Hash table: dev_instance -> ovpn_if index */
   uword *ovpn_if_index_by_sw_if_index;
+
+  /* Next bridge domain ID for TAP mode (starts from 10000 to avoid conflicts) */
+  u32 next_bd_id;
 
   /* Convenience */
   vlib_main_t *vlib_main;

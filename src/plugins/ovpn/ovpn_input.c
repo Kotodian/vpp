@@ -554,6 +554,19 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		{
 		  /* TAP mode - set up L2 buffer fields */
 		  vnet_update_l2_len (b0);
+
+		  /*
+		   * Learn source MAC for this peer (TAP mode only).
+		   * Source MAC is at offset 6 in Ethernet frame.
+		   */
+		  u8 *eth_hdr = vlib_buffer_get_current (b0);
+		  if (PREDICT_TRUE (b0->current_length >= 14))
+		    {
+		      u8 *src_mac = eth_hdr + 6;
+		      ovpn_peer_mac_learn (&inst->multi_context.peer_db,
+					   src_mac, peer->peer_id);
+		    }
+
 		  next0 = OVPN_INPUT_NEXT_L2_INPUT;
 		}
 	      else if (inst->options.pool_start.version == AF_IP6)
@@ -837,6 +850,19 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		    {
 		      /* TAP mode - set up L2 buffer fields */
 		      vnet_update_l2_len (b0);
+
+		      /*
+		       * Learn source MAC for this peer (TAP mode only).
+		       * Source MAC is at offset 6 in Ethernet frame.
+		       */
+		      u8 *eth_hdr = vlib_buffer_get_current (b0);
+		      if (PREDICT_TRUE (b0->current_length >= 14))
+			{
+			  u8 *src_mac = eth_hdr + 6;
+			  ovpn_peer_mac_learn (&inst->multi_context.peer_db,
+					       src_mac, peer->peer_id);
+			}
+
 		      next0 = OVPN_INPUT_NEXT_L2_INPUT;
 		    }
 		  else if (inst->options.pool_start.version == AF_IP6)
@@ -1052,6 +1078,19 @@ ovpn_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		{
 		  /* TAP mode - set up L2 buffer fields */
 		  vnet_update_l2_len (b0);
+
+		  /*
+		   * Learn source MAC for this peer (TAP mode only).
+		   * Source MAC is at offset 6 in Ethernet frame.
+		   */
+		  u8 *eth_hdr = vlib_buffer_get_current (b0);
+		  if (PREDICT_TRUE (b0->current_length >= 14))
+		    {
+		      u8 *src_mac = eth_hdr + 6;
+		      ovpn_peer_mac_learn (&pkt_inst->multi_context.peer_db,
+					   src_mac, peer->peer_id);
+		    }
+
 		  nexts[i] = OVPN_INPUT_NEXT_L2_INPUT;
 		}
 	      else if (pkt_inst &&

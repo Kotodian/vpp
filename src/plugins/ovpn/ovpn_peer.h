@@ -392,6 +392,19 @@ typedef struct ovpn_peer_db_t_
    * No spinlock needed - barrier provides stronger guarantee.
    */
 
+  /*
+   * MAC address to peer_id hash for TAP mode L2 forwarding.
+   * Key: 6-byte MAC address padded to 8 bytes
+   * Value: peer_id
+   *
+   * When receiving decrypted Ethernet frames, we learn the source MAC.
+   * When transmitting, we lookup the destination MAC to find the peer.
+   */
+  clib_bihash_8_8_t mac_hash;
+
+  /* Flag indicating MAC hash is initialized */
+  u8 mac_hash_initialized;
+
 } ovpn_peer_db_t;
 
 /*
@@ -672,6 +685,49 @@ int ovpn_peer_build_rewrite (ovpn_peer_t *peer, const ip_address_t *local_addr,
  * Format peer for display
  */
 u8 *format_ovpn_peer (u8 *s, va_list *args);
+
+/*
+ * MAC-to-peer lookup functions for TAP mode L2 forwarding
+ */
+
+/**
+ * Build 8-byte key from 6-byte MAC address for bihash lookup
+ */
+always_inline u64
+ovpn_peer_mac_to_key (const u8 *mac)
+{
+  u64 key = 0;
+  clib_memcpy_fast (&key, mac, 6);
+  return key;
+}
+
+/**
+ * Learn MAC address for a peer (called on RX path)
+ * Associates source MAC with peer_id for future TX lookups.
+ *
+ * @param db Peer database
+ * @param mac 6-byte source MAC address
+ * @param peer_id Peer that sent this MAC
+ */
+void ovpn_peer_mac_learn (ovpn_peer_db_t *db, const u8 *mac, u32 peer_id);
+
+/**
+ * Lookup peer by destination MAC address (called on TX path)
+ * Returns peer_id or ~0 if not found.
+ *
+ * @param db Peer database
+ * @param mac 6-byte destination MAC address
+ * @return peer_id or ~0 if not found
+ */
+u32 ovpn_peer_mac_lookup (ovpn_peer_db_t *db, const u8 *mac);
+
+/**
+ * Remove all MAC entries for a peer (called on peer delete)
+ *
+ * @param db Peer database
+ * @param peer_id Peer being deleted
+ */
+void ovpn_peer_mac_delete_all (ovpn_peer_db_t *db, u32 peer_id);
 
 /*
  * Cleanup expired keys for a peer

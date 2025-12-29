@@ -58,6 +58,9 @@ ovpn_peer_db_init (ovpn_peer_db_t *db, u32 sw_if_index)
   /* Initialize bihash for session ID -> peer_id lookup (NAT/float support) */
   clib_bihash_init_8_8 (&db->session_hash, "ovpn peer session hash",
 			1024 /* nbuckets */, 64 << 10 /* memory_size */);
+
+  /* MAC hash for TAP mode is initialized on-demand when first MAC is learned */
+  db->mac_hash_initialized = 0;
 }
 
 void
@@ -84,6 +87,10 @@ ovpn_peer_db_free (ovpn_peer_db_t *db)
   clib_bihash_free_24_8 (&db->remote_hash);
   clib_bihash_free_8_8 (&db->key_hash);
   clib_bihash_free_8_8 (&db->session_hash);
+
+  /* Free MAC hash if initialized */
+  if (db->mac_hash_initialized)
+    clib_bihash_free_8_8 (&db->mac_hash);
 
   clib_memset (db, 0, sizeof (*db));
 }
@@ -222,6 +229,9 @@ ovpn_peer_delete (ovpn_peer_db_t *db, u32 peer_id)
       ovpn_peer_push_options_free (peer->client_push_opts);
       peer->client_push_opts = NULL;
     }
+
+  /* Remove all MAC entries for this peer (TAP mode) */
+  ovpn_peer_mac_delete_all (db, peer_id);
 
   /* Free username if stored */
   vec_free (peer->username);
@@ -1768,6 +1778,124 @@ ovpn_peer_load_client_config (const char *config_dir, const char *common_name)
   vec_free (path);
 
   return opts;
+}
+
+/*
+ * MAC-to-peer lookup functions for TAP mode L2 forwarding
+ */
+
+/*
+ * Learn MAC address for a peer
+ *
+ * Called when receiving decrypted Ethernet frames from a peer.
+ * Associates the source MAC address with the peer_id for future TX lookups.
+ *
+ * This uses a lock-free bihash which is safe for concurrent access from
+ * multiple worker threads.
+ */
+void
+ovpn_peer_mac_learn (ovpn_peer_db_t *db, const u8 *mac, u32 peer_id)
+{
+  clib_bihash_kv_8_8_t kv;
+
+  if (!db || !mac)
+    return;
+
+  /* Initialize MAC hash on first use */
+  if (!db->mac_hash_initialized)
+    {
+      clib_bihash_init_8_8 (&db->mac_hash, "ovpn peer mac hash",
+			    1024 /* nbuckets */, 64 << 10 /* memory_size */);
+      db->mac_hash_initialized = 1;
+    }
+
+  /* Build key from MAC address (6 bytes padded to 8) */
+  kv.key = ovpn_peer_mac_to_key (mac);
+  kv.value = peer_id;
+
+  /* Add or update the mapping */
+  clib_bihash_add_del_8_8 (&db->mac_hash, &kv, 1 /* is_add */);
+}
+
+/*
+ * Lookup peer by destination MAC address
+ *
+ * Called when transmitting Ethernet frames to find which peer
+ * should receive the encrypted packet.
+ *
+ * Returns peer_id or ~0 if not found.
+ */
+u32
+ovpn_peer_mac_lookup (ovpn_peer_db_t *db, const u8 *mac)
+{
+  clib_bihash_kv_8_8_t kv, value;
+
+  if (!db || !mac || !db->mac_hash_initialized)
+    return ~0;
+
+  /* Build key from MAC address */
+  kv.key = ovpn_peer_mac_to_key (mac);
+
+  /* Lock-free bihash search */
+  if (clib_bihash_search_8_8 (&db->mac_hash, &kv, &value) == 0)
+    return (u32) value.value;
+
+  return ~0;
+}
+
+/*
+ * Remove all MAC entries for a peer
+ *
+ * Called when a peer is deleted. We need to walk the bihash
+ * and remove all entries that map to this peer_id.
+ *
+ * Note: This is O(n) where n is the number of MAC entries.
+ * For production use with many MACs, consider maintaining
+ * a per-peer list of learned MACs.
+ */
+typedef struct
+{
+  ovpn_peer_db_t *db;
+  u32 peer_id;
+  u64 *keys_to_delete;
+} ovpn_mac_delete_ctx_t;
+
+static int
+ovpn_mac_delete_walk_cb (clib_bihash_kv_8_8_t *kv, void *arg)
+{
+  ovpn_mac_delete_ctx_t *ctx = arg;
+
+  if ((u32) kv->value == ctx->peer_id)
+    vec_add1 (ctx->keys_to_delete, kv->key);
+
+  return BIHASH_WALK_CONTINUE;
+}
+
+void
+ovpn_peer_mac_delete_all (ovpn_peer_db_t *db, u32 peer_id)
+{
+  ovpn_mac_delete_ctx_t ctx = {
+    .db = db,
+    .peer_id = peer_id,
+    .keys_to_delete = NULL,
+  };
+  clib_bihash_kv_8_8_t kv;
+
+  if (!db || !db->mac_hash_initialized)
+    return;
+
+  /* Walk the hash to find all MACs for this peer */
+  clib_bihash_foreach_key_value_pair_8_8 (&db->mac_hash,
+					  ovpn_mac_delete_walk_cb, &ctx);
+
+  /* Delete the found entries */
+  for (u32 i = 0; i < vec_len (ctx.keys_to_delete); i++)
+    {
+      kv.key = ctx.keys_to_delete[i];
+      clib_bihash_add_del_8_8 (&db->mac_hash, &kv, 0 /* is_add */);
+    }
+
+  vec_free (ctx.keys_to_delete);
 }
 
 /*

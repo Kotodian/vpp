@@ -24,6 +24,10 @@
 #include <vnet/ethernet/ethernet.h>
 #include <vnet/adj/adj_midchain.h>
 #include <vnet/adj/adj_nbr.h>
+#include <vnet/l2/l2_input.h>
+#include <vnet/l2/l2_output.h>
+#include <vnet/l2/l2_bd.h>
+#include <vnet/l2/l2_fib.h>
 #include <vppinfra/error.h>
 #include <vppinfra/hash.h>
 #include <ovpn/ovpn_if.h>
@@ -390,17 +394,42 @@ VNET_DEVICE_CLASS_TX_FN (ovpn_device_class)
 
       /*
        * For TAP mode, we need to find the peer for this frame.
-       * The destination MAC address in the Ethernet header can be used
-       * to look up the peer in multi-client scenarios.
+       * Look up the destination MAC address in the Ethernet header
+       * to find the peer that owns this MAC (learned during RX).
        *
-       * For now, in P2P mode, we just use the first established peer.
-       * TODO: Implement proper MAC-to-peer lookup for multi-client.
+       * If MAC lookup fails (unknown destination or broadcast),
+       * fall back to the first established peer for P2P mode.
        */
       ovpn_peer_t *peer = NULL;
-      pool_foreach (peer, inst->multi_context.peer_db.peers)
+      u8 *eth_hdr = vlib_buffer_get_current (b0);
+
+      if (PREDICT_TRUE (b0->current_length >= 14))
 	{
-	  if (peer->state == OVPN_PEER_STATE_ESTABLISHED)
-	    break;
+	  u8 *dst_mac = eth_hdr; /* Destination MAC at offset 0 */
+
+	  /* Skip broadcast/multicast - use first peer for flooding */
+	  if (!(dst_mac[0] & 0x01))
+	    {
+	      /* Unicast - lookup peer by destination MAC */
+	      u32 peer_id =
+		ovpn_peer_mac_lookup (&inst->multi_context.peer_db, dst_mac);
+	      if (peer_id != ~0)
+		{
+		  peer = ovpn_peer_get (&inst->multi_context.peer_db, peer_id);
+		  if (peer && !ovpn_peer_is_established (peer))
+		    peer = NULL; /* Peer exists but not ready */
+		}
+	    }
+	}
+
+      /* Fallback: use first established peer (P2P mode or broadcast) */
+      if (!peer)
+	{
+	  pool_foreach (peer, inst->multi_context.peer_db.peers)
+	    {
+	      if (peer->state == OVPN_PEER_STATE_ESTABLISHED)
+		break;
+	    }
 	}
 
       if (PREDICT_FALSE (!peer || peer->state != OVPN_PEER_STATE_ESTABLISHED))
