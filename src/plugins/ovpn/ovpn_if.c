@@ -589,27 +589,14 @@ ovpn_if_create (vlib_main_t *vm __attribute__ ((unused)), u8 *name, u8 is_tun,
       /*
        * Set up the tx_function next nodes for L2 output path.
        * The tx_function routes packets to OpenVPN output nodes.
+       * Use hi->tx_node_index which is the actual TX node for this interface.
        */
-      vlib_node_t *tx_node =
-	vlib_get_node_by_name (vnm->vlib_main, (u8 *) "ovpn-device-class-tx");
-      if (tx_node)
-	{
-	  vlib_node_add_next_with_slot (vnm->vlib_main, tx_node->index,
-					vlib_get_node_by_name (
-					  vnm->vlib_main, (u8 *) "error-drop")
-					  ->index,
-					0);
-	  vlib_node_add_next_with_slot (
-	    vnm->vlib_main, tx_node->index,
-	    vlib_get_node_by_name (vnm->vlib_main, (u8 *) "ovpn4-output")
-	      ->index,
-	    1);
-	  vlib_node_add_next_with_slot (
-	    vnm->vlib_main, tx_node->index,
-	    vlib_get_node_by_name (vnm->vlib_main, (u8 *) "ovpn6-output")
-	      ->index,
-	    2);
-	}
+      vlib_node_add_named_next_with_slot (vnm->vlib_main, hi->tx_node_index,
+					  "error-drop", 0);
+      vlib_node_add_named_next_with_slot (vnm->vlib_main, hi->tx_node_index,
+					  "ovpn4-output", 1);
+      vlib_node_add_named_next_with_slot (vnm->vlib_main, hi->tx_node_index,
+					  "ovpn6-output", 2);
     }
 
   /* Rename hardware interface to use custom name */

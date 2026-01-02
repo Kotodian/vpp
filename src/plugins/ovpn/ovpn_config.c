@@ -1183,6 +1183,12 @@ ovpn_parse_inline_instance (vlib_main_t *vm, const char *instance_name,
 	  config.key_file = (char *) str_val;
 	  str_val = NULL;
 	}
+      else if (unformat (input, "tls-crypt-v2 %s", &str_val))
+	{
+	  vec_free (config.tls_crypt_v2_file);
+	  config.tls_crypt_v2_file = (char *) str_val;
+	  str_val = NULL;
+	}
       else if (unformat (input, "tls-crypt %s", &str_val))
 	{
 	  vec_free (config.tls_crypt_file);

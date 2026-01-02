@@ -38,6 +38,7 @@
 #include <openssl/pem.h>
 #include <openssl/x509.h>
 #include <openssl/evp.h>
+#include <openssl/err.h>
 
 ovpn_main_t ovpn_main;
 
@@ -233,13 +234,16 @@ ovpn_free_options (ovpn_options_t *opt)
 }
 
 /*
- * Custom certificate verification structure for CN extraction
- * This extends ptls_verify_certificate_t to store extracted CN
+ * Custom certificate verification structure for CN extraction and chain
+ * verification. This extends ptls_verify_certificate_t to store CA store
+ * and extracted CN.
  */
 typedef struct ovpn_verify_certificate_t_
 {
   ptls_verify_certificate_t super;
-  ovpn_instance_t *inst; /* Back pointer to instance */
+  ovpn_instance_t *inst;    /* Back pointer to instance */
+  X509_STORE *ca_store;	    /* CA certificate store for chain verification */
+  u8 verify_client_cert;    /* Whether to verify client certificates */
 } ovpn_verify_certificate_t;
 
 /*
@@ -300,9 +304,94 @@ ovpn_extract_cn_from_cert (const u8 *cert_der, size_t cert_len)
 }
 
 /*
+ * Verify certificate chain using CA store
+ * Returns 0 on success, negative error code on failure
+ */
+static int
+ovpn_verify_cert_chain (X509_STORE *ca_store, ptls_iovec_t *certs,
+			size_t num_certs)
+{
+  X509_STORE_CTX *store_ctx = NULL;
+  STACK_OF (X509) *chain = NULL;
+  X509 *leaf_cert = NULL;
+  const u8 *p;
+  int ret = -1;
+  int verify_result;
+
+  if (!ca_store || num_certs == 0)
+    return -1;
+
+  /* Parse the leaf certificate (first in chain) */
+  p = certs[0].base;
+  leaf_cert = d2i_X509 (NULL, &p, certs[0].len);
+  if (!leaf_cert)
+    {
+      clib_warning ("ovpn: failed to parse leaf certificate");
+      return -1;
+    }
+
+  /* Build intermediate certificate chain if provided */
+  chain = sk_X509_new_null ();
+  if (!chain)
+    {
+      X509_free (leaf_cert);
+      return -1;
+    }
+
+  for (size_t i = 1; i < num_certs; i++)
+    {
+      X509 *intermediate;
+      p = certs[i].base;
+      intermediate = d2i_X509 (NULL, &p, certs[i].len);
+      if (intermediate)
+	{
+	  sk_X509_push (chain, intermediate);
+	}
+    }
+
+  /* Create verification context */
+  store_ctx = X509_STORE_CTX_new ();
+  if (!store_ctx)
+    {
+      sk_X509_pop_free (chain, X509_free);
+      X509_free (leaf_cert);
+      return -1;
+    }
+
+  /* Initialize verification context */
+  if (X509_STORE_CTX_init (store_ctx, ca_store, leaf_cert, chain) != 1)
+    {
+      clib_warning ("ovpn: failed to init X509_STORE_CTX");
+      goto cleanup;
+    }
+
+  /* Set verification flags - allow partial chain if intermediate is trusted */
+  X509_STORE_CTX_set_flags (store_ctx, X509_V_FLAG_PARTIAL_CHAIN);
+
+  /* Perform the verification */
+  verify_result = X509_verify_cert (store_ctx);
+  if (verify_result != 1)
+    {
+      int err = X509_STORE_CTX_get_error (store_ctx);
+      clib_warning ("ovpn: certificate chain verification failed: %s",
+		    X509_verify_cert_error_string (err));
+      ret = -err;
+      goto cleanup;
+    }
+
+  ret = 0; /* Success */
+
+cleanup:
+  X509_STORE_CTX_free (store_ctx);
+  sk_X509_pop_free (chain, X509_free);
+  X509_free (leaf_cert);
+  return ret;
+}
+
+/*
  * Certificate verification callback
  * This is called during TLS handshake to verify the peer's certificate.
- * We use it to extract the Common Name for client-config-dir lookup.
+ * We verify the certificate chain and extract Common Name for CCD lookup.
  */
 static int
 ovpn_verify_certificate_cb (ptls_verify_certificate_t *self, ptls_t *tls,
@@ -314,13 +403,34 @@ ovpn_verify_certificate_cb (ptls_verify_certificate_t *self, ptls_t *tls,
 {
   ovpn_verify_certificate_t *vc = (ovpn_verify_certificate_t *) self;
   char *cn = NULL;
+  int ret = 0;
+
+  (void) server_name;
 
   /* We need at least one certificate (the leaf/client cert) */
   if (num_certs == 0 || certs[0].len == 0)
     {
       clib_warning ("ovpn: no client certificate provided");
-      /* For now, allow connections without certificates for backward compat */
+      /* Allow connections without certificates only if verify is disabled */
+      if (vc->verify_client_cert)
+	return PTLS_ALERT_CERTIFICATE_REQUIRED;
+      *verify_sign = NULL;
+      *verify_data = NULL;
       return 0;
+    }
+
+  /*
+   * Verify certificate chain if CA store is configured
+   */
+  if (vc->ca_store && vc->verify_client_cert)
+    {
+      ret = ovpn_verify_cert_chain (vc->ca_store, certs, num_certs);
+      if (ret != 0)
+	{
+	  clib_warning ("ovpn: rejecting client - certificate chain "
+			"verification failed");
+	  return PTLS_ALERT_BAD_CERTIFICATE;
+	}
     }
 
   /* Extract CN from the leaf certificate (certs[0]) */
@@ -347,17 +457,81 @@ ovpn_verify_certificate_cb (ptls_verify_certificate_t *self, ptls_t *tls,
 	}
     }
 
-  /*
-   * TODO: Implement full certificate chain verification using CA cert.
-   * For now, we accept all certificates (OpenVPN client already verified
-   * server cert, and we're just extracting CN for CCD lookup).
-   */
-  (void) vc;
-  (void) server_name;
   *verify_sign = NULL;
   *verify_data = NULL;
 
   return 0; /* Accept certificate */
+}
+
+/*
+ * Load CA certificate(s) into X509_STORE for chain verification
+ * Supports both PEM and DER formats, and CA files containing multiple certs
+ * Returns X509_STORE on success, NULL on failure
+ */
+static X509_STORE *
+ovpn_load_ca_store (const u8 *ca_data, u32 ca_len)
+{
+  X509_STORE *store = NULL;
+  BIO *bio = NULL;
+  X509 *cert = NULL;
+  int cert_count = 0;
+
+  if (!ca_data || ca_len == 0)
+    return NULL;
+
+  store = X509_STORE_new ();
+  if (!store)
+    return NULL;
+
+  /* Create BIO from the CA data */
+  bio = BIO_new_mem_buf (ca_data, ca_len);
+  if (!bio)
+    {
+      X509_STORE_free (store);
+      return NULL;
+    }
+
+  /* Try to load as PEM first (may contain multiple certificates) */
+  while ((cert = PEM_read_bio_X509 (bio, NULL, NULL, NULL)) != NULL)
+    {
+      if (X509_STORE_add_cert (store, cert) != 1)
+	{
+	  clib_warning ("ovpn: failed to add CA cert to store");
+	}
+      else
+	{
+	  cert_count++;
+	}
+      X509_free (cert);
+    }
+
+  /* Clear any error from the PEM loop reaching end of file */
+  ERR_clear_error ();
+
+  /* If no PEM certs found, try DER format */
+  if (cert_count == 0)
+    {
+      BIO_reset (bio);
+      cert = d2i_X509_bio (bio, NULL);
+      if (cert)
+	{
+	  if (X509_STORE_add_cert (store, cert) == 1)
+	    cert_count++;
+	  X509_free (cert);
+	}
+    }
+
+  BIO_free (bio);
+
+  if (cert_count == 0)
+    {
+      clib_warning ("ovpn: no valid CA certificates found");
+      X509_STORE_free (store);
+      return NULL;
+    }
+
+  clib_warning ("ovpn: loaded %d CA certificate(s)", cert_count);
+  return store;
 }
 
 static clib_error_t *
@@ -385,7 +559,8 @@ ovpn_init_picotls_context_for_instance (ovpn_instance_t *inst)
   /* Request client certificate for CN extraction and authentication */
   ctx->require_client_authentication = 1;
 
-  /* Setup certificate verification callback for CN extraction */
+  /* Setup certificate verification callback for CN extraction and chain
+   * verification */
   verify_cert = clib_mem_alloc (sizeof (ovpn_verify_certificate_t));
   if (!verify_cert)
     {
@@ -396,6 +571,23 @@ ovpn_init_picotls_context_for_instance (ovpn_instance_t *inst)
   verify_cert->super.cb = ovpn_verify_certificate_cb;
   verify_cert->super.algos = ovpn_signature_algorithms;
   verify_cert->inst = inst;
+
+  /* Load CA certificate store for chain verification if CA cert provided */
+  if (inst->options.ca_cert && vec_len (inst->options.ca_cert) > 0)
+    {
+      verify_cert->ca_store =
+	ovpn_load_ca_store (inst->options.ca_cert, vec_len (inst->options.ca_cert));
+      if (verify_cert->ca_store)
+	{
+	  verify_cert->verify_client_cert = 1;
+	  clib_warning ("ovpn: certificate chain verification enabled");
+	}
+      else
+	{
+	  clib_warning ("ovpn: failed to load CA, chain verification disabled");
+	}
+    }
+
   ctx->verify_certificate = &verify_cert->super;
 
   /* Load certificates if provided */
@@ -404,6 +596,8 @@ ovpn_init_picotls_context_for_instance (ovpn_instance_t *inst)
       if (ovpn_load_certificates (ctx, inst->options.server_cert,
 				  inst->options.server_key) != 0)
 	{
+	  if (verify_cert->ca_store)
+	    X509_STORE_free (verify_cert->ca_store);
 	  clib_mem_free (verify_cert);
 	  clib_mem_free (ctx);
 	  return clib_error_return (0, "failed to load certificates");
@@ -422,10 +616,17 @@ ovpn_cleanup_picotls_context_for_instance (ovpn_instance_t *inst)
   if (!inst->ptls_ctx)
     return;
 
-  /* Free verify_certificate structure if it exists */
+  /* Free verify_certificate structure and its resources */
   if (inst->ptls_ctx->verify_certificate)
     {
-      clib_mem_free (inst->ptls_ctx->verify_certificate);
+      ovpn_verify_certificate_t *vc =
+	(ovpn_verify_certificate_t *) inst->ptls_ctx->verify_certificate;
+
+      /* Free the CA store if it was allocated */
+      if (vc->ca_store)
+	X509_STORE_free (vc->ca_store);
+
+      clib_mem_free (vc);
     }
 
   /* Free sign_certificate structure if it exists */
@@ -540,6 +741,19 @@ ovpn_instance_create (vlib_main_t *vm, ip_address_t *local_addr,
 	{
 	  pool_put (omp->instances, inst);
 	  return VNET_API_ERROR_INVALID_VALUE_2;
+	}
+    }
+
+  /* Parse TLS-Crypt-V2 server key if provided */
+  if (inst->options.tls_crypt_v2_key)
+    {
+      rv = ovpn_tls_crypt_v2_parse_server_key (inst->options.tls_crypt_v2_key,
+					       vec_len (inst->options.tls_crypt_v2_key),
+					       &inst->tls_crypt_v2);
+      if (rv < 0)
+	{
+	  pool_put (omp->instances, inst);
+	  return VNET_API_ERROR_INVALID_VALUE_3;
 	}
     }
 
@@ -754,6 +968,8 @@ ovpn_show_command_fn (vlib_main_t *vm,
 
       if (inst->tls_crypt.enabled)
 	vlib_cli_output (vm, "  TLS-Crypt: enabled");
+      if (inst->tls_crypt_v2.enabled)
+	vlib_cli_output (vm, "  TLS-Crypt-V2: enabled");
       if (inst->tls_auth.enabled)
 	vlib_cli_output (vm, "  TLS-Auth: enabled");
 
@@ -1028,6 +1244,19 @@ ovpn_create_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	}
     }
 
+  /* Load TLS-Crypt-V2 server key if specified */
+  if (tls_crypt_v2_key)
+    {
+      error = ovpn_read_file_contents ((char *) tls_crypt_v2_key,
+				       &options.tls_crypt_v2_key);
+      if (error)
+	{
+	  error = clib_error_return (0, "failed to read TLS-Crypt-V2 key: %U",
+				     format_clib_error, error);
+	  goto done;
+	}
+    }
+
   /* Load certificates if specified */
   if (ca_cert)
     {
@@ -1144,8 +1373,9 @@ VLIB_CLI_COMMAND (ovpn_create_command, static) = {
   .path = "ovpn create",
   .short_help = "ovpn create local <ip> port <port> [dev <name>] "
 		"[table-id <id>] [secret <keyfile>] "
-		"[tls-crypt <key>] [tls-auth <key>] [ca <cert>] [cert <cert>] "
-		"[key <key>] [cipher <name>] [server <ip>/<len>]",
+		"[tls-crypt <key>] [tls-crypt-v2 <key>] [tls-auth <key>] "
+		"[ca <cert>] [cert <cert>] [key <key>] [cipher <name>] "
+		"[server <ip>/<len>]",
   .function = ovpn_create_command_fn,
 };
 
