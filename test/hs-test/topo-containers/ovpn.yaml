@@ -1,0 +1,22 @@
+---
+volumes:
+  - volume: &shared-vol
+      host-dir: "$HST_VOLUME_DIR/shared"
+
+containers:
+  - name: "vpp"
+    volumes:
+      - <<: *shared-vol
+        container-dir: "/tmp/vpp"
+        is-default-work-dir: true
+
+  - name: "openvpn-client"
+    volumes:
+      - <<: *shared-vol
+        container-dir: "/tmp/openvpn"
+        is-default-work-dir: true
+      - host-dir: $HST_DIR/resources/openvpn
+        container-dir: "/etc/openvpn"
+    image: "hs-test/openvpn"
+    is-optional: true
+    extra-args: "sleep infinity"

@@ -1,0 +1,24 @@
+---
+devices:
+  # TAP interface for VPP's ovpn tunnel endpoint
+  # VPP side: 10.10.1.1/24 (inner tunnel address)
+  # Host side: 10.10.1.2/24 (peer address)
+  - name: "htaphost"
+    type: "tap"
+    ip4:
+      network: 1
+    peer:
+      name: ""
+      ip4:
+        network: 1
+
+  # TAP interface for OpenVPN client container
+  # Used for encrypted traffic between VPP and OpenVPN client
+  - name: "ovpnhost"
+    type: "tap"
+    ip4:
+      network: 2
+    peer:
+      name: ""
+      ip4:
+        network: 2

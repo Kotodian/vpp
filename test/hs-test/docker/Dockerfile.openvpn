@@ -1,0 +1,24 @@
+# OpenVPN client container for integration testing
+ARG UBUNTU_VERSION=22.04
+FROM localhost:5001/vpp-test-base:latest
+
+# Install OpenVPN
+RUN apt-get update && apt-get install -y \
+    openvpn \
+    easy-rsa \
+    iptables \
+    iproute2 \
+    iputils-ping \
+    tcpdump \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create directories for configs and keys
+RUN mkdir -p /etc/openvpn/client /etc/openvpn/keys
+
+# Copy test resources
+COPY resources/openvpn/* /etc/openvpn/
+
+# Set working directory
+WORKDIR /etc/openvpn
+
+CMD ["/bin/sh"]

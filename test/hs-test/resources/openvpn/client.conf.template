@@ -1,0 +1,35 @@
+# OpenVPN client configuration for integration testing
+# This template is processed by the test framework
+
+dev tun
+proto udp
+remote {{.ServerAddress}} {{.ServerPort}}
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+
+# Static key mode with key direction
+# key-direction 1 = client mode (matches VPP server with direction 0)
+# This ensures proper key assignment:
+#   - Client encrypts with keys[1], VPP decrypts with keys[1]
+#   - VPP encrypts with keys[0], Client decrypts with keys[0]
+secret /etc/openvpn/static.key 1
+
+# Use AES-256-CBC cipher for static key mode
+# Note: AEAD ciphers (GCM) are not supported in static key mode
+cipher AES-256-CBC
+auth SHA256
+
+# Tunnel addresses
+ifconfig {{.ClientTunnelIP}} {{.ServerTunnelIP}}
+
+# Keepalive
+keepalive 10 60
+
+# Verbosity
+verb 4
+
+# Log file
+log /tmp/openvpn/client.log
+status /tmp/openvpn/status.log 10

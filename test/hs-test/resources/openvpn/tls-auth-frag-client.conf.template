@@ -1,0 +1,44 @@
+# OpenVPN TLS-Auth client configuration with fragmentation
+# This template is processed by the test framework
+
+# Note: Not using 'client' directive since it implies --pull mode
+# which requires PUSH_REPLY from server. Instead we configure manually.
+dev tun
+proto udp
+remote {{.ServerAddress}} {{.ServerPort}}
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+
+# TLS mode with certificates
+ca /etc/openvpn/ca.crt
+cert /etc/openvpn/client.crt
+key /etc/openvpn/client.key
+
+# TLS-Auth for control channel HMAC authentication
+# key-direction 1 = client mode (matches VPP server with direction 0)
+tls-auth /etc/openvpn/ta.key 1
+
+# Cipher and auth settings
+cipher AES-256-GCM
+auth SHA256
+
+# TLS settings - client-side TLS
+tls-client
+
+# Static tunnel configuration (no push/pull)
+ifconfig {{.ClientTunnelIP}} {{.ServerTunnelIP}}
+
+# Fragmentation - split packets larger than this size
+fragment {{.FragmentSize}}
+
+# Keepalive
+keepalive 10 60
+
+# Verbosity
+verb 5
+
+# Log file
+log /tmp/openvpn/client.log
+status /tmp/openvpn/status.log 10

@@ -1,0 +1,47 @@
+# OpenVPN TLS-Crypt client configuration for integration testing
+# This template is processed by the test framework
+
+# Note: Not using 'client' directive since it implies --pull mode
+# which requires PUSH_REPLY from server. Instead we configure manually.
+dev tun
+proto udp
+remote {{.ServerAddress}} {{.ServerPort}}
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+
+# TLS mode with certificates
+ca /etc/openvpn/ca.crt
+cert /etc/openvpn/client.crt
+key /etc/openvpn/client.key
+
+# TLS-Crypt for control channel encryption and authentication
+# TLS-Crypt provides both encryption and HMAC authentication
+# Unlike tls-auth, tls-crypt doesn't need key-direction parameter
+tls-crypt /etc/openvpn/tc.key
+
+# Cipher and auth settings
+cipher AES-256-GCM
+auth SHA256
+
+# TLS settings - client-side TLS
+tls-client
+
+# Note: Disabled remote-cert-tls because test certificates don't have
+# Key Usage extensions. In production, you should use properly signed
+# certificates with appropriate extensions.
+# remote-cert-tls server
+
+# Static tunnel configuration (no push/pull)
+ifconfig {{.ClientTunnelIP}} {{.ServerTunnelIP}}
+
+# Keepalive
+keepalive 10 60
+
+# Verbosity - use high level for debugging
+verb 7
+
+# Log file
+log /tmp/openvpn/client.log
+status /tmp/openvpn/status.log 10

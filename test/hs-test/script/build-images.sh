@@ -110,6 +110,7 @@ build_image "Dockerfile.curl" "hs-test/curl"
 build_image "Dockerfile.ab" "hs-test/ab"
 build_image "Dockerfile.wrk" "hs-test/wrk"
 build_image "Dockerfile.ginkgo" "hs-test/ginkgo"
+build_image "Dockerfile.openvpn" "hs-test/openvpn"
 
 # Build HTTP/3 nginx if available
 echo "=== Building HTTP/3 nginx image ==="

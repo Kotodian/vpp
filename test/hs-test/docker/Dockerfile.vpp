@@ -8,7 +8,11 @@ FROM localhost:5001/vpp-test-base:latest
 ARG OS_ARCH
 RUN echo "I'm building for $OS_ARCH"
 
+# VPP uses x86_64-linux-gnu path on amd64 systems
+ENV VPP_LIB_DIR=/usr/lib/x86_64-linux-gnu
+
 ENV DIR=vpp-data/lib/vpp_plugins
+RUN mkdir -p ${VPP_LIB_DIR}/vpp_plugins
 COPY \
    $DIR/af_packet_plugin.so \
    $DIR/hs_apps_plugin.so \
@@ -26,13 +30,22 @@ COPY \
    $DIR/mactime_plugin.so \
    $DIR/arping_plugin.so \
    $DIR/tap_plugin.so \
+   $DIR/ovpn_plugin.so \
    /usr/lib/$OS_ARCH-linux-gnu/vpp_plugins/
+
+# Copy crypto engines for HMAC and cipher operations
+ENV CRYPTO_DIR=vpp-data/lib/vpp_crypto_engines
+RUN mkdir -p ${VPP_LIB_DIR}/vpp_crypto_engines
+COPY ${CRYPTO_DIR}/*.so ${VPP_LIB_DIR}/vpp_crypto_engines/
 
 COPY vpp-data/bin/vpp /usr/bin/
 COPY vpp-data/bin/vppctl /usr/bin/
 COPY vpp-data/bin/vpp_echo /usr/bin/
 COPY vpp-data/bin/vcl_* /usr/bin/
-COPY vpp-data/lib/*.so /usr/lib/
+
+# Copy versioned libraries and create symlinks
+COPY vpp-data/lib/*.so.* /usr/lib/
+RUN cd /usr/lib && for f in *.so.*; do base="${f%%.so.*}.so"; ln -sf "$f" "$base"; done
 
 # Group already created in base image
 
